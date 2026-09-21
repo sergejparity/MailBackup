@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MailBackup Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="app" class="app-container">
+    <!-- Top Navigation Bar -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="logo-icon">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path>
+            <polyline points="22,6 12,13 2,6"></polyline>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1>MailBackup <span class="badge-pro">Studio</span></h1>
+          <span class="brand-subtitle">Resilient Local Email Archive</span>
+        </div>
+      </div>
+
+      <!-- Quick Global Search Bar -->
+      <div class="search-container">
+        <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+        <input type="text" id="global-search" placeholder="Search emails, bodies, attachments (FTS5)..." autocomplete="off">
+        <kbd class="shortcut-key">⌘K</kbd>
+      </div>
+
+      <!-- Storage & Sync Stats Widget -->
+      <div class="header-actions">
+        <div class="stats-pill" id="storage-stats-pill">
+          <span class="stats-dot"></span>
+          <span id="stats-summary">0 msgs • 0 MB</span>
+        </div>
+        <button id="btn-sync-all" class="btn btn-primary">
+          <svg class="btn-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+          </svg>
+          Sync Now
+        </button>
+        <button id="btn-open-settings" class="btn btn-secondary" title="Settings & Accounts">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Workspace Area -->
+    <main class="workspace-layout">
+      <!-- 1. Left Sidebar: Accounts & Folders -->
+      <aside class="sidebar-pane">
+        <div class="sidebar-section-header">
+          <span>ACCOUNTS</span>
+          <button id="btn-add-account-quick" class="btn-icon-subtle" title="Add Account">+</button>
+        </div>
+        <div id="accounts-list" class="accounts-nav">
+          <!-- Populated by JS -->
+        </div>
+
+        <div class="sidebar-section-header folder-header">
+          <span>MAILBOX FOLDERS</span>
+          <span id="folder-count-badge" class="count-badge">0</span>
+        </div>
+        <div id="folders-list" class="folders-nav">
+          <div class="empty-state-hint">Select an account above</div>
+        </div>
+
+        <div class="sidebar-footer">
+          <button id="btn-export-mbox-dialog" class="btn btn-ghost w-100">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            Export to .mbox
+          </button>
+        </div>
+      </aside>
+
+      <!-- 2. Middle Pane: Email List -->
+      <section class="email-list-pane">
+        <div class="list-header">
+          <div class="list-title-group">
+            <h2 id="current-folder-title">Inbox</h2>
+            <span id="folder-msg-count" class="badge-subtle">0 messages</span>
+          </div>
+          <div class="list-sort">
+            <select id="sort-select" class="select-subtle">
+              <option value="newest">Newest First</option>
+              <option value="oldest">Oldest First</option>
+              <option value="sender">Sender (A-Z)</option>
+              <option value="subject">Subject (A-Z)</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="email-items-container" class="email-items-container">
+          <div class="empty-state">
+            <div class="empty-icon">📫</div>
+            <h3>No emails selected</h3>
+            <p>Choose an account and folder from the sidebar or initiate a sync.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3. Right Pane: Email Reader & Full Preview -->
+      <section class="email-reader-pane">
+        <div id="reader-empty" class="reader-empty-state">
+          <div class="empty-icon">✉️</div>
+          <h3>Select an email to view</h3>
+          <p>Read full headers, body content, and manage attachments offline.</p>
+        </div>
+
+        <div id="reader-content" class="reader-content" style="display: none;">
+          <div class="reader-toolbar">
+            <div class="toolbar-left">
+              <span id="view-folder-tag" class="folder-tag">INBOX</span>
+              <span id="view-date-tag" class="date-tag">2026-09-21</span>
+            </div>
+            <div class="toolbar-right">
+              <button id="btn-download-raw-eml" class="btn btn-sm btn-ghost" title="Download Raw RFC 822 .eml">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                  <polyline points="7 10 12 15 17 10"></polyline>
+                  <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+                Raw .eml
+              </button>
+            </div>
+          </div>
+
+          <div class="email-view-header">
+            <h2 id="view-subject" class="view-subject">Subject Title</h2>
+            <div class="view-meta-row">
+              <div class="avatar-circle" id="view-avatar">A</div>
+              <div class="meta-details">
+                <div class="meta-from-line">
+                  <span class="meta-label">From:</span>
+                  <span id="view-from" class="meta-val highlight-val"></span>
+                </div>
+                <div class="meta-to-line">
+                  <span class="meta-label">To:</span>
+                  <span id="view-to" class="meta-val"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Attachments Bar -->
+          <div id="view-attachments-bar" class="attachments-bar" style="display: none;">
+            <div class="attachments-header">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+              </svg>
+              <span>Attachments (<span id="view-att-count">0</span>)</span>
+            </div>
+            <div id="view-attachments-list" class="attachments-chips">
+              <!-- Populated by JS -->
+            </div>
+          </div>
+
+          <!-- Email Body Frame/Text -->
+          <div class="email-body-container">
+            <iframe id="view-body-frame" class="email-body-frame" sandbox="allow-same-origin"></iframe>
+            <div id="view-body-plain" class="email-body-plain" style="display: none;"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Modal: Settings & Account Management -->
+    <div id="settings-modal" class="modal-backdrop" style="display: none;">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h2>Accounts & Configuration</h2>
+          <button id="btn-close-modal" class="btn-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="tab-buttons">
+            <button class="tab-btn active" data-tab="tab-accounts">Email Accounts</button>
+            <button class="tab-btn" data-tab="tab-add">Add New Account</button>
+            <button class="tab-btn" data-tab="tab-settings">General Settings</button>
+          </div>
+
+          <!-- Tab 1: Current Accounts List -->
+          <div id="tab-accounts" class="tab-content active">
+            <div id="modal-accounts-list" class="modal-accounts-table">
+              <!-- Populated by JS -->
+            </div>
+          </div>
+
+          <!-- Tab 2: Add Account Form -->
+          <div id="tab-add" class="tab-content">
+            <form id="add-account-form" class="form-grid">
+              <div class="form-group">
+                <label>Provider Preset</label>
+                <select id="form-provider" class="form-input">
+                  <option value="generic">Generic IMAP</option>
+                  <option value="gmail" selected>Gmail / Google Workspace</option>
+                  <option value="outlook">Outlook / Microsoft 365</option>
+                  <option value="icloud">Apple iCloud</option>
+                  <option value="yahoo">Yahoo Mail</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Display Name</label>
+                <input type="text" id="form-name" class="form-input" placeholder="e.g. Work Email" required>
+              </div>
+              <div class="form-group">
+                <label>Email Address</label>
+                <input type="email" id="form-email" class="form-input" placeholder="user@domain.com" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off" required>
+              </div>
+              <div class="form-group">
+                <label>IMAP Server & Port</label>
+                <div class="input-row">
+                  <input type="text" id="form-server" class="form-input" value="imap.gmail.com" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off" required>
+                  <input type="number" id="form-port" class="form-input port-input" value="993" required>
+                </div>
+              </div>
+              <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="form-username" class="form-input" placeholder="user@domain.com" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off" required>
+              </div>
+              <div class="form-group">
+                <label>Password / App Password</label>
+                <input type="password" id="form-password" class="form-input" placeholder="••••••••••••••••" required>
+                <small class="form-hint">Stored securely in OS Keychain / Keyring.</small>
+              </div>
+              <div class="form-group">
+                <label>Local Retention</label>
+                <select id="form-retention" class="form-input">
+                  <option value="0">Keep Forever (Recommended for Backups)</option>
+                  <option value="30">30 Days</option>
+                  <option value="90">90 Days</option>
+                  <option value="180">180 Days</option>
+                  <option value="365">1 Year</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Schedule (Cron or Interval)</label>
+                <input type="text" id="form-schedule" class="form-input" value="0 0 * * *" placeholder="0 0 * * * (Daily)" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off">
+              </div>
+              <div class="form-actions">
+                <button type="button" id="btn-test-account" class="btn btn-secondary">Test Connection</button>
+                <button type="submit" class="btn btn-primary">Save Account</button>
+              </div>
+            </form>
+          </div>
+
+          <!-- Tab 3: Settings -->
+          <div id="tab-settings" class="tab-content">
+            <div class="settings-box">
+              <h3>Storage Location</h3>
+              <p class="settings-desc">Raw .eml files and SQLite catalog directories.</p>
+              <div class="path-display" id="settings-storage-path">~/.mailbackup/data</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: Edit Account Settings -->
+    <div id="edit-account-modal" class="modal-backdrop" style="display: none;">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h2>Edit Account Settings</h2>
+          <button id="btn-close-edit-modal" class="btn-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <form id="edit-account-form" class="form-grid">
+            <input type="hidden" id="edit-account-id">
+            <div class="form-group">
+              <label>Account ID / Email</label>
+              <input type="text" id="edit-email" class="form-input" disabled style="opacity: 0.7;">
+            </div>
+            <div class="form-group">
+              <label>Display Name</label>
+              <input type="text" id="edit-name" class="form-input" required>
+            </div>
+            <div class="form-group">
+              <label>IMAP Server & Port</label>
+              <div class="input-row">
+                <input type="text" id="edit-server" class="form-input" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off" required>
+                <input type="number" id="edit-port" class="form-input port-input" required>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Username</label>
+              <input type="text" id="edit-username" class="form-input" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off" required>
+            </div>
+            <div class="form-group">
+              <label>Password / App Password</label>
+              <input type="password" id="edit-password" class="form-input" placeholder="(Leave blank to keep current password)">
+              <small class="form-hint">Only fill this if you want to update your stored password.</small>
+            </div>
+            <div class="form-group">
+              <label>Local Retention</label>
+              <select id="edit-retention" class="form-input">
+                <option value="0">Keep Forever (Recommended for Backups)</option>
+                <option value="30">30 Days</option>
+                <option value="90">90 Days</option>
+                <option value="180">180 Days</option>
+                <option value="365">1 Year</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Schedule (Cron or Interval)</label>
+              <input type="text" id="edit-schedule" class="form-input" placeholder="0 0 * * * or every 6h" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off">
+              <small class="form-hint">Standard cron e.g. <code>0 0 * * *</code> (daily) or <code>0 */6 * * *</code> (every 6h)</small>
+            </div>
+            <div class="form-group" style="flex-direction: row; align-items: center; gap: 8px;">
+              <input type="checkbox" id="edit-enabled" style="width: 18px; height: 18px;">
+              <label for="edit-enabled" style="cursor: pointer; font-size: 0.85rem;">Enable automatic scheduled backups for this account</label>
+            </div>
+            <div class="form-actions">
+              <button type="button" id="btn-cancel-edit" class="btn btn-secondary">Cancel</button>
+              <button type="submit" class="btn btn-primary">Save Changes</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: Export to Mbox -->
+    <div id="export-modal" class="modal-backdrop" style="display: none;">
+      <div class="modal-card modal-sm">
+        <div class="modal-header">
+          <h2>Export to .mbox Archive</h2>
+          <button id="btn-close-export" class="btn-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <form id="export-form" class="form-grid">
+            <div class="form-group">
+              <label>Select Account</label>
+              <select id="export-account-select" class="form-input"></select>
+            </div>
+            <div class="form-group">
+              <label>Select Folder</label>
+              <select id="export-folder-select" class="form-input">
+                <option value="ALL">All Folders</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Output Destination</label>
+              <input type="text" id="export-output-path" class="form-input" placeholder="/path/to/archive.mbox" required>
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary w-100">Export Archive</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Notification Toast -->
+    <div id="toast" class="toast" style="display: none;">
+      <span id="toast-message">Notification</span>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
