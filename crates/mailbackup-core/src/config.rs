@@ -103,6 +103,8 @@ pub struct GlobalSettings {
     pub notifications_enabled: bool,
     #[serde(default = "default_server_port")]
     pub web_port: u16,
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
 }
 
 fn default_schedule() -> String {
@@ -121,6 +123,7 @@ impl Default for GlobalSettings {
             rate_limit_kbps: None,
             notifications_enabled: true,
             web_port: default_server_port(),
+            close_to_tray: true,
         }
     }
 }

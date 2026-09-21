@@ -912,3 +912,25 @@ body {
   from { transform: translateY(20px); opacity: 0; }
   to { transform: translateY(0); opacity: 1; }
 }
+
+#tab-settings.active {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.setting-toggle-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--bg-darkest);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  transition: border-color 0.2s ease;
+}
+
+.setting-toggle-row:hover {
+  border-color: rgba(99, 102, 241, 0.4);
+}
+

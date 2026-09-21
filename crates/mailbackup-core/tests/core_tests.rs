@@ -245,3 +245,46 @@ fn test_storage_location_update_and_migration() {
     assert!(abs_in_loc2.exists());
     assert_eq!(abs_in_loc2, dir2.path().join(&stored.relative_path));
 }
+
+#[test]
+fn test_close_to_tray_setting_and_compatibility() {
+    // 1. Default value should be true
+    let default_config = AppConfig::default();
+    assert!(default_config.settings.close_to_tray);
+
+    // 2. Backward compatibility: YAML without close_to_tray should deserialize with close_to_tray = true
+    let legacy_yaml = r#"
+data_dir: /tmp/mailbackup/data
+db_path: /tmp/mailbackup/mailbackup.db
+settings:
+  default_schedule: "0 0 * * *"
+  web_port: 8765
+accounts: []
+"#;
+    let loaded: AppConfig = serde_yaml::from_str(legacy_yaml).unwrap();
+    assert!(loaded.settings.close_to_tray);
+
+    // 3. Explicit false should deserialize properly
+    let explicit_false_yaml = r#"
+data_dir: /tmp/mailbackup/data
+db_path: /tmp/mailbackup/mailbackup.db
+settings:
+  default_schedule: "0 0 * * *"
+  web_port: 8765
+  close_to_tray: false
+accounts: []
+"#;
+    let loaded_false: AppConfig = serde_yaml::from_str(explicit_false_yaml).unwrap();
+    assert!(!loaded_false.settings.close_to_tray);
+
+    // 4. Save and reload preserves setting
+    let dir = tempdir().unwrap();
+    let config_path = dir.path().join("config.yaml");
+    let mut modified = AppConfig::default();
+    modified.settings.close_to_tray = false;
+    modified.save(&config_path).unwrap();
+
+    let reloaded = AppConfig::load_or_create(Some(&config_path)).unwrap();
+    assert!(!reloaded.settings.close_to_tray);
+}
+

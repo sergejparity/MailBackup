@@ -542,6 +542,7 @@ pub struct SettingsResponse {
     pub default_retention_days: Option<u32>,
     pub notifications_enabled: bool,
     pub web_port: u16,
+    pub close_to_tray: bool,
 }
 
 async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
@@ -553,14 +554,16 @@ async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
         default_retention_days: cfg.settings.default_retention_days,
         notifications_enabled: cfg.settings.notifications_enabled,
         web_port: cfg.settings.web_port,
+        close_to_tray: cfg.settings.close_to_tray,
     };
     Json(res).into_response()
 }
 
 #[derive(Deserialize)]
 pub struct UpdateSettingsPayload {
-    pub data_dir: String,
+    pub data_dir: Option<String>,
     pub move_existing: Option<bool>,
+    pub close_to_tray: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -568,6 +571,7 @@ pub struct UpdateSettingsResponse {
     pub success: bool,
     pub data_dir: String,
     pub migrated_files: u64,
+    pub close_to_tray: bool,
     pub message: String,
 }
 
@@ -575,48 +579,66 @@ async fn api_update_settings(
     State(state): State<AppState>,
     Json(payload): Json<UpdateSettingsPayload>,
 ) -> impl IntoResponse {
-    let new_raw_path = payload.data_dir.trim();
-    if new_raw_path.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Storage path cannot be empty").into_response();
-    }
-
-    let resolved_path = mailbackup_core::config::resolve_path(new_raw_path);
-    let move_existing = payload.move_existing.unwrap_or(true);
-
     let mut migrated_files = 0u64;
+    let mut resolved_storage_path = None;
 
-    if move_existing {
-        match state.storage.migrate_data(&resolved_path) {
-            Ok(count) => migrated_files = count,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to migrate storage data: {}", e),
-                )
-                    .into_response();
+    // Check if new data directory is requested
+    if let Some(ref raw_dir) = payload.data_dir {
+        let trimmed = raw_dir.trim();
+        if !trimmed.is_empty() {
+            let target_path = mailbackup_core::config::resolve_path(trimmed);
+            let current_dir = {
+                let cfg = state.config.read().await;
+                cfg.data_dir.clone()
+            };
+
+            if target_path != current_dir {
+                let move_existing = payload.move_existing.unwrap_or(true);
+                if move_existing {
+                    match state.storage.migrate_data(&target_path) {
+                        Ok(count) => migrated_files = count,
+                        Err(e) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to migrate storage data: {}", e),
+                            )
+                                .into_response();
+                        }
+                    }
+                } else if let Err(e) = std::fs::create_dir_all(&target_path) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "Failed to create storage directory {}: {}",
+                            target_path.display(),
+                            e
+                        ),
+                    )
+                        .into_response();
+                }
+
+                // Update storage engine runtime path
+                state.storage.set_base_dir(&target_path);
+                resolved_storage_path = Some(target_path);
             }
         }
-    } else {
-        if let Err(e) = std::fs::create_dir_all(&resolved_path) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "Failed to create storage directory {}: {}",
-                    resolved_path.display(),
-                    e
-                ),
-            )
-                .into_response();
-        }
     }
 
-    // Update storage engine runtime path
-    state.storage.set_base_dir(&resolved_path);
+    let current_data_dir_str;
+    let current_close_to_tray;
 
     // Update config and save to disk
     {
         let mut cfg = state.config.write().await;
-        cfg.data_dir = resolved_path.clone();
+
+        if let Some(new_path) = resolved_storage_path.as_ref() {
+            cfg.data_dir = new_path.clone();
+        }
+
+        if let Some(close_tray) = payload.close_to_tray {
+            cfg.settings.close_to_tray = close_tray;
+        }
+
         if let Err(e) = cfg.save(&state.config_path) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -624,10 +646,13 @@ async fn api_update_settings(
             )
                 .into_response();
         }
+
+        current_data_dir_str = cfg.data_dir.to_string_lossy().to_string();
+        current_close_to_tray = cfg.settings.close_to_tray;
     }
 
-    // Reload scheduler jobs
-    {
+    // If storage location changed, reload scheduler
+    if resolved_storage_path.is_some() {
         let mut sched = state.scheduler.lock().await;
         let cfg = state.config.read().await;
         if let Err(e) = sched.reload(Arc::new(cfg.clone())).await {
@@ -635,15 +660,22 @@ async fn api_update_settings(
         }
     }
 
+    let message = if let Some(ref p) = resolved_storage_path {
+        format!(
+            "Storage location updated to {}. Migrated {} file(s).",
+            p.display(),
+            migrated_files
+        )
+    } else {
+        "Settings updated successfully.".to_string()
+    };
+
     Json(UpdateSettingsResponse {
         success: true,
-        data_dir: resolved_path.to_string_lossy().to_string(),
+        data_dir: current_data_dir_str,
         migrated_files,
-        message: format!(
-            "Storage location updated to {}. Migrated {} file(s).",
-            resolved_path.display(),
-            migrated_files
-        ),
+        close_to_tray: current_close_to_tray,
+        message,
     })
     .into_response()
 }

@@ -77,6 +77,8 @@ const el = {
   settingsDbPath: document.getElementById('settings-db-path'),
   settingsCurrentStorage: document.getElementById('settings-current-storage'),
   btnSaveStorage: document.getElementById('btn-save-storage'),
+  settingsCloseToTray: document.getElementById('settings-close-to-tray'),
+  traySettingStatus: document.getElementById('tray-setting-status'),
 };
 
 // Initialization
@@ -112,6 +114,7 @@ function initEventListeners() {
 
   // Storage Settings Form
   if (el.settingsStorageForm) el.settingsStorageForm.addEventListener('submit', handleSaveStorageSettings);
+  if (el.settingsCloseToTray) el.settingsCloseToTray.addEventListener('change', handleToggleCloseToTray);
 
   // Tab switching in settings modal
   document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -745,8 +748,57 @@ async function loadSettings() {
     if (el.settingsDbPath) {
       el.settingsDbPath.textContent = data.db_path;
     }
+    if (el.settingsCloseToTray) {
+      el.settingsCloseToTray.checked = data.close_to_tray !== false;
+      updateTrayBadge(el.settingsCloseToTray.checked);
+    }
   } catch (err) {
     console.error('Failed to load settings:', err);
+  }
+}
+
+function updateTrayBadge(enabled) {
+  if (!el.traySettingStatus) return;
+  if (enabled) {
+    el.traySettingStatus.textContent = 'Enabled';
+    el.traySettingStatus.style.background = 'rgba(34, 197, 94, 0.15)';
+    el.traySettingStatus.style.color = '#4ade80';
+  } else {
+    el.traySettingStatus.textContent = 'Disabled';
+    el.traySettingStatus.style.background = 'rgba(239, 68, 68, 0.15)';
+    el.traySettingStatus.style.color = '#f87171';
+  }
+}
+
+async function handleToggleCloseToTray(e) {
+  const isChecked = e.target.checked;
+  updateTrayBadge(isChecked);
+
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        close_to_tray: isChecked,
+      }),
+    });
+
+    if (res.ok) {
+      showToast(
+        isChecked
+          ? 'Background mode enabled: closing window keeps app in system tray 📥'
+          : 'Background mode disabled: closing window exits application 🚪'
+      );
+    } else {
+      const errText = await res.text();
+      showToast(`Failed to update setting: ${errText}`);
+      e.target.checked = !isChecked;
+      updateTrayBadge(!isChecked);
+    }
+  } catch (err) {
+    showToast(`Error updating setting: ${err.message}`);
+    e.target.checked = !isChecked;
+    updateTrayBadge(!isChecked);
   }
 }
 
@@ -759,6 +811,7 @@ async function handleSaveStorageSettings(e) {
   }
 
   const moveExisting = el.settingsMoveExisting ? el.settingsMoveExisting.checked : true;
+  const closeToTray = el.settingsCloseToTray ? el.settingsCloseToTray.checked : true;
   const btn = el.btnSaveStorage;
   const originalHtml = btn ? btn.innerHTML : '';
   if (btn) {
@@ -773,12 +826,17 @@ async function handleSaveStorageSettings(e) {
       body: JSON.stringify({
         data_dir: newDir,
         move_existing: moveExisting,
+        close_to_tray: closeToTray,
       }),
     });
 
     if (res.ok) {
       const data = await res.json();
       if (el.settingsDataDir) el.settingsDataDir.value = data.data_dir;
+      if (el.settingsCloseToTray) {
+        el.settingsCloseToTray.checked = data.close_to_tray !== false;
+        updateTrayBadge(el.settingsCloseToTray.checked);
+      }
       showToast(`Storage updated! ${data.migrated_files} file(s) migrated. ✅`);
       await loadStats();
       if (state.selectedAccountId) {
