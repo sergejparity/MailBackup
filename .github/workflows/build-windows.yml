@@ -46,7 +46,7 @@ jobs:
           path: |
             target/release/mailbackup-cli.exe
             target/release/mailbackup-server.exe
-            crates/mailbackup-gui/target/release/bundle/nsis/*.exe
-            crates/mailbackup-gui/target/release/bundle/msi/*.msi
-            crates/mailbackup-gui/target/release/mailbackup-gui.exe
+            target/release/mailbackup-gui.exe
+            **/target/release/bundle/nsis/*.exe
+            **/target/release/bundle/msi/*.msi
           if-no-files-found: warn
