@@ -43,7 +43,6 @@ pub struct AppState {
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(serve_index))
-        .route("/*file", get(serve_static))
         .route("/api/stats", get(api_stats))
         .route("/api/accounts", get(api_get_accounts).post(api_add_account))
         .route(
@@ -60,6 +59,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/search", get(api_search))
         .route("/api/sync/:account_id", post(api_sync_account))
         .route("/api/export/mbox", post(api_export_mbox))
+        .route("/api/settings", get(api_get_settings).put(api_update_settings))
+        .route("/*file", get(serve_static))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -532,3 +533,118 @@ async fn api_export_mbox(
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
+
+#[derive(Serialize)]
+pub struct SettingsResponse {
+    pub data_dir: String,
+    pub db_path: String,
+    pub default_schedule: String,
+    pub default_retention_days: Option<u32>,
+    pub notifications_enabled: bool,
+    pub web_port: u16,
+}
+
+async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
+    let cfg = state.config.read().await;
+    let res = SettingsResponse {
+        data_dir: cfg.data_dir.to_string_lossy().to_string(),
+        db_path: cfg.db_path.to_string_lossy().to_string(),
+        default_schedule: cfg.settings.default_schedule.clone(),
+        default_retention_days: cfg.settings.default_retention_days,
+        notifications_enabled: cfg.settings.notifications_enabled,
+        web_port: cfg.settings.web_port,
+    };
+    Json(res).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct UpdateSettingsPayload {
+    pub data_dir: String,
+    pub move_existing: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct UpdateSettingsResponse {
+    pub success: bool,
+    pub data_dir: String,
+    pub migrated_files: u64,
+    pub message: String,
+}
+
+async fn api_update_settings(
+    State(state): State<AppState>,
+    Json(payload): Json<UpdateSettingsPayload>,
+) -> impl IntoResponse {
+    let new_raw_path = payload.data_dir.trim();
+    if new_raw_path.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Storage path cannot be empty").into_response();
+    }
+
+    let resolved_path = mailbackup_core::config::resolve_path(new_raw_path);
+    let move_existing = payload.move_existing.unwrap_or(true);
+
+    let mut migrated_files = 0u64;
+
+    if move_existing {
+        match state.storage.migrate_data(&resolved_path) {
+            Ok(count) => migrated_files = count,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to migrate storage data: {}", e),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        if let Err(e) = std::fs::create_dir_all(&resolved_path) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Failed to create storage directory {}: {}",
+                    resolved_path.display(),
+                    e
+                ),
+            )
+                .into_response();
+        }
+    }
+
+    // Update storage engine runtime path
+    state.storage.set_base_dir(&resolved_path);
+
+    // Update config and save to disk
+    {
+        let mut cfg = state.config.write().await;
+        cfg.data_dir = resolved_path.clone();
+        if let Err(e) = cfg.save(&state.config_path) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save config: {}", e),
+            )
+                .into_response();
+        }
+    }
+
+    // Reload scheduler jobs
+    {
+        let mut sched = state.scheduler.lock().await;
+        let cfg = state.config.read().await;
+        if let Err(e) = sched.reload(Arc::new(cfg.clone())).await {
+            tracing::warn!("Failed to reload scheduler after storage path change: {}", e);
+        }
+    }
+
+    Json(UpdateSettingsResponse {
+        success: true,
+        data_dir: resolved_path.to_string_lossy().to_string(),
+        migrated_files,
+        message: format!(
+            "Storage location updated to {}. Migrated {} file(s).",
+            resolved_path.display(),
+            migrated_files
+        ),
+    })
+    .into_response()
+}
+

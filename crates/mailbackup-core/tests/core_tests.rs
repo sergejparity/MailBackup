@@ -215,3 +215,33 @@ fn test_mbox_export() {
     assert!(mbox_content.contains("Subject: First"));
     assert!(mbox_content.contains("Subject: Second"));
 }
+
+#[test]
+fn test_storage_location_update_and_migration() {
+    let dir1 = tempdir().unwrap();
+    let dir2 = tempdir().unwrap();
+
+    let storage = StorageEngine::new(dir1.path());
+    assert_eq!(storage.base_dir(), dir1.path());
+
+    // Store a message in location 1
+    let raw_eml = b"From: test@example.com\r\nSubject: Test Migrate\r\n\r\nHello World";
+    let stored = storage.store_eml("acc1", "INBOX", 1, Some(Utc::now()), raw_eml).unwrap();
+    assert!(stored.absolute_path.exists());
+
+    // Migrate from location 1 to location 2
+    let migrated_count = storage.migrate_data(dir2.path()).unwrap();
+    assert_eq!(migrated_count, 1);
+
+    // Update storage base_dir
+    storage.set_base_dir(dir2.path());
+    assert_eq!(storage.base_dir(), dir2.path());
+
+    // Verify message can be read from location 2
+    let read_bytes = storage.read_eml(&stored.relative_path).unwrap();
+    assert_eq!(read_bytes, raw_eml);
+
+    let abs_in_loc2 = storage.get_absolute_path(&stored.relative_path);
+    assert!(abs_in_loc2.exists());
+    assert_eq!(abs_in_loc2, dir2.path().join(&stored.relative_path));
+}

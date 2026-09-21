@@ -831,11 +831,52 @@ body {
   border-radius: var(--radius-md);
 }
 
-.settings-box {
+.settings-card {
   background: var(--bg-card);
-  padding: 16px;
+  padding: 20px;
   border-radius: var(--radius-md);
   border: 1px solid var(--border-subtle);
+}
+
+.settings-header h3 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+
+.settings-desc {
+  font-size: 0.84rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.settings-info-box {
+  background: var(--bg-darkest);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.info-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.8rem;
+}
+
+.info-label {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.info-val {
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--accent-cyan);
 }
 
 .path-display {

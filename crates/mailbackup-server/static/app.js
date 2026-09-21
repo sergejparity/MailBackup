@@ -69,6 +69,14 @@ const el = {
   editRetention: document.getElementById('edit-retention'),
   editSchedule: document.getElementById('edit-schedule'),
   editEnabled: document.getElementById('edit-enabled'),
+
+  // Settings Tab Elements
+  settingsStorageForm: document.getElementById('settings-storage-form'),
+  settingsDataDir: document.getElementById('settings-data-dir'),
+  settingsMoveExisting: document.getElementById('settings-move-existing'),
+  settingsDbPath: document.getElementById('settings-db-path'),
+  settingsCurrentStorage: document.getElementById('settings-current-storage'),
+  btnSaveStorage: document.getElementById('btn-save-storage'),
 };
 
 // Initialization
@@ -76,11 +84,15 @@ document.addEventListener('DOMContentLoaded', () => {
   initEventListeners();
   loadStats();
   loadAccounts();
+  loadSettings();
 });
 
 function initEventListeners() {
   // Navigation & Modals
-  el.btnOpenSettings.addEventListener('click', () => openModal(el.settingsModal));
+  el.btnOpenSettings.addEventListener('click', () => {
+    openModal(el.settingsModal);
+    loadSettings();
+  });
   el.btnAddAccountQuick.addEventListener('click', () => {
     openModal(el.settingsModal);
     switchTab('tab-add');
@@ -97,6 +109,9 @@ function initEventListeners() {
   if (el.btnCloseEditModal) el.btnCloseEditModal.addEventListener('click', () => closeModal(el.editAccountModal));
   if (el.btnCancelEdit) el.btnCancelEdit.addEventListener('click', () => closeModal(el.editAccountModal));
   if (el.editAccountForm) el.editAccountForm.addEventListener('submit', handleSaveAccountEdit);
+
+  // Storage Settings Form
+  if (el.settingsStorageForm) el.settingsStorageForm.addEventListener('submit', handleSaveStorageSettings);
 
   // Tab switching in settings modal
   document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -190,6 +205,9 @@ function switchTab(tabId) {
   document.querySelectorAll('.tab-content').forEach(c => {
     c.classList.toggle('active', c.id === tabId);
   });
+  if (tabId === 'tab-settings') {
+    loadSettings();
+  }
 }
 
 // Sorting logic
@@ -218,6 +236,9 @@ async function loadStats() {
     const stats = await res.json();
     const mb = (stats.total_bytes / (1024 * 1024)).toFixed(1);
     el.statsSummary.textContent = `${stats.total_messages.toLocaleString()} msgs • ${mb} MB`;
+    if (el.settingsCurrentStorage) {
+      el.settingsCurrentStorage.textContent = `${stats.total_messages.toLocaleString()} messages (${mb} MB across accounts)`;
+    }
   } catch (err) {
     console.error('Failed to load stats:', err);
   }
@@ -711,4 +732,68 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
+}
+
+async function loadSettings() {
+  try {
+    const res = await fetch('/api/settings');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (el.settingsDataDir) {
+      el.settingsDataDir.value = data.data_dir;
+    }
+    if (el.settingsDbPath) {
+      el.settingsDbPath.textContent = data.db_path;
+    }
+  } catch (err) {
+    console.error('Failed to load settings:', err);
+  }
+}
+
+async function handleSaveStorageSettings(e) {
+  e.preventDefault();
+  const newDir = el.settingsDataDir.value.trim();
+  if (!newDir) {
+    showToast('Please enter a valid directory path');
+    return;
+  }
+
+  const moveExisting = el.settingsMoveExisting ? el.settingsMoveExisting.checked : true;
+  const btn = el.btnSaveStorage;
+  const originalHtml = btn ? btn.innerHTML : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = `<span class="stats-dot" style="animation: pulse 1s infinite;"></span> Saving...`;
+  }
+
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        data_dir: newDir,
+        move_existing: moveExisting,
+      }),
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      if (el.settingsDataDir) el.settingsDataDir.value = data.data_dir;
+      showToast(`Storage updated! ${data.migrated_files} file(s) migrated. ✅`);
+      await loadStats();
+      if (state.selectedAccountId) {
+        await loadFolders(state.selectedAccountId);
+      }
+    } else {
+      const errText = await res.text();
+      showToast(`Failed to update storage: ${errText}`);
+    }
+  } catch (err) {
+    showToast(`Error updating storage: ${err.message}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = originalHtml;
+    }
+  }
 }

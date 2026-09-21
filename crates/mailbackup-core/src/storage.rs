@@ -2,12 +2,13 @@ use crate::error::{Error, Result};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct StorageEngine {
-    base_dir: PathBuf,
+    base_dir: Arc<RwLock<PathBuf>>,
 }
 
 #[derive(Debug, Clone)]
@@ -21,12 +22,70 @@ pub struct StoredMessageInfo {
 impl StorageEngine {
     pub fn new(base_dir: impl AsRef<Path>) -> Self {
         Self {
-            base_dir: base_dir.as_ref().to_path_buf(),
+            base_dir: Arc::new(RwLock::new(base_dir.as_ref().to_path_buf())),
         }
     }
 
-    pub fn base_dir(&self) -> &Path {
-        &self.base_dir
+    pub fn base_dir(&self) -> PathBuf {
+        self.base_dir.read().unwrap().clone()
+    }
+
+    pub fn set_base_dir(&self, new_dir: impl AsRef<Path>) {
+        let mut w = self.base_dir.write().unwrap();
+        *w = new_dir.as_ref().to_path_buf();
+    }
+
+    pub fn get_absolute_path(&self, relative_path: impl AsRef<Path>) -> PathBuf {
+        self.base_dir().join(relative_path)
+    }
+
+    /// Migrates existing backup data from current base_dir to new_base_dir.
+    /// Returns the number of files migrated.
+    pub fn migrate_data(&self, new_base_dir: impl AsRef<Path>) -> Result<u64> {
+        let old_base = self.base_dir();
+        let new_base = new_base_dir.as_ref().to_path_buf();
+
+        if old_base == new_base {
+            return Ok(0);
+        }
+
+        std::fs::create_dir_all(&new_base)?;
+
+        if !old_base.exists() {
+            return Ok(0);
+        }
+
+        let mut copied_count = 0u64;
+
+        fn copy_dir_recursive(src: &Path, dst: &Path, copied: &mut u64) -> Result<()> {
+            if !dst.exists() {
+                std::fs::create_dir_all(dst)?;
+            }
+            for entry in std::fs::read_dir(src)? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                let file_name = entry.file_name();
+
+                // Skip temporary staging directory
+                if file_name == ".staging" {
+                    continue;
+                }
+
+                let src_path = entry.path();
+                let dst_path = dst.join(&file_name);
+
+                if file_type.is_dir() {
+                    copy_dir_recursive(&src_path, &dst_path, copied)?;
+                } else if file_type.is_file() {
+                    std::fs::copy(&src_path, &dst_path)?;
+                    *copied += 1;
+                }
+            }
+            Ok(())
+        }
+
+        copy_dir_recursive(&old_base, &new_base, &mut copied_count)?;
+        Ok(copied_count)
     }
 
     pub fn sanitize_slug(input: &str) -> String {
@@ -79,7 +138,8 @@ impl StorageEngine {
             .join(&month_str)
             .join(&file_name);
 
-        let absolute_path = self.base_dir.join(&relative_path);
+        let base = self.base_dir();
+        let absolute_path = base.join(&relative_path);
 
         // If target already exists and size matches, verify hash
         if absolute_path.exists() {
@@ -98,7 +158,7 @@ impl StorageEngine {
         }
 
         // Staging directory for atomic rename
-        let staging_dir = self.base_dir.join(".staging");
+        let staging_dir = base.join(".staging");
         std::fs::create_dir_all(&staging_dir)?;
         let temp_filename = format!("{}.tmp", Uuid::new_v4());
         let temp_path = staging_dir.join(temp_filename);
@@ -128,12 +188,12 @@ impl StorageEngine {
     }
 
     pub fn read_eml(&self, relative_path: impl AsRef<Path>) -> Result<Vec<u8>> {
-        let path = self.base_dir.join(relative_path);
+        let path = self.base_dir().join(relative_path);
         std::fs::read(&path).map_err(Error::Io)
     }
 
     pub fn delete_eml(&self, relative_path: impl AsRef<Path>) -> Result<()> {
-        let path = self.base_dir.join(relative_path);
+        let path = self.base_dir().join(relative_path);
         if path.exists() {
             std::fs::remove_file(&path).map_err(Error::Io)?;
         }
@@ -141,7 +201,7 @@ impl StorageEngine {
     }
 
     pub fn verify_checksum(&self, relative_path: impl AsRef<Path>, expected_sha256: &str) -> Result<bool> {
-        let path = self.base_dir.join(relative_path);
+        let path = self.base_dir().join(relative_path);
         if !path.exists() {
             return Ok(false);
         }

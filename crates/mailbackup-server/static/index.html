@@ -261,10 +261,54 @@
 
           <!-- Tab 3: Settings -->
           <div id="tab-settings" class="tab-content">
-            <div class="settings-box">
-              <h3>Storage Location</h3>
-              <p class="settings-desc">Raw .eml files and SQLite catalog directories.</p>
-              <div class="path-display" id="settings-storage-path">~/.mailbackup/data</div>
+            <div class="settings-card">
+              <div class="settings-header">
+                <div>
+                  <h3>Archive Storage Location</h3>
+                  <p class="settings-desc">Choose where raw <code>.eml</code> files and attachment payload directories are saved on your computer or external drive.</p>
+                </div>
+              </div>
+              <form id="settings-storage-form" class="form-grid" style="margin-top: 14px;">
+                <div class="form-group">
+                  <label for="settings-data-dir">Data Directory Path</label>
+                  <input type="text" id="settings-data-dir" class="form-input" placeholder="e.g. ~/.mailbackup/data or D:\MailBackup" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off" required>
+                  <small class="form-hint">Supports full absolute paths or user home shortcuts (<code>~</code>). Changing this path allows storing archives on another disk or external drive.</small>
+                </div>
+
+                <div class="form-group" style="flex-direction: row; align-items: flex-start; gap: 10px; margin-top: 6px;">
+                  <input type="checkbox" id="settings-move-existing" checked style="width: 18px; height: 18px; margin-top: 2px;">
+                  <div>
+                    <label for="settings-move-existing" style="cursor: pointer; font-size: 0.88rem; font-weight: 500;">
+                      Move existing backup files to the new location
+                    </label>
+                    <div style="font-size: 0.78rem; color: var(--text-secondary); margin-top: 2px;">
+                      Automatically transfers all existing folder archives to the new directory so your messages remain immediately accessible in the browser.
+                    </div>
+                  </div>
+                </div>
+
+                <div class="settings-info-box">
+                  <div class="info-row">
+                    <span class="info-label">SQLite Catalog:</span>
+                    <span class="info-val" id="settings-db-path">~/.mailbackup/mailbackup.db</span>
+                  </div>
+                  <div class="info-row">
+                    <span class="info-label">Current Storage:</span>
+                    <span class="info-val" id="settings-current-storage">Loading...</span>
+                  </div>
+                </div>
+
+                <div class="form-actions" style="justify-content: flex-end; margin-top: 12px;">
+                  <button type="submit" id="btn-save-storage" class="btn btn-primary">
+                    <svg class="btn-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
+                      <polyline points="17 21 17 13 7 13 7 21"></polyline>
+                      <polyline points="7 3 7 8 15 8"></polyline>
+                    </svg>
+                    Save Storage Location
+                  </button>
+                </div>
+              </form>
             </div>
           </div>
         </div>

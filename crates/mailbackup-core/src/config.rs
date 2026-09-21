@@ -159,6 +159,20 @@ pub fn default_config_path() -> PathBuf {
     default_base_dir().join("config.yaml")
 }
 
+pub fn resolve_path(input: &str) -> PathBuf {
+    let trimmed = input.trim();
+    if trimmed.starts_with("~/") || trimmed == "~" {
+        if let Some(home) = dirs::home_dir() {
+            if trimmed == "~" {
+                return home;
+            } else {
+                return home.join(&trimmed[2..]);
+            }
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
 impl AppConfig {
     pub fn load_or_create(path: Option<&Path>) -> Result<Self> {
         let config_path = match path {
