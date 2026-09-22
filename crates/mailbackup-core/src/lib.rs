@@ -8,6 +8,8 @@ pub mod imap;
 pub mod retention;
 pub mod mbox;
 pub mod scheduler;
+pub mod autostart;
+pub mod event_log;
 pub mod error;
 
 pub use error::{Error, Result};

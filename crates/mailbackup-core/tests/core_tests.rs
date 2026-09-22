@@ -288,3 +288,79 @@ accounts: []
     assert!(!reloaded.settings.close_to_tray);
 }
 
+#[test]
+fn test_database_relocate_and_swap() {
+    let dir1 = tempdir().unwrap();
+    let dir2 = tempdir().unwrap();
+
+    let db1_path = dir1.path().join("db1.sqlite");
+    let db2_path = dir2.path().join("db2.sqlite");
+
+    let db = Database::open(&db1_path).unwrap();
+    assert_eq!(db.path(), db1_path);
+
+    // Insert an account and folder in db1
+    db.upsert_account("acc1", "Account One", "acc1@example.com", "gmail").unwrap();
+    db.get_or_create_folder("acc1", "INBOX", "inbox", None).unwrap();
+    let stats = db.get_storage_stats().unwrap();
+    assert_eq!(stats.total_accounts, 1);
+    assert_eq!(stats.total_folders, 1);
+
+    // Relocate database to db2_path
+    db.relocate(&db2_path, true).unwrap();
+    assert_eq!(db.path(), db2_path);
+    assert!(db2_path.exists());
+
+    // Verify existing data survived relocation
+    let stats_after = db.get_storage_stats().unwrap();
+    assert_eq!(stats_after.total_accounts, 1);
+    assert_eq!(stats_after.total_folders, 1);
+    let folders = db.get_folders("acc1").unwrap();
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0].remote_name, "INBOX");
+
+    // Insert a new folder into relocated db
+    db.get_or_create_folder("acc1", "Sent", "sent", None).unwrap();
+    let stats_final = db.get_storage_stats().unwrap();
+    assert_eq!(stats_final.total_folders, 2);
+}
+
+#[test]
+fn test_event_log_operations() {
+    use mailbackup_core::event_log::{clear_log, get_raw_log, get_recent_logs, log_event};
+
+    clear_log().unwrap();
+
+    log_event("ACCOUNT_ADDED", "Account 'Work' (work@corp.com) added");
+    log_event("SYNC_SUCCESS", "Account 'Work': Synced 42 messages");
+
+    let entries = get_recent_logs(10).unwrap();
+    assert!(entries.len() >= 2);
+    assert_eq!(entries[0].event_type, "SYNC_SUCCESS");
+    assert!(entries[0].details.contains("42 messages"));
+
+    let raw = get_raw_log().unwrap();
+    assert!(raw.contains("[ACCOUNT_ADDED]"));
+    assert!(raw.contains("[SYNC_SUCCESS]"));
+
+    clear_log().unwrap();
+}
+
+#[test]
+fn test_autostart_config_defaults() {
+    let default_config = AppConfig::default();
+    assert!(!default_config.settings.autostart);
+
+    let yaml = r#"
+data_dir: /tmp/mailbackup/data
+db_path: /tmp/mailbackup/mailbackup.db
+settings:
+  default_schedule: "0 0 * * *"
+  web_port: 8765
+accounts: []
+"#;
+    let loaded: AppConfig = serde_yaml::from_str(yaml).unwrap();
+    assert!(!loaded.settings.autostart);
+}
+
+

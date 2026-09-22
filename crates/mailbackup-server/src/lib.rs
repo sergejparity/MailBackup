@@ -18,9 +18,10 @@ use mailbackup_core::scheduler::BackupScheduler;
 use mailbackup_core::storage::StorageEngine;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -30,6 +31,19 @@ use tracing::{error, info};
 #[folder = "static/"]
 struct Assets;
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncStatus {
+    pub account_id: String,
+    pub account_name: String,
+    pub is_syncing: bool,
+    pub current_folder: String,
+    pub total_messages: u32,
+    pub processed_messages: u32,
+    pub downloaded_bytes: u64,
+    pub status: String,
+    pub error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
@@ -38,6 +52,7 @@ pub struct AppState {
     pub storage: StorageEngine,
     pub credentials: Arc<CredentialStore>,
     pub scheduler: Arc<Mutex<BackupScheduler>>,
+    pub active_syncs: Arc<StdRwLock<HashMap<String, SyncStatus>>>,
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -57,9 +72,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/messages/:id", get(api_get_message_detail))
         .route("/api/messages/:id/download", get(api_download_eml))
         .route("/api/search", get(api_search))
+        .route("/api/sync/status", get(api_get_sync_status))
         .route("/api/sync/:account_id", post(api_sync_account))
         .route("/api/export/mbox", post(api_export_mbox))
         .route("/api/settings", get(api_get_settings).put(api_update_settings))
+        .route("/api/logs", get(api_get_logs))
+        .route("/api/logs/download", get(api_download_logs))
+        .route("/api/logs/clear", post(api_clear_logs))
         .route("/*file", get(serve_static))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -92,6 +111,7 @@ pub async fn start_server(port_override: Option<u16>) -> Result<()> {
     }
 
     let scheduler_arc = Arc::new(Mutex::new(scheduler));
+    let active_syncs = Arc::new(StdRwLock::new(HashMap::new()));
 
     let state = AppState {
         config: config_arc,
@@ -100,6 +120,7 @@ pub async fn start_server(port_override: Option<u16>) -> Result<()> {
         storage,
         credentials,
         scheduler: scheduler_arc,
+        active_syncs,
     };
 
     let app = create_router(state);
@@ -207,6 +228,10 @@ async fn api_add_account(
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save secret: {}", e)).into_response();
     }
 
+    let acc_name_log = account.name.clone();
+    let acc_email_log = account.email.clone();
+    let acc_provider_log = format!("{:?}", account.provider);
+
     let mut cfg = state.config.write().await;
     cfg.accounts.retain(|a| a.id != id);
     cfg.accounts.push(account);
@@ -217,6 +242,11 @@ async fn api_add_account(
 
     // Reload scheduler with new account
     let _ = state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await;
+
+    mailbackup_core::event_log::log_event(
+        "ACCOUNT_ADDED",
+        &format!("Account '{}' ({}) added [Provider: {}]", acc_name_log, acc_email_log, acc_provider_log),
+    );
 
     (StatusCode::OK, "Account created").into_response()
 }
@@ -272,12 +302,20 @@ async fn api_update_account(
         }
     }
 
+    let updated_name = acc.name.clone();
+    let updated_email = acc.email.clone();
+
     if let Err(e) = cfg.save(&state.config_path) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save config: {}", e)).into_response();
     }
 
     // Reload scheduler
     let _ = state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await;
+
+    mailbackup_core::event_log::log_event(
+        "ACCOUNT_MODIFIED",
+        &format!("Account '{}' ({}) configuration updated", updated_name, updated_email),
+    );
 
     (StatusCode::OK, "Account updated").into_response()
 }
@@ -287,12 +325,18 @@ async fn api_delete_account(
     Path(account_id): Path<String>,
 ) -> impl IntoResponse {
     let mut cfg = state.config.write().await;
+    let target_name = cfg.get_account(&account_id).map(|a| a.name.clone()).unwrap_or_else(|| account_id.clone());
     cfg.accounts.retain(|a| a.id != account_id);
     let _ = state.credentials.delete_password(&account_id);
     let _ = cfg.save(&state.config_path);
 
     // Reload scheduler
     let _ = state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await;
+
+    mailbackup_core::event_log::log_event(
+        "ACCOUNT_DELETED",
+        &format!("Account '{}' (ID: {}) deleted", target_name, account_id),
+    );
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -460,6 +504,12 @@ async fn api_search(
     }
 }
 
+async fn api_get_sync_status(State(state): State<AppState>) -> impl IntoResponse {
+    let syncs = state.active_syncs.read().unwrap();
+    let list: Vec<SyncStatus> = syncs.values().cloned().collect();
+    Json(list).into_response()
+}
+
 async fn api_sync_account(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
@@ -477,12 +527,112 @@ async fn api_sync_account(
 
     let db = state.db.clone();
     let storage = state.storage.clone();
+    let active_syncs = state.active_syncs.clone();
+
+    // Register initial syncing state
+    {
+        let mut syncs = active_syncs.write().unwrap();
+        syncs.insert(
+            acc.id.clone(),
+            SyncStatus {
+                account_id: acc.id.clone(),
+                account_name: acc.name.clone(),
+                is_syncing: true,
+                current_folder: "Connecting to IMAP...".to_string(),
+                total_messages: 0,
+                processed_messages: 0,
+                downloaded_bytes: 0,
+                status: "connecting".to_string(),
+                error: None,
+            },
+        );
+    }
+
+    mailbackup_core::event_log::log_event(
+        "SYNC_STARTED",
+        &format!("Sync started for account '{}' ({})", acc.name, acc.email),
+    );
 
     tokio::spawn(async move {
         let sync_engine = ImapSyncEngine::new(db.clone(), storage.clone());
-        if let Err(e) = sync_engine.sync_account(&acc, &password, None::<fn(&_)>).await {
-            error!("Background sync error for {}: {}", acc.id, e);
+        let active_syncs_cb = active_syncs.clone();
+        let acc_id_cb = acc.id.clone();
+        let acc_name_cb = acc.name.clone();
+
+        let progress_cb = move |p: &mailbackup_core::imap::SyncProgress| {
+            if let Ok(mut syncs) = active_syncs_cb.write() {
+                syncs.insert(
+                    acc_id_cb.clone(),
+                    SyncStatus {
+                        account_id: acc_id_cb.clone(),
+                        account_name: acc_name_cb.clone(),
+                        is_syncing: true,
+                        current_folder: p.current_folder.clone(),
+                        total_messages: p.total_messages,
+                        processed_messages: p.processed_messages,
+                        downloaded_bytes: p.downloaded_bytes,
+                        status: "syncing".to_string(),
+                        error: None,
+                    },
+                );
+            }
+        };
+
+        match sync_engine.sync_account(&acc, &password, Some(progress_cb)).await {
+            Ok(p) => {
+                let mb = (p.downloaded_bytes as f64) / (1024.0 * 1024.0);
+                mailbackup_core::event_log::log_event(
+                    "SYNC_SUCCESS",
+                    &format!(
+                        "Account '{}' sync completed: {} message(s), {:.2} MB downloaded",
+                        acc.name, p.processed_messages, mb
+                    ),
+                );
+
+                if let Ok(mut syncs) = active_syncs.write() {
+                    syncs.insert(
+                        acc.id.clone(),
+                        SyncStatus {
+                            account_id: acc.id.clone(),
+                            account_name: acc.name.clone(),
+                            is_syncing: false,
+                            current_folder: "Finished".to_string(),
+                            total_messages: p.total_messages,
+                            processed_messages: p.processed_messages,
+                            downloaded_bytes: p.downloaded_bytes,
+                            status: "completed".to_string(),
+                            error: None,
+                        },
+                    );
+                }
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                error!("Background sync error for {}: {}", acc.id, err_msg);
+                mailbackup_core::event_log::log_event(
+                    "SYNC_ERROR",
+                    &format!("Account '{}' sync error: {}", acc.name, err_msg),
+                );
+
+                if let Ok(mut syncs) = active_syncs.write() {
+                    syncs.insert(
+                        acc.id.clone(),
+                        SyncStatus {
+                            account_id: acc.id.clone(),
+                            account_name: acc.name.clone(),
+                            is_syncing: false,
+                            current_folder: "Failed".to_string(),
+                            total_messages: 0,
+                            processed_messages: 0,
+                            downloaded_bytes: 0,
+                            status: "failed".to_string(),
+                            error: Some(err_msg),
+                        },
+                    );
+                }
+            }
         }
+
         // Enforce retention
         let retention = RetentionManager::new(&db, &storage);
         let _ = retention.enforce_retention(&acc.id, acc.retention_days);
@@ -543,18 +693,20 @@ pub struct SettingsResponse {
     pub notifications_enabled: bool,
     pub web_port: u16,
     pub close_to_tray: bool,
+    pub autostart: bool,
 }
 
 async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let cfg = state.config.read().await;
     let res = SettingsResponse {
         data_dir: cfg.data_dir.to_string_lossy().to_string(),
-        db_path: cfg.db_path.to_string_lossy().to_string(),
+        db_path: state.db.path().to_string_lossy().to_string(),
         default_schedule: cfg.settings.default_schedule.clone(),
         default_retention_days: cfg.settings.default_retention_days,
         notifications_enabled: cfg.settings.notifications_enabled,
         web_port: cfg.settings.web_port,
         close_to_tray: cfg.settings.close_to_tray,
+        autostart: cfg.settings.autostart,
     };
     Json(res).into_response()
 }
@@ -563,15 +715,20 @@ async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
 pub struct UpdateSettingsPayload {
     pub data_dir: Option<String>,
     pub move_existing: Option<bool>,
+    pub db_path: Option<String>,
+    pub move_db_existing: Option<bool>,
     pub close_to_tray: Option<bool>,
+    pub autostart: Option<bool>,
 }
 
 #[derive(Serialize)]
 pub struct UpdateSettingsResponse {
     pub success: bool,
     pub data_dir: String,
+    pub db_path: String,
     pub migrated_files: u64,
     pub close_to_tray: bool,
+    pub autostart: bool,
     pub message: String,
 }
 
@@ -581,8 +738,9 @@ async fn api_update_settings(
 ) -> impl IntoResponse {
     let mut migrated_files = 0u64;
     let mut resolved_storage_path = None;
+    let mut resolved_db_path = None;
 
-    // Check if new data directory is requested
+    // 1. Check if new data directory is requested
     if let Some(ref raw_dir) = payload.data_dir {
         let trimmed = raw_dir.trim();
         if !trimmed.is_empty() {
@@ -619,15 +777,46 @@ async fn api_update_settings(
 
                 // Update storage engine runtime path
                 state.storage.set_base_dir(&target_path);
+                mailbackup_core::event_log::log_event(
+                    "STORAGE_MOVED",
+                    &format!("Archive storage directory changed to {}", target_path.display()),
+                );
                 resolved_storage_path = Some(target_path);
             }
         }
     }
 
-    let current_data_dir_str;
-    let current_close_to_tray;
+    // 2. Check if new database path is requested
+    if let Some(ref raw_db) = payload.db_path {
+        let trimmed_db = raw_db.trim();
+        if !trimmed_db.is_empty() {
+            let target_db = mailbackup_core::config::resolve_path(trimmed_db);
+            let current_db = state.db.path();
 
-    // Update config and save to disk
+            if target_db != current_db {
+                let move_db = payload.move_db_existing.unwrap_or(true);
+                if let Err(e) = state.db.relocate(&target_db, move_db) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to relocate database: {}", e),
+                    )
+                        .into_response();
+                }
+                mailbackup_core::event_log::log_event(
+                    "DATABASE_MOVED",
+                    &format!("Database catalog relocated from {} to {}", current_db.display(), target_db.display()),
+                );
+                resolved_db_path = Some(target_db);
+            }
+        }
+    }
+
+    let current_data_dir_str;
+    let current_db_path_str;
+    let current_close_to_tray;
+    let current_autostart;
+
+    // 3. Update config and save to disk
     {
         let mut cfg = state.config.write().await;
 
@@ -635,8 +824,25 @@ async fn api_update_settings(
             cfg.data_dir = new_path.clone();
         }
 
+        if let Some(new_db) = resolved_db_path.as_ref() {
+            cfg.db_path = new_db.clone();
+        }
+
         if let Some(close_tray) = payload.close_to_tray {
             cfg.settings.close_to_tray = close_tray;
+            mailbackup_core::event_log::log_event(
+                "SETTINGS_UPDATED",
+                &format!("Close to system tray set to {}", close_tray),
+            );
+        }
+
+        if let Some(autostart_val) = payload.autostart {
+            let _ = mailbackup_core::autostart::set_autostart(autostart_val);
+            cfg.settings.autostart = autostart_val;
+            mailbackup_core::event_log::log_event(
+                "SETTINGS_UPDATED",
+                &format!("OS autostart set to {}", autostart_val),
+            );
         }
 
         if let Err(e) = cfg.save(&state.config_path) {
@@ -648,35 +854,74 @@ async fn api_update_settings(
         }
 
         current_data_dir_str = cfg.data_dir.to_string_lossy().to_string();
+        current_db_path_str = cfg.db_path.to_string_lossy().to_string();
         current_close_to_tray = cfg.settings.close_to_tray;
+        current_autostart = cfg.settings.autostart;
     }
 
-    // If storage location changed, reload scheduler
-    if resolved_storage_path.is_some() {
+    // 4. If storage or db location changed, reload scheduler
+    if resolved_storage_path.is_some() || resolved_db_path.is_some() {
         let mut sched = state.scheduler.lock().await;
         let cfg = state.config.read().await;
         if let Err(e) = sched.reload(Arc::new(cfg.clone())).await {
-            tracing::warn!("Failed to reload scheduler after storage path change: {}", e);
+            tracing::warn!("Failed to reload scheduler after location change: {}", e);
         }
     }
 
-    let message = if let Some(ref p) = resolved_storage_path {
-        format!(
-            "Storage location updated to {}. Migrated {} file(s).",
-            p.display(),
-            migrated_files
-        )
-    } else {
-        "Settings updated successfully.".to_string()
-    };
+    let mut messages = Vec::new();
+    if let Some(ref p) = resolved_storage_path {
+        messages.push(format!("Storage moved to {} ({} files migrated).", p.display(), migrated_files));
+    }
+    if let Some(ref db) = resolved_db_path {
+        messages.push(format!("Database catalog relocated to {}.", db.display()));
+    }
+    if messages.is_empty() {
+        messages.push("Settings updated successfully.".to_string());
+    }
 
     Json(UpdateSettingsResponse {
         success: true,
         data_dir: current_data_dir_str,
+        db_path: current_db_path_str,
         migrated_files,
         close_to_tray: current_close_to_tray,
-        message,
+        autostart: current_autostart,
+        message: messages.join(" "),
     })
     .into_response()
+}
+
+// Log Viewer Endpoints
+#[derive(Serialize)]
+pub struct LogsResponse {
+    pub logs: Vec<mailbackup_core::event_log::LogEntry>,
+    pub raw: String,
+    pub path: String,
+}
+
+async fn api_get_logs() -> impl IntoResponse {
+    let logs = mailbackup_core::event_log::get_recent_logs(200).unwrap_or_default();
+    let raw = mailbackup_core::event_log::get_raw_log().unwrap_or_default();
+    let path = mailbackup_core::event_log::log_file_path().to_string_lossy().to_string();
+    Json(LogsResponse { logs, raw, path }).into_response()
+}
+
+async fn api_download_logs() -> impl IntoResponse {
+    let raw = mailbackup_core::event_log::get_raw_log().unwrap_or_default();
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"mailbackup-events.log\"",
+        )
+        .body(Body::from(raw))
+        .unwrap()
+}
+
+async fn api_clear_logs() -> impl IntoResponse {
+    match mailbackup_core::event_log::clear_log() {
+        Ok(_) => (StatusCode::OK, "Logs cleared").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 

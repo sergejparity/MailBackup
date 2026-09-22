@@ -54,6 +54,13 @@ fn main() {
     let port = 8765;
     start_background_server(port);
 
+    // Sync OS autostart registration if configured
+    if let Ok(cfg) = mailbackup_core::config::AppConfig::load_or_create(None) {
+        if cfg.settings.autostart {
+            let _ = mailbackup_core::autostart::set_autostart(true);
+        }
+    }
+
     let quit = CustomMenuItem::new("quit".to_string(), "Quit MailBackup");
     let show = CustomMenuItem::new("show".to_string(), "Open Studio");
     let sync = CustomMenuItem::new("sync".to_string(), "Sync Now");

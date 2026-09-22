@@ -2,7 +2,7 @@ use crate::error::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -82,16 +82,19 @@ pub struct StorageStats {
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
+    current_path: Arc<Mutex<PathBuf>>,
 }
 
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let p = path.as_ref().to_path_buf();
+        let conn = Connection::open(&p)?;
         let _ = conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()));
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            current_path: Arc::new(Mutex::new(p)),
         };
         db.init_schema()?;
         Ok(db)
@@ -102,9 +105,67 @@ impl Database {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            current_path: Arc::new(Mutex::new(PathBuf::from(":memory:"))),
         };
         db.init_schema()?;
         Ok(db)
+    }
+
+    /// Returns the current path to the SQLite database file
+    pub fn path(&self) -> PathBuf {
+        self.current_path.lock().unwrap().clone()
+    }
+
+    /// Relocates the SQLite database to a new file location in-place
+    pub fn relocate(&self, new_path: impl AsRef<Path>, move_existing: bool) -> Result<()> {
+        let new_p = new_path.as_ref();
+        let old_p = self.path();
+
+        if new_p == old_p {
+            return Ok(());
+        }
+
+        if let Some(parent) = new_p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        {
+            let mut conn_guard = self.conn.lock().unwrap();
+
+            if move_existing && old_p.exists() && old_p.to_string_lossy() != ":memory:" {
+                // Checkpoint WAL cleanly so main DB file has all data
+                let _ = conn_guard.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+
+                // Copy main .db file
+                std::fs::copy(&old_p, new_p)?;
+
+                // Also copy WAL and SHM if present
+                let old_wal = format!("{}-wal", old_p.display());
+                let new_wal = format!("{}-wal", new_p.display());
+                if std::path::Path::new(&old_wal).exists() {
+                    let _ = std::fs::copy(&old_wal, &new_wal);
+                }
+                let old_shm = format!("{}-shm", old_p.display());
+                let new_shm = format!("{}-shm", new_p.display());
+                if std::path::Path::new(&old_shm).exists() {
+                    let _ = std::fs::copy(&old_shm, &new_shm);
+                }
+            }
+
+            // Open new connection on relocated path
+            let new_conn = Connection::open(new_p)?;
+            let _ = new_conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()));
+            new_conn.pragma_update(None, "synchronous", "NORMAL")?;
+            new_conn.pragma_update(None, "foreign_keys", "ON")?;
+
+            *conn_guard = new_conn;
+            *self.current_path.lock().unwrap() = new_p.to_path_buf();
+        }
+
+        // Ensure schema and tables exist on the relocated connection
+        self.init_schema()?;
+
+        Ok(())
     }
 
     fn init_schema(&self) -> Result<()> {

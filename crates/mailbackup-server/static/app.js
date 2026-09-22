@@ -75,10 +75,28 @@ const el = {
   settingsDataDir: document.getElementById('settings-data-dir'),
   settingsMoveExisting: document.getElementById('settings-move-existing'),
   settingsDbPath: document.getElementById('settings-db-path'),
+  settingsDbPathInput: document.getElementById('settings-db-path-input'),
+  settingsMoveDbExisting: document.getElementById('settings-move-db-existing'),
   settingsCurrentStorage: document.getElementById('settings-current-storage'),
   btnSaveStorage: document.getElementById('btn-save-storage'),
   settingsCloseToTray: document.getElementById('settings-close-to-tray'),
   traySettingStatus: document.getElementById('tray-setting-status'),
+  settingsAutostart: document.getElementById('settings-autostart'),
+  autostartSettingStatus: document.getElementById('autostart-setting-status'),
+
+  // Header & Logs Elements
+  syncProgressBanner: document.getElementById('sync-progress-banner'),
+  syncStatusTitle: document.getElementById('sync-status-title'),
+  syncStatusSubtitle: document.getElementById('sync-status-subtitle'),
+  syncProgressBarFill: document.getElementById('sync-progress-bar-fill'),
+  btnOpenLogs: document.getElementById('btn-open-logs'),
+  logsFilter: document.getElementById('logs-filter'),
+  btnRefreshLogs: document.getElementById('btn-refresh-logs'),
+  btnDownloadLogs: document.getElementById('btn-download-logs'),
+  btnClearLogs: document.getElementById('btn-clear-logs'),
+  logsEntriesList: document.getElementById('logs-entries-list'),
+  logsFilePath: document.getElementById('logs-file-path'),
+  logsEntryCount: document.getElementById('logs-entry-count'),
 };
 
 // Initialization
@@ -115,11 +133,27 @@ function initEventListeners() {
   // Storage Settings Form
   if (el.settingsStorageForm) el.settingsStorageForm.addEventListener('submit', handleSaveStorageSettings);
   if (el.settingsCloseToTray) el.settingsCloseToTray.addEventListener('change', handleToggleCloseToTray);
+  if (el.settingsAutostart) el.settingsAutostart.addEventListener('change', handleToggleAutostart);
+
+  // Logs Actions & Direct Nav
+  if (el.btnOpenLogs) {
+    el.btnOpenLogs.addEventListener('click', () => {
+      openModal(el.settingsModal);
+      switchTab('tab-logs');
+    });
+  }
+  if (el.logsFilter) el.logsFilter.addEventListener('change', () => renderLogs(cachedLogs));
+  if (el.btnRefreshLogs) el.btnRefreshLogs.addEventListener('click', loadLogs);
+  if (el.btnDownloadLogs) el.btnDownloadLogs.addEventListener('click', handleDownloadLogs);
+  if (el.btnClearLogs) el.btnClearLogs.addEventListener('click', handleClearLogs);
 
   // Tab switching in settings modal
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', () => switchTab(btn.dataset.tab));
   });
+
+  // Start live sync progress background poller
+  startSyncProgressPolling();
 
   // Sorting
   if (el.sortSelect) {
@@ -210,6 +244,8 @@ function switchTab(tabId) {
   });
   if (tabId === 'tab-settings') {
     loadSettings();
+  } else if (tabId === 'tab-logs') {
+    loadLogs();
   }
 }
 
@@ -745,12 +781,19 @@ async function loadSettings() {
     if (el.settingsDataDir) {
       el.settingsDataDir.value = data.data_dir;
     }
+    if (el.settingsDbPathInput) {
+      el.settingsDbPathInput.value = data.db_path;
+    }
     if (el.settingsDbPath) {
       el.settingsDbPath.textContent = data.db_path;
     }
     if (el.settingsCloseToTray) {
       el.settingsCloseToTray.checked = data.close_to_tray !== false;
       updateTrayBadge(el.settingsCloseToTray.checked);
+    }
+    if (el.settingsAutostart) {
+      el.settingsAutostart.checked = !!data.autostart;
+      updateAutostartBadge(data.autostart);
     }
   } catch (err) {
     console.error('Failed to load settings:', err);
@@ -767,6 +810,19 @@ function updateTrayBadge(enabled) {
     el.traySettingStatus.textContent = 'Disabled';
     el.traySettingStatus.style.background = 'rgba(239, 68, 68, 0.15)';
     el.traySettingStatus.style.color = '#f87171';
+  }
+}
+
+function updateAutostartBadge(enabled) {
+  if (!el.autostartSettingStatus) return;
+  if (enabled) {
+    el.autostartSettingStatus.textContent = 'Enabled';
+    el.autostartSettingStatus.style.background = 'rgba(34, 197, 94, 0.15)';
+    el.autostartSettingStatus.style.color = '#4ade80';
+  } else {
+    el.autostartSettingStatus.textContent = 'Disabled';
+    el.autostartSettingStatus.style.background = 'rgba(148, 163, 184, 0.15)';
+    el.autostartSettingStatus.style.color = 'var(--text-secondary)';
   }
 }
 
@@ -802,16 +858,53 @@ async function handleToggleCloseToTray(e) {
   }
 }
 
+async function handleToggleAutostart(e) {
+  const isChecked = e.target.checked;
+  updateAutostartBadge(isChecked);
+
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        autostart: isChecked,
+      }),
+    });
+
+    if (res.ok) {
+      showToast(
+        isChecked
+          ? 'Autostart Enabled: MailBackup will launch on system login 🚀'
+          : 'Autostart Disabled 🛑'
+      );
+    } else {
+      const errText = await res.text();
+      showToast(`Failed to update autostart: ${errText}`);
+      e.target.checked = !isChecked;
+      updateAutostartBadge(!isChecked);
+    }
+  } catch (err) {
+    showToast(`Error updating autostart: ${err.message}`);
+    e.target.checked = !isChecked;
+    updateAutostartBadge(!isChecked);
+  }
+}
+
 async function handleSaveStorageSettings(e) {
   e.preventDefault();
   const newDir = el.settingsDataDir.value.trim();
+  const newDb = el.settingsDbPathInput ? el.settingsDbPathInput.value.trim() : '';
+
   if (!newDir) {
     showToast('Please enter a valid directory path');
     return;
   }
 
   const moveExisting = el.settingsMoveExisting ? el.settingsMoveExisting.checked : true;
+  const moveDbExisting = el.settingsMoveDbExisting ? el.settingsMoveDbExisting.checked : true;
   const closeToTray = el.settingsCloseToTray ? el.settingsCloseToTray.checked : true;
+  const autostartVal = el.settingsAutostart ? el.settingsAutostart.checked : false;
+
   const btn = el.btnSaveStorage;
   const originalHtml = btn ? btn.innerHTML : '';
   if (btn) {
@@ -826,32 +919,192 @@ async function handleSaveStorageSettings(e) {
       body: JSON.stringify({
         data_dir: newDir,
         move_existing: moveExisting,
+        db_path: newDb || undefined,
+        move_db_existing: moveDbExisting,
         close_to_tray: closeToTray,
+        autostart: autostartVal,
       }),
     });
 
     if (res.ok) {
       const data = await res.json();
       if (el.settingsDataDir) el.settingsDataDir.value = data.data_dir;
+      if (el.settingsDbPathInput) el.settingsDbPathInput.value = data.db_path;
+      if (el.settingsDbPath) el.settingsDbPath.textContent = data.db_path;
       if (el.settingsCloseToTray) {
         el.settingsCloseToTray.checked = data.close_to_tray !== false;
         updateTrayBadge(el.settingsCloseToTray.checked);
       }
-      showToast(`Storage updated! ${data.migrated_files} file(s) migrated. ✅`);
+      if (el.settingsAutostart) {
+        el.settingsAutostart.checked = !!data.autostart;
+        updateAutostartBadge(data.autostart);
+      }
+      showToast(data.message || 'Settings saved successfully! ✅');
       await loadStats();
       if (state.selectedAccountId) {
         await loadFolders(state.selectedAccountId);
       }
     } else {
       const errText = await res.text();
-      showToast(`Failed to update storage: ${errText}`);
+      showToast(`Failed to update settings: ${errText}`);
     }
   } catch (err) {
-    showToast(`Error updating storage: ${err.message}`);
+    showToast(`Error updating settings: ${err.message}`);
   } finally {
     if (btn) {
       btn.disabled = false;
       btn.innerHTML = originalHtml;
     }
+  }
+}
+
+// Live Sync Progress Polling
+let isSyncActive = false;
+let syncPollTimer = null;
+
+function startSyncProgressPolling() {
+  checkSyncProgress();
+  if (syncPollTimer) clearTimeout(syncPollTimer);
+  syncPollTimer = setTimeout(startSyncProgressPolling, isSyncActive ? 750 : 2500);
+}
+
+async function checkSyncProgress() {
+  try {
+    const res = await fetch('/api/sync/status');
+    if (!res.ok) return;
+    const list = await res.json();
+    const activeSync = list.find(s => s.is_syncing);
+
+    if (activeSync) {
+      isSyncActive = true;
+      if (el.syncProgressBanner) el.syncProgressBanner.style.display = 'flex';
+
+      const total = activeSync.total_messages || 0;
+      const processed = activeSync.processed_messages || 0;
+      const pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+      const mb = (activeSync.downloaded_bytes / (1024 * 1024)).toFixed(1);
+
+      if (el.syncStatusTitle) {
+        el.syncStatusTitle.textContent = `Syncing ${activeSync.account_name}: ${activeSync.current_folder || 'Connecting...'}`;
+      }
+      if (el.syncStatusSubtitle) {
+        if (total > 0) {
+          el.syncStatusSubtitle.textContent = `${processed} / ${total} msgs (${pct}%) • ${mb} MB`;
+        } else {
+          el.syncStatusSubtitle.textContent = activeSync.current_folder || 'Connecting to server...';
+        }
+      }
+      if (el.syncProgressBarFill) {
+        el.syncProgressBarFill.style.width = `${total > 0 ? pct : 30}%`;
+        el.syncProgressBarFill.style.background = 'linear-gradient(90deg, var(--primary), var(--accent-cyan))';
+      }
+    } else {
+      if (isSyncActive) {
+        isSyncActive = false;
+        if (el.syncStatusTitle) el.syncStatusTitle.textContent = 'Sync Finished! ✅';
+        if (el.syncStatusSubtitle) el.syncStatusSubtitle.textContent = 'All messages up to date';
+        if (el.syncProgressBarFill) {
+          el.syncProgressBarFill.style.width = '100%';
+          el.syncProgressBarFill.style.background = '#22c55e';
+        }
+        await loadStats();
+        if (state.selectedAccountId) {
+          await loadFolders(state.selectedAccountId);
+        }
+        setTimeout(() => {
+          if (!isSyncActive && el.syncProgressBanner) {
+            el.syncProgressBanner.style.display = 'none';
+          }
+        }, 3500);
+      } else if (el.syncProgressBanner && el.syncProgressBanner.style.display !== 'none') {
+        el.syncProgressBanner.style.display = 'none';
+      }
+    }
+  } catch (err) {
+    console.error('Error polling sync status:', err);
+  }
+}
+
+// Event Logs Functions
+let cachedLogs = [];
+
+async function loadLogs() {
+  try {
+    const res = await fetch('/api/logs');
+    if (!res.ok) return;
+    const data = await res.json();
+    cachedLogs = data.logs || [];
+
+    if (el.logsFilePath) {
+      el.logsFilePath.textContent = data.path || '';
+    }
+
+    renderLogs(cachedLogs);
+  } catch (err) {
+    console.error('Failed to load logs:', err);
+  }
+}
+
+function renderLogs(logs) {
+  if (!el.logsEntriesList) return;
+  const filterVal = el.logsFilter ? el.logsFilter.value : 'ALL';
+
+  let filtered = logs;
+  if (filterVal === 'ACCOUNT') {
+    filtered = logs.filter(l => l.event_type.startsWith('ACCOUNT'));
+  } else if (filterVal === 'SYNC') {
+    filtered = logs.filter(l => l.event_type.startsWith('SYNC'));
+  } else if (filterVal === 'STORAGE') {
+    filtered = logs.filter(l => l.event_type.includes('MOVED') || l.event_type.includes('SETTINGS'));
+  } else if (filterVal === 'ERROR') {
+    filtered = logs.filter(l => l.event_type.includes('ERROR') || l.event_type.includes('FAIL'));
+  }
+
+  if (el.logsEntryCount) {
+    el.logsEntryCount.textContent = `${filtered.length} of ${logs.length} events`;
+  }
+
+  if (filtered.length === 0) {
+    el.logsEntriesList.innerHTML = `<div style="color: #64748B; padding: 12px 0;">No matching event entries found.</div>`;
+    return;
+  }
+
+  el.logsEntriesList.innerHTML = filtered.map(item => {
+    let tagClass = 'tag-system';
+    const type = item.event_type;
+    if (type.startsWith('ACCOUNT')) tagClass = 'tag-account';
+    else if (type.includes('SUCCESS')) tagClass = 'tag-success';
+    else if (type.includes('ERROR') || type.includes('FAIL')) tagClass = 'tag-error';
+    else if (type.startsWith('SYNC')) tagClass = 'tag-sync';
+
+    const timeStr = new Date(item.timestamp).toLocaleTimeString();
+    const dateStr = new Date(item.timestamp).toLocaleDateString();
+
+    return `
+      <div class="log-entry-row">
+        <span class="log-ts">${dateStr} ${timeStr}</span>
+        <span class="log-badge ${tagClass}">[${escapeHtml(type)}]</span>
+        <span class="log-msg">${escapeHtml(item.details)}</span>
+      </div>
+    `;
+  }).join('');
+}
+
+function handleDownloadLogs() {
+  window.open('/api/logs/download', '_blank');
+}
+
+async function handleClearLogs() {
+  if (!confirm('Are you sure you want to clear the event logs history?')) return;
+  try {
+    const res = await fetch('/api/logs/clear', { method: 'POST' });
+    if (res.ok) {
+      showToast('Event logs cleared! 🧹');
+      await loadLogs();
+    } else {
+      showToast('Failed to clear logs');
+    }
+  } catch (err) {
+    showToast(`Error: ${err.message}`);
   }
 }

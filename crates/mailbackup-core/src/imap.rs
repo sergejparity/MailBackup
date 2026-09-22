@@ -5,6 +5,7 @@ use crate::storage::StorageEngine;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use mail_parser::{Address, MessageParser, MimeHeaders};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -12,6 +13,7 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncProgress {
     pub account_id: String,
     pub current_folder: String,
