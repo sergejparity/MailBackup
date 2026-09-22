@@ -879,6 +879,37 @@ async function selectMessage(messageId) {
     if (!res.ok) return;
     const msg = await res.json();
 
+    // Auto-focus the account/folder for this message
+    if (msg.account_id && msg.folder_id) {
+      let needsRender = false;
+      
+      if (state.selectedAccountId !== msg.account_id || state.selectedFolderId !== msg.folder_id) {
+        state.selectedAccountId = msg.account_id;
+        state.selectedFolderId = msg.folder_id;
+        needsRender = true;
+      }
+      
+      if (!state.expandedAccounts.has(msg.account_id)) {
+        state.expandedAccounts.add(msg.account_id);
+        needsRender = true;
+      }
+
+      if (needsRender) {
+        if (!state.accountFolders[msg.account_id]) {
+          await loadFolders(msg.account_id);
+        } else {
+          renderAccounts();
+        }
+        
+        setTimeout(() => {
+          const activeFolder = document.querySelector('.folder-item.active');
+          if (activeFolder) {
+            activeFolder.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          }
+        }, 50);
+      }
+    }
+
     el.readerEmpty.style.display = 'none';
     el.readerContent.style.display = 'flex';
 
