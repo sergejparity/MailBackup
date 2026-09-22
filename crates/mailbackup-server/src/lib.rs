@@ -103,6 +103,7 @@ pub async fn start_server_with_options(
     let port = port_override.unwrap_or(config.settings.web_port);
 
     let config_arc = Arc::new(RwLock::new(config.clone()));
+    let active_syncs = Arc::new(StdRwLock::new(HashMap::new()));
 
     // Initialize and start background scheduler
     let mut scheduler = BackupScheduler::new(
@@ -113,6 +114,85 @@ pub async fn start_server_with_options(
     )
     .await?;
 
+    let active_syncs_for_sched = active_syncs.clone();
+    scheduler.set_status_listener(Some(Arc::new(
+        move |acc_id: &str, acc_name: &str, status: &str, progress: Option<&mailbackup_core::imap::SyncProgress>, err: Option<&str>| {
+            if let Ok(mut syncs) = active_syncs_for_sched.write() {
+                match status {
+                    "started" => {
+                        syncs.insert(
+                            acc_id.to_string(),
+                            SyncStatus {
+                                account_id: acc_id.to_string(),
+                                account_name: acc_name.to_string(),
+                                is_syncing: true,
+                                current_folder: "Starting...".to_string(),
+                                total_messages: 0,
+                                processed_messages: 0,
+                                downloaded_bytes: 0,
+                                status: "syncing".to_string(),
+                                error: None,
+                            },
+                        );
+                    }
+                    "syncing" => {
+                        if let Some(p) = progress {
+                            syncs.insert(
+                                acc_id.to_string(),
+                                SyncStatus {
+                                    account_id: acc_id.to_string(),
+                                    account_name: acc_name.to_string(),
+                                    is_syncing: true,
+                                    current_folder: p.current_folder.clone(),
+                                    total_messages: p.total_messages,
+                                    processed_messages: p.processed_messages,
+                                    downloaded_bytes: p.downloaded_bytes,
+                                    status: "syncing".to_string(),
+                                    error: None,
+                                },
+                            );
+                        }
+                    }
+                    "completed" => {
+                        if let Some(p) = progress {
+                            syncs.insert(
+                                acc_id.to_string(),
+                                SyncStatus {
+                                    account_id: acc_id.to_string(),
+                                    account_name: acc_name.to_string(),
+                                    is_syncing: false,
+                                    current_folder: "Finished".to_string(),
+                                    total_messages: p.total_messages,
+                                    processed_messages: p.processed_messages,
+                                    downloaded_bytes: p.downloaded_bytes,
+                                    status: "completed".to_string(),
+                                    error: None,
+                                },
+                            );
+                        }
+                    }
+                    "error" => {
+                        syncs.insert(
+                            acc_id.to_string(),
+                            SyncStatus {
+                                account_id: acc_id.to_string(),
+                                account_name: acc_name.to_string(),
+                                is_syncing: false,
+                                current_folder: "Failed".to_string(),
+                                total_messages: 0,
+                                processed_messages: 0,
+                                downloaded_bytes: 0,
+                                status: "failed".to_string(),
+                                error: err.map(|s| s.to_string()),
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        },
+    )));
+
     if let Err(e) = scheduler.start().await {
         error!("Failed to start backup scheduler: {}", e);
     } else {
@@ -120,7 +200,6 @@ pub async fn start_server_with_options(
     }
 
     let scheduler_arc = Arc::new(Mutex::new(scheduler));
-    let active_syncs = Arc::new(StdRwLock::new(HashMap::new()));
 
     let state = AppState {
         config: config_arc,

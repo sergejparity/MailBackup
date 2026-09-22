@@ -427,6 +427,11 @@ async fn handle_sync(
         // Record account in DB
         db.upsert_account(&acc.id, &acc.name, &acc.email, &format!("{:?}", acc.provider))?;
 
+        mailbackup_core::event_log::log_event(
+            "SYNC_STARTED",
+            &format!("CLI sync started for account '{}' ({})", acc.name, acc.email),
+        );
+
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::default_spinner()
@@ -449,15 +454,28 @@ async fn handle_sync(
 
         match sync_engine.sync_account(acc, &password, Some(progress_cb)).await {
             Ok(progress) => {
+                let mb = (progress.downloaded_bytes as f64) / (1024.0 * 1024.0);
+                mailbackup_core::event_log::log_event(
+                    "SYNC_SUCCESS",
+                    &format!(
+                        "Account '{}' CLI sync completed: {} message(s), {:.2} MB downloaded",
+                        acc.name, progress.processed_messages, mb
+                    ),
+                );
                 pb.finish_with_message(format!(
                     "{} Done! Synced {} new messages ({:.2} MB)",
                     CHECK_EMOJI,
                     progress.processed_messages,
-                    (progress.downloaded_bytes as f64) / (1024.0 * 1024.0)
+                    mb
                 ));
             }
             Err(e) => {
-                pb.abandon_with_message(format!("{} Sync failed: {}", style("ERROR").red(), e));
+                let err_msg = e.to_string();
+                mailbackup_core::event_log::log_event(
+                    "SYNC_ERROR",
+                    &format!("Account '{}' CLI sync error: {}", acc.name, err_msg),
+                );
+                pb.abandon_with_message(format!("{} Sync failed: {}", style("ERROR").red(), err_msg));
             }
         }
 
@@ -465,11 +483,19 @@ async fn handle_sync(
         let retention = RetentionManager::new(db, storage);
         if let Ok(report) = retention.enforce_retention(&acc.id, acc.retention_days) {
             if report.pruned_count > 0 {
+                let mb = (report.reclaimed_bytes as f64) / (1024.0 * 1024.0);
+                mailbackup_core::event_log::log_event(
+                    "RETENTION_CLEANUP",
+                    &format!(
+                        "Retention cleanup for account '{}': pruned {} message(s), {:.2} MB reclaimed",
+                        acc.name, report.pruned_count, mb
+                    ),
+                );
                 println!(
                     "{} Retention policy: pruned {} expired messages ({:.2} MB reclaimed)",
                     CHECK_EMOJI,
                     report.pruned_count,
-                    (report.reclaimed_bytes as f64) / (1024.0 * 1024.0)
+                    mb
                 );
             }
         }

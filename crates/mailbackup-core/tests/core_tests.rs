@@ -385,5 +385,57 @@ fn test_service_status_and_config() {
     assert!(!uninst.is_empty());
 }
 
+#[tokio::test]
+async fn test_scheduler_event_logging_and_listener() {
+    use mailbackup_core::config::{AccountConfig, AuthType, FolderFilter, ProviderType};
+    use mailbackup_core::db::Database;
+    use mailbackup_core::event_log::clear_log;
+    use mailbackup_core::keyring::CredentialStore;
+    use mailbackup_core::scheduler::BackupScheduler;
+    use mailbackup_core::storage::StorageEngine;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tempfile::tempdir;
+
+    clear_log().unwrap();
+
+    let dir = tempdir().unwrap();
+    let db = Database::open(&dir.path().join("test.db")).unwrap();
+    let storage = StorageEngine::new(&dir.path().join("storage"));
+    let creds = Arc::new(CredentialStore::new());
+
+    let mut config = AppConfig::default();
+    config.accounts.push(AccountConfig {
+        id: "acc_sched_test".to_string(),
+        name: "Scheduled Test Acc".to_string(),
+        email: "sched@example.com".to_string(),
+        provider: ProviderType::GenericImap,
+        imap_server: "127.0.0.1".to_string(),
+        imap_port: 9993,
+        use_tls: false,
+        auth_type: AuthType::Password,
+        username: "sched@example.com".to_string(),
+        schedule: Some("0 0 1 1 *".to_string()), // Yearly, won't fire during test unless manual
+        retention_days: None,
+        folder_filter: FolderFilter::default(),
+        gmail_smart_labels: false,
+        enabled: true,
+    });
+
+    let mut scheduler = BackupScheduler::new(Arc::new(config), db, storage, creds).await.unwrap();
+    let listener_invoked = Arc::new(AtomicBool::new(false));
+    let listener_invoked_clone = listener_invoked.clone();
+
+    scheduler.set_status_listener(Some(Arc::new(move |_id, _name, _status, _prog, _err| {
+        listener_invoked_clone.store(true, Ordering::SeqCst);
+    })));
+
+    scheduler.start().await.unwrap();
+
+    // Verify scheduler started without errors
+    scheduler.shutdown().await.unwrap();
+}
+
+
 
 

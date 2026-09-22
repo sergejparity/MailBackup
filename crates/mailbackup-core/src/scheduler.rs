@@ -23,12 +23,24 @@ pub fn normalize_cron(expr: &str) -> String {
     }
 }
 
+pub type SchedulerStatusCallback = Arc<
+    dyn Fn(
+            &str, // account_id
+            &str, // account_name
+            &str, // event: "started" | "syncing" | "completed" | "error"
+            Option<&crate::imap::SyncProgress>,
+            Option<&str>, // error message if any
+        ) + Send
+        + Sync,
+>;
+
 pub struct BackupScheduler {
     scheduler: JobScheduler,
     config: Arc<AppConfig>,
     db: Database,
     storage: StorageEngine,
     credentials: Arc<CredentialStore>,
+    status_listener: Option<SchedulerStatusCallback>,
 }
 
 impl BackupScheduler {
@@ -48,7 +60,12 @@ impl BackupScheduler {
             db,
             storage,
             credentials,
+            status_listener: None,
         })
+    }
+
+    pub fn set_status_listener(&mut self, listener: Option<SchedulerStatusCallback>) {
+        self.status_listener = listener;
     }
 
     pub async fn start(&mut self) -> Result<()> {
@@ -77,6 +94,7 @@ impl BackupScheduler {
             let db_clone = self.db.clone();
             let storage_clone = self.storage.clone();
             let creds_clone = self.credentials.clone();
+            let status_listener_clone = self.status_listener.clone();
 
             info!(
                 "Registering scheduled backup for account '{}' ({}) with cron: '{}' (normalized: '{}')",
@@ -88,34 +106,86 @@ impl BackupScheduler {
                 let db = db_clone.clone();
                 let storage = storage_clone.clone();
                 let creds = creds_clone.clone();
+                let status_listener = status_listener_clone.clone();
 
                 Box::pin(async move {
-                    info!("Starting scheduled backup for account '{}'", acc.id);
+                    info!("Starting scheduled backup for account '{}' ({})", acc.name, acc.email);
+                    crate::event_log::log_event(
+                        "SYNC_STARTED",
+                        &format!("Scheduled background sync started for account '{}' ({})", acc.name, acc.email),
+                    );
+
+                    if let Some(ref l) = status_listener {
+                        l(&acc.id, &acc.name, "started", None, None);
+                    }
+
                     let password = match creds.get_password(&acc.id) {
                         Ok(p) => p,
                         Err(e) => {
-                            error!("Scheduled backup failed for '{}': cannot retrieve password ({})", acc.id, e);
+                            let err_msg = format!("Scheduled backup failed for account '{}': cannot retrieve password ({})", acc.name, e);
+                            error!("{}", err_msg);
+                            crate::event_log::log_event("SYNC_ERROR", &err_msg);
+                            if let Some(ref l) = status_listener {
+                                l(&acc.id, &acc.name, "error", None, Some(&err_msg));
+                            }
                             return;
                         }
                     };
 
                     let sync_engine = ImapSyncEngine::new(db.clone(), storage.clone());
-                    match sync_engine.sync_account(&acc, &password, None::<fn(&_)>).await {
+                    let listener_cb = status_listener.clone();
+                    let acc_id_cb = acc.id.clone();
+                    let acc_name_cb = acc.name.clone();
+
+                    let progress_cb = move |p: &crate::imap::SyncProgress| {
+                        if let Some(ref l) = listener_cb {
+                            l(&acc_id_cb, &acc_name_cb, "syncing", Some(p), None);
+                        }
+                    };
+
+                    match sync_engine.sync_account(&acc, &password, Some(progress_cb)).await {
                         Ok(progress) => {
-                            info!(
-                                "Scheduled backup completed for '{}': {} messages ({} bytes)",
-                                acc.id, progress.processed_messages, progress.downloaded_bytes
+                            let mb = (progress.downloaded_bytes as f64) / (1024.0 * 1024.0);
+                            let msg = format!(
+                                "Scheduled background sync completed for account '{}': {} message(s), {:.2} MB downloaded",
+                                acc.name, progress.processed_messages, mb
                             );
+                            info!("{}", msg);
+                            crate::event_log::log_event("SYNC_SUCCESS", &msg);
+
+                            if let Some(ref l) = status_listener {
+                                l(&acc.id, &acc.name, "completed", Some(&progress), None);
+                            }
                         }
                         Err(e) => {
-                            error!("Scheduled backup error for '{}': {}", acc.id, e);
+                            let err_msg = format!("Scheduled background sync error for account '{}': {}", acc.name, e);
+                            error!("{}", err_msg);
+                            crate::event_log::log_event("SYNC_ERROR", &err_msg);
+
+                            if let Some(ref l) = status_listener {
+                                l(&acc.id, &acc.name, "error", None, Some(&err_msg));
+                            }
                         }
                     }
 
                     // Enforce retention policy
                     let retention = RetentionManager::new(&db, &storage);
-                    if let Err(e) = retention.enforce_retention(&acc.id, acc.retention_days) {
-                        warn!("Scheduled retention cleanup failed for '{}': {}", acc.id, e);
+                    match retention.enforce_retention(&acc.id, acc.retention_days) {
+                        Ok(report) => {
+                            if report.pruned_count > 0 {
+                                let mb = (report.reclaimed_bytes as f64) / (1024.0 * 1024.0);
+                                crate::event_log::log_event(
+                                    "RETENTION_CLEANUP",
+                                    &format!(
+                                        "Retention cleanup for account '{}': pruned {} message(s), {:.2} MB reclaimed",
+                                        acc.name, report.pruned_count, mb
+                                    ),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Scheduled retention cleanup failed for '{}': {}", acc.id, e);
+                        }
                     }
                 })
             }).map_err(|e| Error::Other(format!("Invalid cron expression '{}' (raw: '{}'): {}", cron_expr, raw_cron, e)))?;
@@ -128,11 +198,13 @@ impl BackupScheduler {
     }
 
     pub async fn reload(&mut self, new_config: Arc<AppConfig>) -> Result<()> {
+        let listener = self.status_listener.clone();
         let _ = self.scheduler.shutdown().await;
         self.config = new_config;
         self.scheduler = JobScheduler::new().await.map_err(|e| {
             Error::Other(format!("Failed to recreate job scheduler: {}", e))
         })?;
+        self.status_listener = listener;
         self.start().await?;
         info!("Backup scheduler reloaded with updated account configurations");
         Ok(())
