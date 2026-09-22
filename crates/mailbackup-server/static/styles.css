@@ -364,7 +364,7 @@ body.is-modal-resizing * {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  max-height: 180px;
+  flex: 1;
   overflow-y: auto;
 }
 
