@@ -916,7 +916,14 @@ async function selectMessage(messageId) {
     el.viewSubject.textContent = msg.subject || '(No Subject)';
     el.viewFrom.textContent = msg.from_addr || 'Unknown';
     el.viewTo.textContent = msg.to_addrs || 'Undisclosed recipients';
-    el.viewFolderTag.textContent = msg.folder_name || 'MAILBOX';
+    let folderName = msg.folder_name || 'MAILBOX';
+    if (msg.account_id && msg.folder_id && state.accountFolders[msg.account_id]) {
+      const matchedFolder = state.accountFolders[msg.account_id].find(f => f.id === msg.folder_id);
+      if (matchedFolder) {
+        folderName = matchedFolder.remote_name;
+      }
+    }
+    el.viewFolderTag.textContent = folderName;
     el.viewDateTag.textContent = msg.date ? new Date(msg.date).toLocaleString() : '';
 
     const firstLetter = (msg.from_addr || 'U')[0].toUpperCase();

@@ -489,6 +489,8 @@ async fn api_get_messages(
 #[derive(Serialize)]
 struct MessageDetailResponse {
     id: String,
+    account_id: String,
+    folder_id: String,
     subject: Option<String>,
     from_addr: Option<String>,
     to_addrs: Option<String>,
@@ -539,6 +541,8 @@ async fn api_get_message_detail(
 
     let resp = MessageDetailResponse {
         id: msg_rec.id,
+        account_id: msg_rec.account_id,
+        folder_id: msg_rec.folder_id,
         subject: msg_rec.subject,
         from_addr: msg_rec.from_addr,
         to_addrs: msg_rec.to_addrs,
