@@ -108,11 +108,297 @@ const el = {
 
 // Initialization
 document.addEventListener('DOMContentLoaded', () => {
+  initSplitterResizing();
+  initModalResizing();
   initEventListeners();
   loadStats();
   loadAccounts();
   loadSettings();
 });
+
+// Workspace Panes Draggable Splitters
+function initSplitterResizing() {
+  const sidebar = document.getElementById('sidebar-pane');
+  const resizerSidebar = document.getElementById('resizer-sidebar');
+  const msgList = document.getElementById('email-list-pane');
+  const resizerMsgList = document.getElementById('resizer-msglist');
+
+  if (!sidebar || !resizerSidebar || !msgList || !resizerMsgList) return;
+
+  // Restore saved widths from localStorage
+  const savedSidebar = localStorage.getItem('mailbackup_sidebar_width');
+  if (savedSidebar) {
+    const w = parseInt(savedSidebar, 10);
+    if (!isNaN(w) && w >= 180 && w <= 480) {
+      sidebar.style.width = `${w}px`;
+    }
+  }
+
+  const savedMsgList = localStorage.getItem('mailbackup_msglist_width');
+  if (savedMsgList) {
+    const w = parseInt(savedMsgList, 10);
+    if (!isNaN(w) && w >= 240 && w <= 850) {
+      msgList.style.width = `${w}px`;
+    }
+  }
+
+  // 1. Sidebar Resizer
+  resizerSidebar.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = sidebar.getBoundingClientRect().width;
+    document.body.classList.add('is-resizing');
+    resizerSidebar.classList.add('is-active');
+
+    function onMouseMove(moveEvent) {
+      const delta = moveEvent.clientX - startX;
+      let newWidth = startWidth + delta;
+      const maxAllowed = Math.min(480, window.innerWidth - 550);
+      newWidth = Math.max(180, Math.min(newWidth, Math.max(180, maxAllowed)));
+      sidebar.style.width = `${newWidth}px`;
+    }
+
+    function onMouseUp() {
+      document.body.classList.remove('is-resizing');
+      resizerSidebar.classList.remove('is-active');
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      localStorage.setItem('mailbackup_sidebar_width', Math.round(sidebar.getBoundingClientRect().width));
+    }
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  });
+
+  // Double click sidebar resizer to reset to default 260px
+  resizerSidebar.addEventListener('dblclick', () => {
+    sidebar.style.width = '260px';
+    localStorage.removeItem('mailbackup_sidebar_width');
+  });
+
+  // 2. Message List Resizer
+  resizerMsgList.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = msgList.getBoundingClientRect().width;
+    document.body.classList.add('is-resizing');
+    resizerMsgList.classList.add('is-active');
+
+    function onMouseMove(moveEvent) {
+      const delta = moveEvent.clientX - startX;
+      let newWidth = startWidth + delta;
+      const sidebarW = sidebar.getBoundingClientRect().width;
+      const maxAllowed = Math.min(850, window.innerWidth - sidebarW - 320);
+      newWidth = Math.max(240, Math.min(newWidth, Math.max(240, maxAllowed)));
+      msgList.style.width = `${newWidth}px`;
+    }
+
+    function onMouseUp() {
+      document.body.classList.remove('is-resizing');
+      resizerMsgList.classList.remove('is-active');
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      localStorage.setItem('mailbackup_msglist_width', Math.round(msgList.getBoundingClientRect().width));
+    }
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  });
+
+  // Double click message list resizer to reset to default 380px
+  resizerMsgList.addEventListener('dblclick', () => {
+    msgList.style.width = '380px';
+    localStorage.removeItem('mailbackup_msglist_width');
+  });
+
+  // Keep panes responsive if window is shrunk
+  window.addEventListener('resize', () => {
+    const totalW = window.innerWidth;
+    const sidebarW = sidebar.getBoundingClientRect().width;
+    const msgListW = msgList.getBoundingClientRect().width;
+    if (sidebarW + msgListW + 300 > totalW) {
+      const excess = (sidebarW + msgListW + 300) - totalW;
+      const newMsgW = Math.max(240, msgListW - excess);
+      msgList.style.width = `${newMsgW}px`;
+    }
+  });
+}
+
+// Modal Resizing & Maximize/Restore
+function initModalResizing() {
+  setupModalResizing({
+    cardId: 'settings-modal-card',
+    headerId: 'settings-modal-header',
+    maxBtnId: 'btn-maximize-modal',
+    storageKey: 'mailbackup_settings_modal_size',
+    defaultWidth: 720,
+    defaultHeight: 580,
+  });
+
+  setupModalResizing({
+    cardId: 'edit-account-modal-card',
+    headerId: 'edit-account-modal-header',
+    maxBtnId: 'btn-maximize-edit-modal',
+    storageKey: 'mailbackup_edit_modal_size',
+    defaultWidth: 640,
+    defaultHeight: 540,
+  });
+}
+
+function setupModalResizing(options) {
+  const { cardId, headerId, maxBtnId, storageKey, defaultWidth, defaultHeight } = options;
+  const card = document.getElementById(cardId);
+  const header = document.getElementById(headerId);
+  const maxBtn = document.getElementById(maxBtnId);
+
+  if (!card) return;
+
+  let isMaximized = false;
+  let preMaxWidth = `${defaultWidth}px`;
+  let preMaxHeight = `${defaultHeight}px`;
+
+  // Restore saved preferences from localStorage
+  try {
+    const saved = JSON.parse(localStorage.getItem(storageKey));
+    if (saved) {
+      if (saved.width) {
+        const w = Math.min(Math.max(saved.width, 480), Math.round(window.innerWidth * 0.96));
+        card.style.width = `${w}px`;
+        preMaxWidth = `${w}px`;
+      }
+      if (saved.height) {
+        const h = Math.min(Math.max(saved.height, 380), Math.round(window.innerHeight * 0.94));
+        card.style.height = `${h}px`;
+        preMaxHeight = `${h}px`;
+      }
+      if (saved.maximized) {
+        toggleMaximize(true);
+      }
+    }
+  } catch (e) {
+    // Ignore JSON errors
+  }
+
+  function updateMaxBtnUI(maximized) {
+    if (!maxBtn) return;
+    const maxIcon = maxBtn.querySelector('.maximize-icon');
+    const restoreIcon = maxBtn.querySelector('.restore-icon');
+    if (maxIcon) maxIcon.style.display = maximized ? 'none' : 'block';
+    if (restoreIcon) restoreIcon.style.display = maximized ? 'block' : 'none';
+    maxBtn.title = maximized ? 'Restore window size' : 'Maximize window';
+  }
+
+  function toggleMaximize(forceState) {
+    isMaximized = typeof forceState === 'boolean' ? forceState : !isMaximized;
+    if (isMaximized) {
+      if (!card.classList.contains('is-maximized')) {
+        preMaxWidth = card.style.width || `${card.offsetWidth}px`;
+        preMaxHeight = card.style.height || `${card.offsetHeight}px`;
+      }
+      card.classList.add('is-maximized');
+    } else {
+      card.classList.remove('is-maximized');
+      card.style.width = preMaxWidth;
+      card.style.height = preMaxHeight;
+    }
+    updateMaxBtnUI(isMaximized);
+    saveModalState();
+  }
+
+  function saveModalState() {
+    try {
+      localStorage.setItem(storageKey, JSON.stringify({
+        width: Math.round(parseFloat(preMaxWidth) || card.offsetWidth),
+        height: Math.round(parseFloat(preMaxHeight) || card.offsetHeight),
+        maximized: isMaximized,
+      }));
+    } catch (e) {}
+  }
+
+  if (maxBtn) {
+    maxBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleMaximize();
+    });
+  }
+
+  if (header) {
+    header.addEventListener('dblclick', (e) => {
+      if (e.target.closest('button')) return;
+      toggleMaximize();
+    });
+  }
+
+  // Handle drag resizing via corner grip or edges
+  const handles = card.querySelectorAll('.modal-resize-handle');
+  handles.forEach(handle => {
+    handle.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      const dir = handle.dataset.direction || 'se';
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const startW = card.offsetWidth;
+      const startH = card.offsetHeight;
+
+      // If maximized, smoothly unmaximize to current size
+      if (isMaximized) {
+        card.classList.remove('is-maximized');
+        isMaximized = false;
+        updateMaxBtnUI(false);
+      }
+
+      card.classList.add('no-transition');
+      document.body.classList.add('is-modal-resizing');
+      handle.classList.add('is-dragging');
+
+      function onMouseMove(moveEvent) {
+        if (dir.includes('e')) {
+          const deltaX = moveEvent.clientX - startX;
+          let newW = startW + deltaX;
+          newW = Math.max(480, Math.min(newW, window.innerWidth * 0.96));
+          card.style.width = `${newW}px`;
+          preMaxWidth = `${newW}px`;
+        }
+        if (dir.includes('s')) {
+          const deltaY = moveEvent.clientY - startY;
+          let newH = startH + deltaY;
+          newH = Math.max(380, Math.min(newH, window.innerHeight * 0.94));
+          card.style.height = `${newH}px`;
+          preMaxHeight = `${newH}px`;
+        }
+      }
+
+      function onMouseUp() {
+        card.classList.remove('no-transition');
+        document.body.classList.remove('is-modal-resizing');
+        handle.classList.remove('is-dragging');
+        window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mouseup', onMouseUp);
+        saveModalState();
+      }
+
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+    });
+
+    // Double-click on corner grip resets to default size
+    if (handle.dataset.direction === 'se') {
+      handle.addEventListener('dblclick', (e) => {
+        e.stopPropagation();
+        card.classList.remove('is-maximized');
+        isMaximized = false;
+        card.style.width = `${defaultWidth}px`;
+        card.style.height = `${defaultHeight}px`;
+        preMaxWidth = `${defaultWidth}px`;
+        preMaxHeight = `${defaultHeight}px`;
+        updateMaxBtnUI(false);
+        saveModalState();
+      });
+    }
+  });
+}
 
 function initEventListeners() {
   // Navigation & Modals
@@ -136,6 +422,15 @@ function initEventListeners() {
   if (el.btnCloseEditModal) el.btnCloseEditModal.addEventListener('click', () => closeModal(el.editAccountModal));
   if (el.btnCancelEdit) el.btnCancelEdit.addEventListener('click', () => closeModal(el.editAccountModal));
   if (el.editAccountForm) el.editAccountForm.addEventListener('submit', handleSaveAccountEdit);
+
+  // Backdrop click to dismiss modals
+  [el.settingsModal, el.editAccountModal, el.exportModal].forEach(modal => {
+    if (modal) {
+      modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal(modal);
+      });
+    }
+  });
 
   // Storage Settings Form
   if (el.settingsStorageForm) el.settingsStorageForm.addEventListener('submit', handleSaveStorageSettings);
@@ -222,11 +517,16 @@ function initEventListeners() {
     }
   });
 
-  // Keyboard shortcut: Cmd/Ctrl + K to focus search
+  // Keyboard shortcut: Cmd/Ctrl + K to focus search, Escape to close modals
   document.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
       e.preventDefault();
       el.globalSearch.focus();
+    }
+    if (e.key === 'Escape') {
+      if (el.settingsModal && el.settingsModal.style.display === 'flex') closeModal(el.settingsModal);
+      if (el.editAccountModal && el.editAccountModal.style.display === 'flex') closeModal(el.editAccountModal);
+      if (el.exportModal && el.exportModal.style.display === 'flex') closeModal(el.exportModal);
     }
   });
 }

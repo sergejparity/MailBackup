@@ -83,7 +83,7 @@
     <!-- Main Workspace Area -->
     <main class="workspace-layout">
       <!-- 1. Left Sidebar: Accounts & Folders -->
-      <aside class="sidebar-pane">
+      <aside class="sidebar-pane" id="sidebar-pane">
         <div class="sidebar-section-header">
           <span>ACCOUNTS</span>
           <button id="btn-add-account-quick" class="btn-icon-subtle" title="Add Account">+</button>
@@ -112,8 +112,13 @@
         </div>
       </aside>
 
+      <!-- Sidebar Resizer Splitter -->
+      <div id="resizer-sidebar" class="pane-resizer" role="separator" aria-orientation="vertical" title="Drag to resize sidebar • Double-click to reset">
+        <div class="resizer-indicator"></div>
+      </div>
+
       <!-- 2. Middle Pane: Email List -->
-      <section class="email-list-pane">
+      <section class="email-list-pane" id="email-list-pane">
         <div class="list-header">
           <div class="list-title-group">
             <h2 id="current-folder-title">Inbox</h2>
@@ -138,8 +143,13 @@
         </div>
       </section>
 
+      <!-- Message List Resizer Splitter -->
+      <div id="resizer-msglist" class="pane-resizer" role="separator" aria-orientation="vertical" title="Drag to resize message list • Double-click to reset">
+        <div class="resizer-indicator"></div>
+      </div>
+
       <!-- 3. Right Pane: Email Reader & Full Preview -->
-      <section class="email-reader-pane">
+      <section class="email-reader-pane" id="email-reader-pane">
         <div id="reader-empty" class="reader-empty-state">
           <div class="empty-icon">✉️</div>
           <h3>Select an email to view</h3>
@@ -205,10 +215,21 @@
 
     <!-- Modal: Settings & Account Management -->
     <div id="settings-modal" class="modal-backdrop" style="display: none;">
-      <div class="modal-card">
-        <div class="modal-header">
+      <div class="modal-card resizable-modal" id="settings-modal-card">
+        <div class="modal-header" id="settings-modal-header" title="Double click to maximize / restore">
           <h2>Accounts & Configuration</h2>
-          <button id="btn-close-modal" class="btn-close">&times;</button>
+          <div class="modal-header-actions">
+            <button type="button" id="btn-maximize-modal" class="btn-modal-action" title="Maximize / Restore">
+              <svg class="maximize-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+              </svg>
+              <svg class="restore-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display: none;">
+                <rect x="7" y="3" width="14" height="14" rx="2"></rect>
+                <path d="M3 7v14h14"></path>
+              </svg>
+            </button>
+            <button id="btn-close-modal" class="btn-close" title="Close Settings">&times;</button>
+          </div>
         </div>
         <div class="modal-body">
           <div class="tab-buttons">
@@ -462,17 +483,36 @@
               </div>
             </div>
           </div>
-          </div>
+        </div>
+
+        <!-- Modal Resize Handles -->
+        <div class="modal-resize-handle modal-resize-e" data-direction="e" title="Drag to resize width"></div>
+        <div class="modal-resize-handle modal-resize-s" data-direction="s" title="Drag to resize height"></div>
+        <div class="modal-resize-handle modal-resize-se" id="settings-resize-grip" data-direction="se" title="Drag to resize • Double-click to reset">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+            <path d="M10 2L2 10M10 6L6 10M10 10L10 10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
         </div>
       </div>
     </div>
 
     <!-- Modal: Edit Account Settings -->
     <div id="edit-account-modal" class="modal-backdrop" style="display: none;">
-      <div class="modal-card">
-        <div class="modal-header">
+      <div class="modal-card resizable-modal" id="edit-account-modal-card">
+        <div class="modal-header" id="edit-account-modal-header" title="Double click to maximize / restore">
           <h2>Edit Account Settings</h2>
-          <button id="btn-close-edit-modal" class="btn-close">&times;</button>
+          <div class="modal-header-actions">
+            <button type="button" id="btn-maximize-edit-modal" class="btn-modal-action" title="Maximize / Restore">
+              <svg class="maximize-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+              </svg>
+              <svg class="restore-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display: none;">
+                <rect x="7" y="3" width="14" height="14" rx="2"></rect>
+                <path d="M3 7v14h14"></path>
+              </svg>
+            </button>
+            <button id="btn-close-edit-modal" class="btn-close" title="Close">&times;</button>
+          </div>
         </div>
         <div class="modal-body">
           <form id="edit-account-form" class="form-grid">
@@ -525,6 +565,15 @@
               <button type="submit" class="btn btn-primary">Save Changes</button>
             </div>
           </form>
+        </div>
+
+        <!-- Modal Resize Handles -->
+        <div class="modal-resize-handle modal-resize-e" data-direction="e" title="Drag to resize width"></div>
+        <div class="modal-resize-handle modal-resize-s" data-direction="s" title="Drag to resize height"></div>
+        <div class="modal-resize-handle modal-resize-se" id="edit-resize-grip" data-direction="se" title="Drag to resize • Double-click to reset">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+            <path d="M10 2L2 10M10 6L6 10M10 10L10 10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
         </div>
       </div>
     </div>

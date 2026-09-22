@@ -241,16 +241,98 @@ body {
   display: flex;
   flex: 1;
   overflow: hidden;
+  position: relative;
 }
 
 /* 1. Left Sidebar */
 .sidebar-pane {
   width: 260px;
+  min-width: 180px;
+  max-width: 480px;
+  flex-shrink: 0;
   background: var(--bg-darker);
   border-right: 1px solid var(--border-subtle);
   display: flex;
   flex-direction: column;
   padding: 16px 12px;
+  overflow: hidden;
+}
+
+/* Draggable Splitters between Panes */
+.pane-resizer {
+  width: 8px;
+  margin: 0 -4px;
+  position: relative;
+  z-index: 25;
+  cursor: col-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: transparent;
+  user-select: none;
+  touch-action: none;
+}
+
+.pane-resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+  background: var(--border-subtle);
+  transition: background 0.15s ease, box-shadow 0.15s ease, width 0.15s ease;
+}
+
+.pane-resizer:hover::after,
+.pane-resizer.is-active::after {
+  background: var(--primary);
+  box-shadow: 0 0 10px var(--primary-glow), 0 0 3px var(--primary);
+  width: 3px;
+  left: 2.5px;
+}
+
+.resizer-indicator {
+  position: absolute;
+  width: 4px;
+  height: 28px;
+  border-radius: 4px;
+  background: var(--text-dim);
+  opacity: 0;
+  transition: opacity 0.2s ease, background 0.2s ease, transform 0.15s ease;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.pane-resizer:hover .resizer-indicator,
+.pane-resizer.is-active .resizer-indicator {
+  opacity: 1;
+  background: #818CF8;
+  box-shadow: 0 0 8px var(--primary);
+  transform: scaleY(1.2);
+}
+
+/* Global Resizing state (prevents iframe event capturing and text selection) */
+body.is-resizing {
+  user-select: none !important;
+  cursor: col-resize !important;
+}
+
+body.is-resizing * {
+  user-select: none !important;
+}
+
+body.is-resizing iframe {
+  pointer-events: none !important;
+}
+
+body.is-modal-resizing {
+  user-select: none !important;
+}
+
+body.is-modal-resizing * {
+  user-select: none !important;
 }
 
 .sidebar-section-header {
@@ -389,10 +471,14 @@ body {
 /* 2. Middle Pane: Email List */
 .email-list-pane {
   width: 380px;
+  min-width: 240px;
+  max-width: 850px;
+  flex-shrink: 0;
   background: rgba(15, 23, 42, 0.5);
   border-right: 1px solid var(--border-subtle);
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .list-header {
@@ -519,10 +605,12 @@ body {
 /* 3. Right Pane: Email Reader */
 .email-reader-pane {
   flex: 1;
+  min-width: 300px;
   background: var(--bg-darkest);
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  position: relative;
 }
 
 .reader-content {
@@ -688,32 +776,77 @@ body {
 }
 
 .modal-card {
-  width: 600px;
-  max-width: 90vw;
+  width: 720px;
+  max-width: 95vw;
+  max-height: 92vh;
+  min-width: 480px;
+  min-height: 380px;
   background: var(--bg-darker);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-lg);
-  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.7);
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  position: relative;
+  transition: width 0.2s cubic-bezier(0.4, 0, 0.2, 1), height 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.modal-card.no-transition {
+  transition: none !important;
+}
+
+.modal-card.is-maximized {
+  width: 96vw !important;
+  height: 94vh !important;
+  max-width: 96vw !important;
+  max-height: 94vh !important;
+  border-radius: var(--radius-md);
 }
 
 .modal-sm {
   width: 440px;
+  min-width: 380px;
+  min-height: auto;
 }
 
 .modal-header {
-  padding: 16px 20px;
+  padding: 14px 20px;
   border-bottom: 1px solid var(--border-subtle);
   display: flex;
   align-items: center;
   justify-content: space-between;
+  user-select: none;
+  cursor: default;
 }
 
 .modal-header h2 {
   font-size: 1.1rem;
   font-weight: 700;
+}
+
+.modal-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn-modal-action {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: var(--transition-fast);
+}
+
+.btn-modal-action:hover {
+  color: var(--text-main);
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .btn-close {
@@ -722,16 +855,75 @@ body {
   color: var(--text-muted);
   font-size: 1.4rem;
   cursor: pointer;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  transition: var(--transition-fast);
 }
 
 .btn-close:hover {
   color: #fff;
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .modal-body {
   padding: 20px;
-  max-height: 70vh;
+  flex: 1;
+  min-height: 0;
+  max-height: none;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Modal Resize Handles */
+.modal-resize-handle {
+  position: absolute;
+  z-index: 60;
+  touch-action: none;
+}
+
+.modal-resize-handle.modal-resize-e {
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: ew-resize;
+}
+
+.modal-resize-handle.modal-resize-s {
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 8px;
+  cursor: ns-resize;
+}
+
+.modal-resize-handle.modal-resize-se {
+  right: 2px;
+  bottom: 2px;
+  width: 20px;
+  height: 20px;
+  cursor: nwse-resize;
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  padding: 3px;
+  color: var(--text-dim);
+  opacity: 0.6;
+  transition: opacity 0.15s ease, color 0.15s ease, transform 0.15s ease;
+  user-select: none;
+}
+
+.modal-resize-handle.modal-resize-se:hover,
+.modal-resize-handle.modal-resize-se.is-dragging {
+  opacity: 1;
+  color: var(--primary);
+  transform: scale(1.15);
+}
+
+.modal-card.is-maximized .modal-resize-handle {
+  display: none !important;
 }
 
 .tab-buttons {
@@ -1022,6 +1214,15 @@ body {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  flex: 1;
+  min-height: 0;
+}
+
+#tab-logs .settings-card {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .logs-toolbar {
@@ -1053,7 +1254,8 @@ body {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   padding: 14px;
-  height: 380px;
+  min-height: 240px;
+  flex: 1;
   overflow-y: auto;
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.78rem;
