@@ -677,6 +677,83 @@ fn test_resolve_export_path_and_writer() {
     assert!(text.contains("Subject: Test"));
 }
 
+#[test]
+fn test_csv_bulk_import_parser() {
+    use mailbackup_core::csv_import::{parse_accounts_csv, generate_csv_template};
+    use mailbackup_core::config::ProviderType;
+
+    // 1. Template generation
+    let template = generate_csv_template();
+    assert!(template.contains("email,password,name,server,port,username"));
+
+    // 2. Standard CSV with various providers and auto-detection
+    let csv_data = "\
+email,password,name,server,port,username,retention,schedule
+admin@example.com,Secret123,Work Admin,mail.example.com,993,admin,90,0 2 * * *
+alice@gmail.com,app-pass-key,Alice Personal,,,alice@gmail.com,,
+bob@outlook.com,ms-pass-xyz,Bob Outlook,,,bob@outlook.com,,
+charlie@customdomain.io,pass123,,,,charlie,,
+";
+    let report = parse_accounts_csv(csv_data);
+    assert_eq!(report.errors.len(), 0);
+    assert_eq!(report.valid_accounts.len(), 4);
+
+    let acc0 = &report.valid_accounts[0];
+    assert_eq!(acc0.email, "admin@example.com");
+    assert_eq!(acc0.name, "Work Admin");
+    assert_eq!(acc0.imap_server, "mail.example.com");
+    assert_eq!(acc0.imap_port, 993);
+    assert_eq!(acc0.username, "admin");
+    assert_eq!(acc0.retention_days, Some(90));
+    assert_eq!(acc0.schedule.as_deref(), Some("0 2 * * *"));
+
+    let acc1 = &report.valid_accounts[1];
+    assert_eq!(acc1.email, "alice@gmail.com");
+    assert_eq!(acc1.provider, ProviderType::Gmail);
+    assert_eq!(acc1.imap_server, "imap.gmail.com");
+    assert_eq!(acc1.imap_port, 993);
+
+    let acc2 = &report.valid_accounts[2];
+    assert_eq!(acc2.email, "bob@outlook.com");
+    assert_eq!(acc2.provider, ProviderType::Outlook);
+    assert_eq!(acc2.imap_server, "outlook.office365.com");
+
+    let acc3 = &report.valid_accounts[3];
+    assert_eq!(acc3.email, "charlie@customdomain.io");
+    assert_eq!(acc3.name, "Charlie");
+    assert_eq!(acc3.imap_server, "mail.customdomain.io");
+
+    // 3. Semicolon delimiter (European Excel)
+    let semi_data = "Email;Password;Display Name;Server;Port\nuser1@extron.lv;pwd1;User One;mail.extron.lv;993\n";
+    let semi_report = parse_accounts_csv(semi_data);
+    assert_eq!(semi_report.errors.len(), 0);
+    assert_eq!(semi_report.valid_accounts.len(), 1);
+    assert_eq!(semi_report.valid_accounts[0].email, "user1@extron.lv");
+    assert_eq!(semi_report.valid_accounts[0].password, "pwd1");
+
+    // 4. Invalid rows & validation error handling
+    let bad_data = "\
+email,password,name
+good@test.com,pass1,Good User
+missing_pwd@test.com,,No Pass User
+not-an-email,pass2,Bad Email
+,pass3,Empty Email
+";
+    let bad_report = parse_accounts_csv(bad_data);
+    assert_eq!(bad_report.valid_accounts.len(), 1);
+    assert_eq!(bad_report.errors.len(), 3);
+    assert!(bad_report.errors.iter().any(|e| e.error.contains("Missing password")));
+    assert!(bad_report.errors.iter().any(|e| e.error.contains("Invalid email format")));
+    assert!(bad_report.errors.iter().any(|e| e.error.contains("Missing required 'email'")));
+
+    // 5. Convert to AccountConfig
+    let cfg = bad_report.valid_accounts[0].to_account_config();
+    assert_eq!(cfg.id, "goodtest_com");
+    assert_eq!(cfg.email, "good@test.com");
+    assert!(cfg.enabled);
+}
+
+
 
 
 

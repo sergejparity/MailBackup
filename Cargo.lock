@@ -2539,6 +2539,7 @@ dependencies = [
  "async-imap",
  "async-trait",
  "chrono",
+ "csv",
  "dirs",
  "futures-util",
  "hex",

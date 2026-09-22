@@ -73,6 +73,14 @@ enum AccountCommands {
         #[arg(help = "Account ID or email address")]
         account: String,
     },
+
+    #[command(about = "Bulk import accounts from a CSV file")]
+    ImportCsv {
+        #[arg(help = "Path to CSV file containing accounts")]
+        file: PathBuf,
+        #[arg(long, help = "Validate CSV format and display accounts without saving")]
+        dry_run: bool,
+    },
 }
 
 #[derive(Args)]
@@ -163,6 +171,9 @@ async fn main() -> Result<()> {
         }
         Commands::Account(AccountCommands::Remove { account }) => {
             handle_account_remove(&mut config, cli.config.as_deref(), &credentials, &account)?;
+        }
+        Commands::Account(AccountCommands::ImportCsv { file, dry_run }) => {
+            handle_account_import_csv(&mut config, cli.config.as_deref(), &credentials, &file, dry_run)?;
         }
         Commands::Sync(args) => {
             handle_sync(&config, &db, &storage, &credentials, args).await?;
@@ -390,6 +401,81 @@ fn handle_account_remove(
     config.save(save_path)?;
 
     println!("{} Removed account '{}' from configuration and credentials store.", CHECK_EMOJI, account_id);
+    Ok(())
+}
+
+fn handle_account_import_csv(
+    config: &mut AppConfig,
+    config_path: Option<&std::path::Path>,
+    credentials: &CredentialStore,
+    file_path: &std::path::Path,
+    dry_run: bool,
+) -> Result<()> {
+    if !file_path.exists() {
+        bail!("CSV file not found: {}", file_path.display());
+    }
+
+    let content = std::fs::read_to_string(file_path)
+        .context(format!("Failed to read CSV file: {}", file_path.display()))?;
+
+    let report = mailbackup_core::csv_import::parse_accounts_csv(&content);
+
+    println!("\n{} Parsing CSV: {}", MAIL_EMOJI, style(file_path.display()).cyan());
+    println!(
+        "Found {} valid account(s), {} error(s).\n",
+        style(report.valid_accounts.len()).green().bold(),
+        style(report.errors.len()).red().bold()
+    );
+
+    if !report.errors.is_empty() {
+        println!("{}", style("Errors encountered:").yellow().bold());
+        for err in &report.errors {
+            println!("  {} Line {}: {}", WARN_EMOJI, err.line, err.error);
+        }
+        println!();
+    }
+
+    if report.valid_accounts.is_empty() {
+        bail!("No valid email accounts to import.");
+    }
+
+    println!("{}", style("Accounts to import:").bold());
+    for acc in &report.valid_accounts {
+        println!(
+            "  {} {} ({}) -> {}:{} [User: {}]",
+            CHECK_EMOJI,
+            style(&acc.name).bold(),
+            style(&acc.email).cyan(),
+            acc.imap_server,
+            acc.imap_port,
+            acc.username
+        );
+    }
+    println!();
+
+    if dry_run {
+        println!("{} Dry-run mode active: No accounts or credentials were saved.", MAIL_EMOJI);
+        return Ok(());
+    }
+
+    let save_path = config_path.unwrap_or_else(|| mailbackup_core::config::default_config_path().leak());
+
+    for acc in &report.valid_accounts {
+        credentials.set_password(&acc.id, &acc.password)?;
+        let cfg_acc = acc.to_account_config();
+        let acc_id = cfg_acc.id.clone();
+        config.accounts.retain(|a| a.id != acc_id);
+        config.accounts.push(cfg_acc);
+    }
+
+    config.save(save_path)?;
+
+    println!(
+        "{} Successfully imported {} account(s) into configuration and credentials store.",
+        CHECK_EMOJI,
+        report.valid_accounts.len()
+    );
+
     Ok(())
 }
 

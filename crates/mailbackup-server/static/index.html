@@ -390,13 +390,36 @@
         <div class="modal-body">
           <div class="tab-buttons">
             <button class="tab-btn active" data-tab="tab-accounts">Email Accounts</button>
-            <button class="tab-btn" data-tab="tab-add">Add New Account</button>
+            <button class="tab-btn" data-tab="tab-add">Add Single Account</button>
+            <button class="tab-btn" data-tab="tab-bulk-import">Bulk Import (CSV)</button>
             <button class="tab-btn" data-tab="tab-settings">General Settings</button>
             <button class="tab-btn" data-tab="tab-logs">Event Logs</button>
           </div>
 
           <!-- Tab 1: Current Accounts List -->
           <div id="tab-accounts" class="tab-content active">
+            <div class="accounts-tab-toolbar">
+              <div class="accounts-tab-title">
+                <span id="accounts-count-badge" class="badge-subtle">Configured Accounts</span>
+              </div>
+              <div class="accounts-tab-actions">
+                <button type="button" id="btn-tab-add-single" class="btn btn-sm btn-secondary">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                  </svg>
+                  Add Account
+                </button>
+                <button type="button" id="btn-tab-bulk-import" class="btn btn-sm btn-primary">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                  </svg>
+                  Bulk Import (CSV)
+                </button>
+              </div>
+            </div>
             <div id="modal-accounts-list" class="modal-accounts-table">
               <!-- Populated by JS -->
             </div>
@@ -458,6 +481,114 @@
                 <button type="submit" class="btn btn-primary">Save Account</button>
               </div>
             </form>
+          </div>
+
+          <!-- Tab: Bulk Import via CSV -->
+          <div id="tab-bulk-import" class="tab-content">
+            <div class="bulk-import-container">
+              <div class="bulk-import-header">
+                <div>
+                  <h3 style="font-size: 1.05rem; font-weight: 700; color: var(--text-main);">Bulk Import Email Accounts</h3>
+                  <p class="settings-desc">Import multiple IMAP accounts at once from a CSV file. Supports Gmail, Outlook, Yahoo, iCloud, and custom domains with smart server auto-detection.</p>
+                </div>
+                <a href="/api/accounts/csv-template" download="mailbackup_accounts_template.csv" class="btn btn-sm btn-secondary" id="btn-download-csv-template" title="Download sample CSV template">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                  </svg>
+                  Download CSV Template
+                </a>
+              </div>
+
+              <!-- Input Mode Toggle (File Dropzone vs Paste CSV Text) -->
+              <div class="csv-input-modes">
+                <button type="button" class="csv-mode-btn active" id="btn-csv-mode-file">Upload CSV File</button>
+                <button type="button" class="csv-mode-btn" id="btn-csv-mode-text">Paste CSV Text</button>
+              </div>
+
+              <!-- Mode 1: File Dropzone -->
+              <div id="csv-file-panel" class="csv-mode-panel">
+                <div class="csv-dropzone" id="csv-dropzone">
+                  <input type="file" id="csv-file-input" accept=".csv,text/csv,text/plain" style="display: none;">
+                  <div class="dropzone-icon">📁</div>
+                  <div class="dropzone-text">
+                    <strong>Drag and drop your CSV file here</strong>, or <span class="dropzone-browse" id="btn-browse-csv">browse files</span>
+                  </div>
+                  <div class="dropzone-hint">Supports comma (,), semicolon (;), and tab-separated formats with or without header row</div>
+                  <div id="csv-selected-file-info" class="selected-file-pill" style="display: none;">
+                    <span id="csv-selected-filename">filename.csv</span>
+                    <button type="button" id="btn-remove-selected-csv" class="btn-remove-file" title="Remove selected file">&times;</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Mode 2: Paste CSV Text -->
+              <div id="csv-text-panel" class="csv-mode-panel" style="display: none;">
+                <textarea id="csv-raw-textarea" class="form-input csv-textarea" placeholder="email,password,name,server,port,username&#10;user@example.com,AppPass123,Work Email,mail.example.com,993,user@example.com&#10;john.doe@gmail.com,abcd-efgh-ijkl-mnop,Personal Gmail,,,john.doe@gmail.com&#10;alice@company.com,Secret2026,Alice Smith,outlook.office365.com,993,alice@company.com" spellcheck="false" autocomplete="off"></textarea>
+              </div>
+
+              <div class="bulk-import-actions">
+                <button type="button" id="btn-preview-csv" class="btn btn-primary">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                    <circle cx="12" cy="12" r="3"></circle>
+                  </svg>
+                  Preview & Validate
+                </button>
+              </div>
+
+              <!-- Preview & Confirmation Area -->
+              <div id="csv-preview-container" class="csv-preview-container" style="display: none;">
+                <div class="csv-preview-header">
+                  <div class="csv-preview-stats">
+                    <span id="badge-csv-valid" class="badge-pill badge-pill-success">0 Valid Accounts</span>
+                    <span id="badge-csv-errors" class="badge-pill badge-pill-danger" style="display: none;">0 Errors (Skipped)</span>
+                  </div>
+                  <div class="csv-preview-confirm-btns">
+                    <button type="button" id="btn-cancel-csv-import" class="btn btn-secondary btn-sm">Clear</button>
+                    <button type="button" id="btn-confirm-csv-import" class="btn btn-primary btn-sm">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="20 6 9 17 4 12"></polyline>
+                      </svg>
+                      Confirm Import
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Error Messages Box -->
+                <div id="csv-errors-box" class="csv-errors-box" style="display: none;">
+                  <div class="errors-box-title">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <line x1="12" y1="8" x2="12" y2="12"></line>
+                      <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                    </svg>
+                    <span>Issues Found (These rows will be skipped during import):</span>
+                  </div>
+                  <ul id="csv-errors-list" class="csv-errors-list"></ul>
+                </div>
+
+                <!-- Preview Table -->
+                <div class="csv-table-wrap">
+                  <table class="csv-preview-table">
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>Email</th>
+                        <th>Display Name</th>
+                        <th>Provider</th>
+                        <th>IMAP Server : Port</th>
+                        <th>Username</th>
+                      </tr>
+                    </thead>
+                    <tbody id="csv-preview-tbody">
+                      <!-- Populated by JS -->
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
           </div>
 
           <!-- Tab 3: Settings -->

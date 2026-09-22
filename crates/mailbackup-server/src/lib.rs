@@ -60,6 +60,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/", get(serve_index))
         .route("/api/stats", get(api_stats))
         .route("/api/accounts", get(api_get_accounts).post(api_add_account))
+        .route("/api/accounts/import-csv", post(api_import_accounts_csv))
+        .route("/api/accounts/csv-template", get(api_accounts_csv_template))
         .route(
             "/api/accounts/:id",
             get(api_get_account)
@@ -338,6 +340,166 @@ async fn api_add_account(
     );
 
     (StatusCode::OK, "Account created").into_response()
+}
+
+#[derive(Deserialize)]
+struct ImportAccountsCsvPayload {
+    #[serde(alias = "csv_data")]
+    csv_content: String,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Serialize)]
+struct ImportAccountsCsvResponse {
+    valid_count: usize,
+    error_count: usize,
+    accounts: Vec<ImportedAccountPreview>,
+    valid_accounts: Vec<ImportedAccountPreview>,
+    errors: Vec<mailbackup_core::csv_import::CsvRowError>,
+    imported: bool,
+    imported_count: usize,
+}
+
+#[derive(Clone, Serialize)]
+struct ImportedAccountPreview {
+    id: String,
+    email: String,
+    name: String,
+    provider: String,
+    imap_server: String,
+    server: String,
+    imap_port: u16,
+    port: u16,
+    username: String,
+    schedule: Option<String>,
+}
+
+async fn api_accounts_csv_template() -> impl IntoResponse {
+    let template = mailbackup_core::csv_import::generate_csv_template();
+    let mut res = Response::new(Body::from(template));
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
+    res.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"mailbackup_accounts_template.csv\""),
+    );
+    res
+}
+
+async fn api_import_accounts_csv(
+    State(state): State<AppState>,
+    Json(payload): Json<ImportAccountsCsvPayload>,
+) -> impl IntoResponse {
+    let report = mailbackup_core::csv_import::parse_accounts_csv(&payload.csv_content);
+
+    let previews: Vec<ImportedAccountPreview> = report
+        .valid_accounts
+        .iter()
+        .map(|acc| ImportedAccountPreview {
+            id: acc.id.clone(),
+            email: acc.email.clone(),
+            name: acc.name.clone(),
+            provider: format!("{:?}", acc.provider),
+            imap_server: acc.imap_server.clone(),
+            server: acc.imap_server.clone(),
+            imap_port: acc.imap_port,
+            port: acc.imap_port,
+            username: acc.username.clone(),
+            schedule: acc.schedule.clone(),
+        })
+        .collect();
+
+    let valid_count = report.valid_accounts.len();
+    let error_count = report.errors.len();
+
+    if payload.dry_run {
+        return (
+            StatusCode::OK,
+            Json(ImportAccountsCsvResponse {
+                valid_count,
+                error_count,
+                accounts: previews.clone(),
+                valid_accounts: previews,
+                errors: report.errors,
+                imported: false,
+                imported_count: 0,
+            }),
+        )
+            .into_response();
+    }
+
+    if valid_count == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ImportAccountsCsvResponse {
+                valid_count: 0,
+                error_count,
+                accounts: vec![],
+                valid_accounts: vec![],
+                errors: report.errors,
+                imported: false,
+                imported_count: 0,
+            }),
+        )
+            .into_response();
+    }
+
+    // Save credentials and update config
+    let mut saved_accounts = Vec::new();
+    for acc in &report.valid_accounts {
+        if let Err(e) = state.credentials.set_password(&acc.id, &acc.password) {
+            error!("Failed to save secret for account '{}': {}", acc.email, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save secret for account '{}': {}", acc.email, e),
+            )
+                .into_response();
+        }
+        saved_accounts.push(acc.to_account_config());
+    }
+
+    let mut cfg = state.config.write().await;
+    for acc in saved_accounts {
+        let acc_id = acc.id.clone();
+        cfg.accounts.retain(|a| a.id != acc_id);
+        cfg.accounts.push(acc);
+    }
+
+    if let Err(e) = cfg.save(&state.config_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save config: {}", e),
+        )
+            .into_response();
+    }
+
+    // Reload scheduler with updated accounts
+    let _ = state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await;
+
+    mailbackup_core::event_log::log_event(
+        "ACCOUNTS_BULK_IMPORTED",
+        &format!(
+            "Bulk imported {} account(s) via CSV ({} invalid rows skipped)",
+            valid_count, error_count
+        ),
+    );
+
+    (
+        StatusCode::OK,
+        Json(ImportAccountsCsvResponse {
+            valid_count,
+            error_count,
+            accounts: previews.clone(),
+            valid_accounts: previews,
+            errors: report.errors,
+            imported: true,
+            imported_count: valid_count,
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]

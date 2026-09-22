@@ -8,6 +8,8 @@ let state = {
   selectedMessageId: null,
   messages: [],
   currentSort: 'newest',
+  csvImportContent: '',
+  csvImportMode: 'file',
 };
 
 // DOM Elements
@@ -76,6 +78,30 @@ const el = {
   advSearchMinSize: document.getElementById('adv-search-min-size'),
   advSearchHasAtt: document.getElementById('adv-search-has-att'),
   advSearchIncludeDeleted: document.getElementById('adv-search-include-deleted'),
+
+  // Bulk Import Elements
+  btnTabAddSingle: document.getElementById('btn-tab-add-single'),
+  btnTabBulkImport: document.getElementById('btn-tab-bulk-import'),
+  btnCsvModeFile: document.getElementById('btn-csv-mode-file'),
+  btnCsvModeText: document.getElementById('btn-csv-mode-text'),
+  csvFilePanel: document.getElementById('csv-file-panel'),
+  csvTextPanel: document.getElementById('csv-text-panel'),
+  csvDropzone: document.getElementById('csv-dropzone'),
+  csvFileInput: document.getElementById('csv-file-input'),
+  btnBrowseCsv: document.getElementById('btn-browse-csv'),
+  csvSelectedFileInfo: document.getElementById('csv-selected-file-info'),
+  csvSelectedFilename: document.getElementById('csv-selected-filename'),
+  btnRemoveSelectedCsv: document.getElementById('btn-remove-selected-csv'),
+  csvRawTextarea: document.getElementById('csv-raw-textarea'),
+  btnPreviewCsv: document.getElementById('btn-preview-csv'),
+  csvPreviewContainer: document.getElementById('csv-preview-container'),
+  badgeCsvValid: document.getElementById('badge-csv-valid'),
+  badgeCsvErrors: document.getElementById('badge-csv-errors'),
+  csvErrorsBox: document.getElementById('csv-errors-box'),
+  csvErrorsList: document.getElementById('csv-errors-list'),
+  csvPreviewTbody: document.getElementById('csv-preview-tbody'),
+  btnConfirmCsvImport: document.getElementById('btn-confirm-csv-import'),
+  btnCancelCsvImport: document.getElementById('btn-cancel-csv-import'),
 
   // Edit Account Modal Elements
   editAccountModal: document.getElementById('edit-account-modal'),
@@ -447,6 +473,59 @@ function initEventListeners() {
   if (el.btnCloseEditModal) el.btnCloseEditModal.addEventListener('click', () => closeModal(el.editAccountModal));
   if (el.btnCancelEdit) el.btnCancelEdit.addEventListener('click', () => closeModal(el.editAccountModal));
   if (el.editAccountForm) el.editAccountForm.addEventListener('submit', handleSaveAccountEdit);
+
+  // Bulk Import Actions
+  if (el.btnTabAddSingle) el.btnTabAddSingle.addEventListener('click', () => switchTab('tab-add'));
+  if (el.btnTabBulkImport) el.btnTabBulkImport.addEventListener('click', () => switchTab('tab-bulk-import'));
+  if (el.btnCsvModeFile) el.btnCsvModeFile.addEventListener('click', () => setCsvImportMode('file'));
+  if (el.btnCsvModeText) el.btnCsvModeText.addEventListener('click', () => setCsvImportMode('text'));
+
+  if (el.btnBrowseCsv) {
+    el.btnBrowseCsv.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (el.csvFileInput) el.csvFileInput.click();
+    });
+  }
+  if (el.csvDropzone) {
+    el.csvDropzone.addEventListener('click', (e) => {
+      if (e.target.id !== 'btn-remove-selected-csv') {
+        if (el.csvFileInput) el.csvFileInput.click();
+      }
+    });
+    el.csvDropzone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      el.csvDropzone.classList.add('dragover');
+    });
+    el.csvDropzone.addEventListener('dragleave', () => {
+      el.csvDropzone.classList.remove('dragover');
+    });
+    el.csvDropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      el.csvDropzone.classList.remove('dragover');
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        handleCsvFileSelected(e.dataTransfer.files[0]);
+      }
+    });
+  }
+
+  if (el.csvFileInput) {
+    el.csvFileInput.addEventListener('change', (e) => {
+      if (e.target.files && e.target.files.length > 0) {
+        handleCsvFileSelected(e.target.files[0]);
+      }
+    });
+  }
+
+  if (el.btnRemoveSelectedCsv) {
+    el.btnRemoveSelectedCsv.addEventListener('click', (e) => {
+      e.stopPropagation();
+      clearSelectedCsvFile();
+    });
+  }
+
+  if (el.btnPreviewCsv) el.btnPreviewCsv.addEventListener('click', handlePreviewCsv);
+  if (el.btnConfirmCsvImport) el.btnConfirmCsvImport.addEventListener('click', handleConfirmCsvImport);
+  if (el.btnCancelCsvImport) el.btnCancelCsvImport.addEventListener('click', clearCsvImport);
 
   // Advanced Search Panel
   if (el.btnOpenAdvancedSearch) el.btnOpenAdvancedSearch.addEventListener('click', () => toggleAdvancedSearchPanel());
@@ -1963,3 +2042,180 @@ async function handleClearLogs() {
     showToast(`Error: ${err.message}`);
   }
 }
+
+// Bulk CSV Account Import
+function setCsvImportMode(mode) {
+  state.csvImportMode = mode;
+  if (mode === 'file') {
+    if (el.btnCsvModeFile) el.btnCsvModeFile.classList.add('active');
+    if (el.btnCsvModeText) el.btnCsvModeText.classList.remove('active');
+    if (el.csvFilePanel) el.csvFilePanel.style.display = 'block';
+    if (el.csvTextPanel) el.csvTextPanel.style.display = 'none';
+  } else {
+    if (el.btnCsvModeText) el.btnCsvModeText.classList.add('active');
+    if (el.btnCsvModeFile) el.btnCsvModeFile.classList.remove('active');
+    if (el.csvFilePanel) el.csvFilePanel.style.display = 'none';
+    if (el.csvTextPanel) el.csvTextPanel.style.display = 'block';
+  }
+}
+
+function handleCsvFileSelected(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    state.csvImportContent = e.target.result;
+    if (el.csvSelectedFilename) el.csvSelectedFilename.textContent = file.name + ` (${(file.size / 1024).toFixed(1)} KB)`;
+    if (el.csvSelectedFileInfo) el.csvSelectedFileInfo.style.display = 'flex';
+  };
+  reader.readAsText(file);
+}
+
+function clearSelectedCsvFile() {
+  state.csvImportContent = '';
+  if (el.csvFileInput) el.csvFileInput.value = '';
+  if (el.csvSelectedFileInfo) el.csvSelectedFileInfo.style.display = 'none';
+  if (el.csvSelectedFilename) el.csvSelectedFilename.textContent = '';
+}
+
+function clearCsvImport() {
+  clearSelectedCsvFile();
+  if (el.csvRawTextarea) el.csvRawTextarea.value = '';
+  if (el.csvPreviewContainer) el.csvPreviewContainer.style.display = 'none';
+  if (el.csvErrorsBox) el.csvErrorsBox.style.display = 'none';
+  if (el.csvPreviewTbody) el.csvPreviewTbody.innerHTML = '';
+  state.csvImportReport = null;
+}
+
+function getCsvImportText() {
+  if (state.csvImportMode === 'file') {
+    return state.csvImportContent || '';
+  } else {
+    return el.csvRawTextarea ? el.csvRawTextarea.value.trim() : '';
+  }
+}
+
+async function handlePreviewCsv() {
+  const csvData = getCsvImportText();
+  if (!csvData) {
+    showToast('Please select a CSV file or paste CSV content first.');
+    return;
+  }
+
+  if (el.btnPreviewCsv) {
+    el.btnPreviewCsv.disabled = true;
+    el.btnPreviewCsv.textContent = 'Validating...';
+  }
+
+  try {
+    const res = await fetch('/api/accounts/import-csv', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ csv_data: csvData, dry_run: true })
+    });
+
+    if (res.ok) {
+      const report = await res.json();
+      state.csvImportReport = report;
+      renderCsvPreview(report);
+    } else {
+      const err = await res.text();
+      showToast(`CSV Validation error: ${err}`);
+    }
+  } catch (err) {
+    showToast(`Network error: ${err.message || err}`);
+  } finally {
+    if (el.btnPreviewCsv) {
+      el.btnPreviewCsv.disabled = false;
+      el.btnPreviewCsv.textContent = 'Preview & Validate';
+    }
+  }
+}
+
+function renderCsvPreview(report) {
+  if (!el.csvPreviewContainer) return;
+  el.csvPreviewContainer.style.display = 'block';
+
+  if (el.badgeCsvValid) {
+    el.badgeCsvValid.textContent = `${report.valid_count || 0} valid account(s)`;
+  }
+  if (el.badgeCsvErrors) {
+    el.badgeCsvErrors.textContent = `${report.error_count || 0} error(s)`;
+    el.badgeCsvErrors.style.display = report.error_count > 0 ? 'inline-block' : 'none';
+  }
+
+  if (el.csvErrorsBox && el.csvErrorsList) {
+    if (report.errors && report.errors.length > 0) {
+      el.csvErrorsBox.style.display = 'block';
+      el.csvErrorsList.innerHTML = report.errors.map(err => `
+        <li style="margin-bottom: 4px;">
+          <strong>Line ${err.line || err.row}${err.email ? ` (${escapeHtml(err.email)})` : ''}:</strong> ${escapeHtml(err.error)}
+        </li>
+      `).join('');
+    } else {
+      el.csvErrorsBox.style.display = 'none';
+      el.csvErrorsList.innerHTML = '';
+    }
+  }
+
+  if (el.csvPreviewTbody) {
+    if (report.valid_accounts && report.valid_accounts.length > 0) {
+      el.csvPreviewTbody.innerHTML = report.valid_accounts.map(acc => `
+        <tr>
+          <td><span class="badge" style="background: rgba(34, 197, 94, 0.15); color: #4ade80; font-size: 11px;">Valid</span></td>
+          <td style="font-weight: 500;">${escapeHtml(acc.name)}</td>
+          <td>${escapeHtml(acc.email)}</td>
+          <td><span class="badge" style="background: rgba(99, 102, 241, 0.15); color: #818cf8; text-transform: uppercase; font-size: 10px;">${escapeHtml(acc.provider)}</span></td>
+          <td style="font-family: monospace; font-size: 12px; color: var(--text-secondary);">${escapeHtml(acc.server)}:${acc.port}</td>
+          <td style="font-family: monospace; font-size: 12px; color: var(--text-secondary);">${escapeHtml(acc.username)}</td>
+          <td style="font-family: monospace; font-size: 12px; color: var(--text-secondary);">${acc.schedule || '0 0 * * *'}</td>
+        </tr>
+      `).join('');
+      if (el.btnConfirmCsvImport) el.btnConfirmCsvImport.disabled = false;
+    } else {
+      el.csvPreviewTbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-secondary); padding: 16px;">No valid accounts detected in CSV.</td></tr>`;
+      if (el.btnConfirmCsvImport) el.btnConfirmCsvImport.disabled = true;
+    }
+  }
+}
+
+async function handleConfirmCsvImport() {
+  const csvData = getCsvImportText();
+  if (!csvData) {
+    showToast('No CSV data to import');
+    return;
+  }
+
+  if (el.btnConfirmCsvImport) {
+    el.btnConfirmCsvImport.disabled = true;
+    el.btnConfirmCsvImport.textContent = 'Importing...';
+  }
+
+  try {
+    const res = await fetch('/api/accounts/import-csv', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ csv_data: csvData, dry_run: false })
+    });
+
+    if (res.ok) {
+      const report = await res.json();
+      showToast(`Successfully imported ${report.imported_count || 0} account(s)! 🎉`);
+      clearCsvImport();
+      closeModal(el.settingsModal);
+      await loadAccounts();
+      await loadStats();
+      await loadLogs();
+    } else {
+      const err = await res.text();
+      showToast(`Import failed: ${err}`);
+    }
+  } catch (err) {
+    showToast(`Network error: ${err.message || err}`);
+  } finally {
+    if (el.btnConfirmCsvImport) {
+      el.btnConfirmCsvImport.disabled = false;
+      el.btnConfirmCsvImport.textContent = 'Import Valid Accounts';
+    }
+  }
+}
+
