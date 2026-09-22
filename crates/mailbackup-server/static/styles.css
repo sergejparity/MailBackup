@@ -459,6 +459,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
 }
 
 .card-sender {
@@ -468,13 +469,16 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 220px;
+  flex: 1;
+  min-width: 0;
 }
 
 .card-date {
   font-size: 0.72rem;
   color: var(--text-dim);
   font-family: 'JetBrains Mono', monospace;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .card-subject {

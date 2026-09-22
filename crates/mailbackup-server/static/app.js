@@ -477,6 +477,19 @@ async function loadFolderMessages(folderId) {
   }
 }
 
+function formatMailDateTime(rawDate) {
+  if (!rawDate) return '';
+  const d = new Date(rawDate);
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
 function renderMessages(messages) {
   el.emailItemsContainer.innerHTML = '';
   if (!messages || messages.length === 0) {
@@ -498,12 +511,13 @@ function renderMessages(messages) {
     
     const sender = msg.from_addr || 'Unknown Sender';
     const subject = msg.subject || '(No Subject)';
-    const dateStr = msg.date ? new Date(msg.date).toLocaleDateString() : '';
+    const dateStr = formatMailDateTime(msg.date);
+    const fullDateTitle = msg.date ? new Date(msg.date).toLocaleString() : '';
 
     card.innerHTML = `
       <div class="card-top-row">
-        <span class="card-sender">${escapeHtml(sender)}</span>
-        <span class="card-date">${dateStr}</span>
+        <span class="card-sender" title="${escapeHtml(sender)}">${escapeHtml(sender)}</span>
+        <span class="card-date" title="${escapeHtml(fullDateTitle)}">${dateStr}</span>
       </div>
       <div class="card-subject">${escapeHtml(subject)}</div>
     `;
@@ -586,12 +600,13 @@ async function performSearch(query) {
     sortedResults.forEach(item => {
       const card = document.createElement('div');
       card.className = `email-card ${item.message_id === state.selectedMessageId ? 'active' : ''}`;
-      const dateStr = item.date ? new Date(item.date).toLocaleDateString() : '';
+      const dateStr = formatMailDateTime(item.date);
+      const fullDateTitle = item.date ? new Date(item.date).toLocaleString() : '';
 
       card.innerHTML = `
         <div class="card-top-row">
-          <span class="card-sender">${escapeHtml(item.from_addr)}</span>
-          <span class="card-date">${dateStr}</span>
+          <span class="card-sender" title="${escapeHtml(item.from_addr)}">${escapeHtml(item.from_addr)}</span>
+          <span class="card-date" title="${escapeHtml(fullDateTitle)}">${dateStr}</span>
         </div>
         <div class="card-subject">${escapeHtml(item.subject || '(No Subject)')}</div>
         <div class="card-snippet">${item.snippet}</div>
