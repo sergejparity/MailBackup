@@ -372,8 +372,10 @@ function setupModalResizing(options) {
 
       function onMouseUp() {
         card.classList.remove('no-transition');
-        document.body.classList.remove('is-modal-resizing');
         handle.classList.remove('is-dragging');
+        setTimeout(() => {
+          document.body.classList.remove('is-modal-resizing');
+        }, 50); // delay removal to prevent modal click dismissal
         window.removeEventListener('mousemove', onMouseMove);
         window.removeEventListener('mouseup', onMouseUp);
         saveModalState();
@@ -427,7 +429,9 @@ function initEventListeners() {
   [el.settingsModal, el.editAccountModal, el.exportModal].forEach(modal => {
     if (modal) {
       modal.addEventListener('click', (e) => {
-        if (e.target === modal) closeModal(modal);
+        if (e.target === modal && !document.body.classList.contains('is-modal-resizing')) {
+          closeModal(modal);
+        }
       });
     }
   });
