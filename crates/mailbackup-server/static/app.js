@@ -1,19 +1,18 @@
 // MailBackup Studio Web Application
 let state = {
   accounts: [],
+  expandedAccounts: new Set(),
+  accountFolders: {}, // accountId -> array of folders
   selectedAccountId: null,
   selectedFolderId: null,
   selectedMessageId: null,
   messages: [],
-  folders: [],
   currentSort: 'newest',
 };
 
 // DOM Elements
 const el = {
   accountsList: document.getElementById('accounts-list'),
-  foldersList: document.getElementById('folders-list'),
-  folderCountBadge: document.getElementById('folder-count-badge'),
   currentFolderTitle: document.getElementById('current-folder-title'),
   folderMsgCount: document.getElementById('folder-msg-count'),
   emailItemsContainer: document.getElementById('email-items-container'),
@@ -623,17 +622,74 @@ function renderAccounts() {
   }
 
   state.accounts.forEach(acc => {
+    // Container for the account row and its nested folders
+    const container = document.createElement('div');
+    container.className = 'account-tree-node';
+
+    const isExpanded = state.expandedAccounts.has(acc.id);
+
     const item = document.createElement('div');
     item.className = `account-item ${acc.id === state.selectedAccountId ? 'active' : ''}`;
-    item.innerHTML = `
-      <div class="account-info">
-        <span class="account-title">${escapeHtml(acc.name)}</span>
-        <span class="account-email">${escapeHtml(acc.email)}</span>
-      </div>
-      <span class="account-status-dot" style="background: ${acc.enabled ? 'var(--accent-emerald)' : 'var(--text-dim)'};" title="${acc.enabled ? 'Active' : 'Disabled'}"></span>
+    
+    // Chevron icon
+    const chevron = document.createElement('span');
+    chevron.className = `account-chevron ${isExpanded ? 'expanded' : ''}`;
+    chevron.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"></polyline></svg>`;
+    chevron.style.marginRight = '8px';
+    chevron.style.transition = 'transform 0.2s';
+    if (isExpanded) chevron.style.transform = 'rotate(90deg)';
+
+    const info = document.createElement('div');
+    info.className = 'account-info';
+    info.innerHTML = `
+      <span class="account-title">${escapeHtml(acc.name)}</span>
+      <span class="account-email">${escapeHtml(acc.email)}</span>
     `;
-    item.addEventListener('click', () => selectAccount(acc.id));
-    el.accountsList.appendChild(item);
+
+    const statusDot = document.createElement('span');
+    statusDot.className = 'account-status-dot';
+    statusDot.style.background = acc.enabled ? 'var(--accent-emerald)' : 'var(--text-dim)';
+    statusDot.title = acc.enabled ? 'Active' : 'Disabled';
+
+    item.appendChild(chevron);
+    item.appendChild(info);
+    item.appendChild(statusDot);
+
+    item.addEventListener('click', () => toggleAccountExpansion(acc.id));
+    container.appendChild(item);
+
+    // Render nested folders if expanded
+    if (isExpanded) {
+      const foldersContainer = document.createElement('div');
+      foldersContainer.className = 'nested-folders';
+      
+      const folders = state.accountFolders[acc.id];
+      if (folders) {
+        if (folders.length === 0) {
+          foldersContainer.innerHTML = '<div class="empty-state-hint" style="padding: 4px 16px;">No folders found</div>';
+        } else {
+          folders.forEach(f => {
+            const fItem = document.createElement('div');
+            fItem.className = `folder-item nested ${f.id === state.selectedFolderId ? 'active' : ''}`;
+            fItem.innerHTML = `
+              <span>📁 ${escapeHtml(f.remote_name)}</span>
+              <span class="count-badge">${f.message_count}</span>
+            `;
+            fItem.addEventListener('click', (e) => {
+              e.stopPropagation();
+              state.selectedAccountId = acc.id;
+              selectFolder(f);
+            });
+            foldersContainer.appendChild(fItem);
+          });
+        }
+      } else {
+        foldersContainer.innerHTML = '<div class="empty-state-hint" style="padding: 4px 16px;">Loading folders...</div>';
+      }
+      container.appendChild(foldersContainer);
+    }
+
+    el.accountsList.appendChild(container);
   });
 }
 
@@ -720,52 +776,36 @@ async function handleSaveAccountEdit(e) {
   }
 }
 
-async function selectAccount(accountId) {
-  state.selectedAccountId = accountId;
-  renderAccounts();
-  await loadFolders(accountId);
+async function toggleAccountExpansion(accountId) {
+  if (state.expandedAccounts.has(accountId)) {
+    state.expandedAccounts.delete(accountId);
+    renderAccounts();
+  } else {
+    state.expandedAccounts.add(accountId);
+    renderAccounts();
+    if (!state.accountFolders[accountId]) {
+      await loadFolders(accountId);
+    }
+  }
 }
 
 async function loadFolders(accountId) {
   try {
     const res = await fetch(`/api/accounts/${accountId}/folders`);
     if (!res.ok) return;
-    state.folders = await res.json();
-    renderFolders();
-
-    if (state.folders.length > 0) {
-      selectFolder(state.folders[0]);
-    } else {
-      el.currentFolderTitle.textContent = 'No folders';
-      el.folderMsgCount.textContent = '0 messages';
-      el.emailItemsContainer.innerHTML = `<div class="empty-state"><h3>No folders synced</h3><p>Click "Sync Now" to download mailboxes.</p></div>`;
-    }
+    const folders = await res.json();
+    state.accountFolders[accountId] = folders;
+    renderAccounts();
   } catch (err) {
     console.error('Failed to load folders:', err);
   }
-}
-
-function renderFolders() {
-  el.foldersList.innerHTML = '';
-  el.folderCountBadge.textContent = state.folders.length;
-
-  state.folders.forEach(f => {
-    const item = document.createElement('div');
-    item.className = `folder-item ${f.id === state.selectedFolderId ? 'active' : ''}`;
-    item.innerHTML = `
-      <span>📁 ${escapeHtml(f.remote_name)}</span>
-      <span class="count-badge">${f.message_count}</span>
-    `;
-    item.addEventListener('click', () => selectFolder(f));
-    el.foldersList.appendChild(item);
-  });
 }
 
 async function selectFolder(folder) {
   state.selectedFolderId = folder.id;
   el.currentFolderTitle.textContent = folder.remote_name;
   el.folderMsgCount.textContent = `${folder.message_count} messages`;
-  renderFolders();
+  renderAccounts();
   await loadFolderMessages(folder.id);
 }
 

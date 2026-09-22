@@ -418,10 +418,6 @@ body.is-modal-resizing * {
   background: var(--accent-emerald);
 }
 
-.folder-header {
-  margin-top: 18px;
-}
-
 .count-badge {
   background: rgba(255, 255, 255, 0.06);
   color: var(--text-dim);
@@ -430,24 +426,44 @@ body.is-modal-resizing * {
   font-size: 0.68rem;
 }
 
-.folders-nav {
-  flex: 1;
-  overflow-y: auto;
+.account-tree-node {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding-top: 4px;
+  margin-bottom: 2px;
 }
+
+.account-chevron {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+}
+
+.account-chevron.expanded {
+  color: var(--text-main);
+}
+
+.nested-folders {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-left: 24px;
+  margin-top: 2px;
+  border-left: 1px solid var(--border-subtle);
+  margin-left: 12px;
+}
+
+
 
 .folder-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 7px 10px;
+  padding: 6px 10px;
   border-radius: var(--radius-sm);
   cursor: pointer;
   color: var(--text-muted);
-  font-size: 0.84rem;
+  font-size: 0.8rem;
   transition: var(--transition-fast);
 }
 
