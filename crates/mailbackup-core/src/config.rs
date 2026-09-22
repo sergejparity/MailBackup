@@ -182,6 +182,28 @@ pub fn resolve_path(input: &str) -> PathBuf {
     PathBuf::from(trimmed)
 }
 
+pub fn default_export_dir() -> PathBuf {
+    dirs::download_dir()
+        .or_else(dirs::document_dir)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| default_base_dir().join("exports"))
+}
+
+pub fn resolve_export_path(input: &str) -> PathBuf {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        return default_export_dir().join(format!("backup_{}.mbox", timestamp));
+    }
+
+    let resolved = resolve_path(trimmed);
+    if resolved.is_relative() {
+        default_export_dir().join(resolved)
+    } else {
+        resolved
+    }
+}
+
 impl AppConfig {
     pub fn load_or_create(path: Option<&Path>) -> Result<Self> {
         let config_path = match path {

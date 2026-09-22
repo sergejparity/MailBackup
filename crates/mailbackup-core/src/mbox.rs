@@ -16,19 +16,12 @@ impl<'a> MboxExporter<'a> {
         Self { storage }
     }
 
-    /// Exports a list of relative .eml paths to an RFC 4155 mbox file
-    pub fn export_to_mbox(
+    /// Streams a list of relative .eml paths to an RFC 4155 mbox writer
+    pub fn export_to_writer<W: Write>(
         &self,
         eml_relative_paths: &[String],
-        output_path: impl AsRef<Path>,
+        mut writer: W,
     ) -> Result<usize> {
-        let output_path = output_path.as_ref();
-        if let Some(parent) = output_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let file = File::create(output_path)?;
-        let mut writer = BufWriter::new(file);
         let mut count = 0;
 
         for rel_path in eml_relative_paths {
@@ -81,6 +74,25 @@ impl<'a> MboxExporter<'a> {
         }
 
         writer.flush()?;
+        Ok(count)
+    }
+
+    /// Exports a list of relative .eml paths to an RFC 4155 mbox file
+    pub fn export_to_mbox(
+        &self,
+        eml_relative_paths: &[String],
+        output_path: impl AsRef<Path>,
+    ) -> Result<usize> {
+        let output_path = output_path.as_ref();
+        if let Some(parent) = output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        let file = File::create(output_path)?;
+        let writer = BufWriter::new(file);
+        let count = self.export_to_writer(eml_relative_paths, writer)?;
         info!("Exported {} messages to mbox: {}", count, output_path.display());
         Ok(count)
     }

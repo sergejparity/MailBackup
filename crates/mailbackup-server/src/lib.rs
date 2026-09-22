@@ -75,6 +75,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/sync/status", get(api_get_sync_status))
         .route("/api/sync/:account_id", post(api_sync_account))
         .route("/api/export/mbox", post(api_export_mbox))
+        .route("/api/export/mbox/download", get(api_download_mbox))
         .route("/api/settings", get(api_get_settings).put(api_update_settings))
         .route("/api/service/status", get(api_service_status))
         .route("/api/service/toggle", post(api_service_toggle))
@@ -739,6 +740,7 @@ struct ExportMboxPayload {
 #[derive(Serialize)]
 struct ExportResult {
     exported_count: usize,
+    output_path: String,
 }
 
 async fn api_export_mbox(
@@ -765,11 +767,88 @@ async fn api_export_mbox(
         }
     }
 
+    let final_output_path = mailbackup_core::config::resolve_export_path(&payload.output_path);
+
     let exporter = MboxExporter::new(&state.storage);
-    match exporter.export_to_mbox(&paths, PathBuf::from(&payload.output_path)) {
-        Ok(count) => Json(ExportResult { exported_count: count }).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    match exporter.export_to_mbox(&paths, &final_output_path) {
+        Ok(count) => {
+            let path_str = final_output_path.to_string_lossy().to_string();
+            mailbackup_core::event_log::log_event(
+                "ARCHIVE_EXPORTED",
+                &format!("Exported {} message(s) to .mbox archive: {}", count, path_str),
+            );
+            Json(ExportResult {
+                exported_count: count,
+                output_path: path_str,
+            })
+            .into_response()
+        }
+        Err(e) => {
+            let err_msg = format!("Failed to export to {}: {}", final_output_path.display(), e);
+            mailbackup_core::event_log::log_event("EXPORT_ERROR", &err_msg);
+            (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response()
+        }
     }
+}
+
+#[derive(Deserialize)]
+struct DownloadMboxQuery {
+    account_id: String,
+    folder_id: Option<String>,
+}
+
+async fn api_download_mbox(
+    State(state): State<AppState>,
+    Query(query): Query<DownloadMboxQuery>,
+) -> impl IntoResponse {
+    let folders = match state.db.get_folders(&query.account_id) {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let target_folders: Vec<_> = if let Some(ref fid) = query.folder_id {
+        if fid == "ALL" {
+            folders
+        } else {
+            folders.into_iter().filter(|f| f.id == *fid).collect()
+        }
+    } else {
+        folders
+    };
+
+    let mut paths = Vec::new();
+    for f in target_folders {
+        if let Ok(msgs) = state.db.get_messages_for_folder(&f.id) {
+            for m in msgs {
+                paths.push(m.relative_path);
+            }
+        }
+    }
+
+    let mut buffer = Vec::new();
+    let exporter = MboxExporter::new(&state.storage);
+    let count = match exporter.export_to_writer(&paths, &mut buffer) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let filename = format!("backup_{}.mbox", timestamp);
+
+    mailbackup_core::event_log::log_event(
+        "ARCHIVE_EXPORTED",
+        &format!("Downloaded .mbox archive containing {} message(s)", count),
+    );
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/mbox")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .body(Body::from(buffer))
+        .unwrap()
+        .into_response()
 }
 
 #[derive(Serialize)]
@@ -784,6 +863,7 @@ pub struct SettingsResponse {
     pub autostart: bool,
     pub run_as_service: bool,
     pub service_status: mailbackup_core::service::ServiceStatus,
+    pub default_export_dir: String,
 }
 
 async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
@@ -799,6 +879,7 @@ async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
         autostart: cfg.settings.autostart,
         run_as_service: cfg.settings.run_as_service,
         service_status: mailbackup_core::service::get_service_status(),
+        default_export_dir: mailbackup_core::config::default_export_dir().to_string_lossy().to_string(),
     };
     Json(res).into_response()
 }

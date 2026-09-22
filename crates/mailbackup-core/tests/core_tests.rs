@@ -436,6 +436,44 @@ async fn test_scheduler_event_logging_and_listener() {
     scheduler.shutdown().await.unwrap();
 }
 
+#[test]
+fn test_resolve_export_path_and_writer() {
+    use mailbackup_core::config::{default_export_dir, resolve_export_path};
+    use mailbackup_core::mbox::MboxExporter;
+    use mailbackup_core::storage::StorageEngine;
+    use chrono::Utc;
+    use tempfile::tempdir;
+
+    let def_dir = default_export_dir();
+    assert!(!def_dir.as_os_str().is_empty());
+
+    // Relative path resolves to default_export_dir
+    let resolved = resolve_export_path("backup_2026.mbox");
+    assert!(resolved.is_absolute() || !resolved.to_string_lossy().is_empty());
+    assert_eq!(resolved, def_dir.join("backup_2026.mbox"));
+
+    // Empty path resolves to default_export_dir with backup_*.mbox
+    let empty_resolved = resolve_export_path("");
+    assert!(empty_resolved.to_string_lossy().contains("backup_"));
+    assert!(empty_resolved.to_string_lossy().ends_with(".mbox"));
+
+    // Test export_to_writer
+    let dir = tempdir().unwrap();
+    let storage = StorageEngine::new(dir.path());
+    let raw = b"From: user@test.com\r\nSubject: Test\r\n\r\nTest body";
+    let stored = storage.store_eml("acc1", "INBOX", 1, Some(Utc::now()), raw).unwrap();
+
+    let exporter = MboxExporter::new(&storage);
+    let mut buffer = Vec::new();
+    let count = exporter.export_to_writer(&[stored.relative_path.to_string_lossy().to_string()], &mut buffer).unwrap();
+    assert_eq!(count, 1);
+    assert!(!buffer.is_empty());
+    let text = String::from_utf8_lossy(&buffer);
+    assert!(text.contains("From user@test.com"));
+    assert!(text.contains("Subject: Test"));
+}
+
+
 
 
 

@@ -193,7 +193,10 @@ function initEventListeners() {
   // Forms
   el.addAccountForm.addEventListener('submit', handleAddAccount);
   el.btnTestAccount.addEventListener('click', handleTestAccount);
-  el.exportForm.addEventListener('submit', handleExportMbox);
+  if (el.exportForm) el.exportForm.addEventListener('submit', handleExportMbox);
+  if (el.exportAccountSelect) el.exportAccountSelect.addEventListener('change', updateExportDefaultPath);
+  const btnDownloadBrowser = document.getElementById('btn-download-browser');
+  if (btnDownloadBrowser) btnDownloadBrowser.addEventListener('click', handleDownloadMboxBrowser);
 
   // Sync All button
   el.btnSyncAll.addEventListener('click', handleSyncAll);
@@ -740,17 +743,47 @@ function populateExportModal() {
     el.exportFolderSelect.appendChild(opt);
   });
 
+  updateExportDefaultPath();
+}
+
+function updateExportDefaultPath() {
   const timestamp = new Date().toISOString().split('T')[0];
-  document.getElementById('export-output-path').value = `backup_${timestamp}.mbox`;
+  const selectedAccId = el.exportAccountSelect ? el.exportAccountSelect.value : '';
+  const acc = state.accounts.find(a => a.id === selectedAccId);
+  const accSlug = acc ? acc.name.replace(/[^a-zA-Z0-9_-]/g, '_') : 'backup';
+  const fileName = `${accSlug}_${timestamp}.mbox`;
+
+  const input = document.getElementById('export-output-path');
+  if (!input) return;
+
+  if (state.defaultExportDir) {
+    const sep = state.defaultExportDir.includes('\\') ? '\\' : '/';
+    input.value = `${state.defaultExportDir}${sep}${fileName}`;
+  } else {
+    input.value = fileName;
+  }
 }
 
 async function handleExportMbox(e) {
   e.preventDefault();
+  const rawPath = document.getElementById('export-output-path').value.trim();
+  if (!rawPath) {
+    showToast('Please enter an output destination path');
+    return;
+  }
+
   const payload = {
     account_id: el.exportAccountSelect.value,
     folder_id: el.exportFolderSelect.value === 'ALL' ? null : el.exportFolderSelect.value,
-    output_path: document.getElementById('export-output-path').value.trim(),
+    output_path: rawPath,
   };
+
+  const btn = document.getElementById('btn-export-submit');
+  const originalText = btn ? btn.textContent : 'Export Archive to Disk';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Exporting...';
+  }
 
   try {
     const res = await fetch('/api/export/mbox', {
@@ -761,15 +794,32 @@ async function handleExportMbox(e) {
 
     if (res.ok) {
       const result = await res.json();
-      showToast(`Exported ${result.exported_count} messages to .mbox! ✅`);
+      showToast(`Exported ${result.exported_count} message(s) to ${result.output_path || 'archive'}! ✅`);
       closeModal(el.exportModal);
     } else {
       const err = await res.text();
       showToast(`Export failed: ${err}`);
     }
   } catch (err) {
-    showToast(`Export error: ${err}`);
+    showToast(`Export error: ${err.message || err}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
   }
+}
+
+function handleDownloadMboxBrowser() {
+  const accountId = el.exportAccountSelect.value;
+  if (!accountId) {
+    showToast('Please select an account to export');
+    return;
+  }
+  const folderId = el.exportFolderSelect.value;
+  showToast('Preparing .mbox archive download in browser... 📦');
+  window.location.href = `/api/export/mbox/download?account_id=${encodeURIComponent(accountId)}&folder_id=${encodeURIComponent(folderId)}`;
+  closeModal(el.exportModal);
 }
 
 function escapeHtml(str) {
@@ -809,6 +859,9 @@ async function loadSettings() {
     }
     if (data.service_status) {
       updateServiceBadge(data.service_status, !!data.run_as_service);
+    }
+    if (data.default_export_dir) {
+      state.defaultExportDir = data.default_export_dir;
     }
   } catch (err) {
     console.error('Failed to load settings:', err);
