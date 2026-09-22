@@ -76,6 +76,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/sync/:account_id", post(api_sync_account))
         .route("/api/export/mbox", post(api_export_mbox))
         .route("/api/settings", get(api_get_settings).put(api_update_settings))
+        .route("/api/service/status", get(api_service_status))
+        .route("/api/service/toggle", post(api_service_toggle))
         .route("/api/logs", get(api_get_logs))
         .route("/api/logs/download", get(api_download_logs))
         .route("/api/logs/clear", post(api_clear_logs))
@@ -86,7 +88,14 @@ pub fn create_router(state: AppState) -> Router {
 }
 
 pub async fn start_server(port_override: Option<u16>) -> Result<()> {
-    let config_path = mailbackup_core::config::default_config_path();
+    start_server_with_options(port_override, None).await
+}
+
+pub async fn start_server_with_options(
+    port_override: Option<u16>,
+    config_path_override: Option<PathBuf>,
+) -> Result<()> {
+    let config_path = config_path_override.unwrap_or_else(mailbackup_core::config::default_config_path);
     let config = AppConfig::load_or_create(Some(&config_path))?;
     let db = Database::open(&config.db_path)?;
     let storage = StorageEngine::new(&config.data_dir);
@@ -694,6 +703,8 @@ pub struct SettingsResponse {
     pub web_port: u16,
     pub close_to_tray: bool,
     pub autostart: bool,
+    pub run_as_service: bool,
+    pub service_status: mailbackup_core::service::ServiceStatus,
 }
 
 async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
@@ -707,6 +718,8 @@ async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
         web_port: cfg.settings.web_port,
         close_to_tray: cfg.settings.close_to_tray,
         autostart: cfg.settings.autostart,
+        run_as_service: cfg.settings.run_as_service,
+        service_status: mailbackup_core::service::get_service_status(),
     };
     Json(res).into_response()
 }
@@ -719,6 +732,7 @@ pub struct UpdateSettingsPayload {
     pub move_db_existing: Option<bool>,
     pub close_to_tray: Option<bool>,
     pub autostart: Option<bool>,
+    pub run_as_service: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -729,6 +743,8 @@ pub struct UpdateSettingsResponse {
     pub migrated_files: u64,
     pub close_to_tray: bool,
     pub autostart: bool,
+    pub run_as_service: bool,
+    pub service_status: mailbackup_core::service::ServiceStatus,
     pub message: String,
 }
 
@@ -815,6 +831,7 @@ async fn api_update_settings(
     let current_db_path_str;
     let current_close_to_tray;
     let current_autostart;
+    let current_run_as_service;
 
     // 3. Update config and save to disk
     {
@@ -845,6 +862,22 @@ async fn api_update_settings(
             );
         }
 
+        if let Some(service_val) = payload.run_as_service {
+            if let Err(e) = mailbackup_core::service::set_service_enabled(service_val) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to configure system service: {}", e),
+                )
+                    .into_response();
+            }
+            cfg.settings.run_as_service = service_val;
+            let action = if service_val { "installed and started" } else { "uninstalled and stopped" };
+            mailbackup_core::event_log::log_event(
+                if service_val { "SERVICE_INSTALLED" } else { "SERVICE_REMOVED" },
+                &format!("System background service {}", action),
+            );
+        }
+
         if let Err(e) = cfg.save(&state.config_path) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -857,6 +890,7 @@ async fn api_update_settings(
         current_db_path_str = cfg.db_path.to_string_lossy().to_string();
         current_close_to_tray = cfg.settings.close_to_tray;
         current_autostart = cfg.settings.autostart;
+        current_run_as_service = cfg.settings.run_as_service;
     }
 
     // 4. If storage or db location changed, reload scheduler
@@ -886,9 +920,75 @@ async fn api_update_settings(
         migrated_files,
         close_to_tray: current_close_to_tray,
         autostart: current_autostart,
+        run_as_service: current_run_as_service,
+        service_status: mailbackup_core::service::get_service_status(),
         message: messages.join(" "),
     })
     .into_response()
+}
+
+// Service Management Endpoints
+#[derive(Deserialize)]
+pub struct ServiceTogglePayload {
+    pub enabled: bool,
+}
+
+#[derive(Serialize)]
+pub struct ServiceToggleResponse {
+    pub success: bool,
+    pub enabled: bool,
+    pub service_status: mailbackup_core::service::ServiceStatus,
+    pub message: String,
+}
+
+async fn api_service_status() -> impl IntoResponse {
+    let status = mailbackup_core::service::get_service_status();
+    Json(status).into_response()
+}
+
+async fn api_service_toggle(
+    State(state): State<AppState>,
+    Json(payload): Json<ServiceTogglePayload>,
+) -> impl IntoResponse {
+    let res = mailbackup_core::service::set_service_enabled(payload.enabled);
+    match res {
+        Ok(_) => {
+            {
+                let mut cfg = state.config.write().await;
+                cfg.settings.run_as_service = payload.enabled;
+                let _ = cfg.save(&state.config_path);
+            }
+            let action = if payload.enabled { "installed and started" } else { "uninstalled and stopped" };
+            mailbackup_core::event_log::log_event(
+                if payload.enabled { "SERVICE_INSTALLED" } else { "SERVICE_REMOVED" },
+                &format!("System background service {}", action),
+            );
+            let status = mailbackup_core::service::get_service_status();
+            (
+                StatusCode::OK,
+                Json(ServiceToggleResponse {
+                    success: true,
+                    enabled: payload.enabled,
+                    service_status: status,
+                    message: format!("System service {} successfully", action),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let status = mailbackup_core::service::get_service_status();
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ServiceToggleResponse {
+                    success: false,
+                    enabled: !payload.enabled,
+                    service_status: status,
+                    message: format!("Failed to configure service: {}", e),
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 // Log Viewer Endpoints

@@ -107,6 +107,8 @@ pub struct GlobalSettings {
     pub close_to_tray: bool,
     #[serde(default)]
     pub autostart: bool,
+    #[serde(default)]
+    pub run_as_service: bool,
 }
 
 fn default_schedule() -> String {
@@ -127,6 +129,7 @@ impl Default for GlobalSettings {
             web_port: default_server_port(),
             close_to_tray: true,
             autostart: false,
+            run_as_service: false,
         }
     }
 }

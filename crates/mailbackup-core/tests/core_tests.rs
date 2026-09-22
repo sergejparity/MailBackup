@@ -361,6 +361,29 @@ accounts: []
 "#;
     let loaded: AppConfig = serde_yaml::from_str(yaml).unwrap();
     assert!(!loaded.settings.autostart);
+    assert!(!loaded.settings.run_as_service);
 }
+
+#[test]
+fn test_service_status_and_config() {
+    use mailbackup_core::service::{find_server_executable, get_manual_install_command, get_manual_uninstall_command, get_service_status};
+    use std::path::Path;
+
+    let default_config = AppConfig::default();
+    assert!(!default_config.settings.run_as_service);
+
+    let status = get_service_status();
+    assert!(!status.service_type.is_empty());
+    assert!(!status.manual_install_cmd.is_empty());
+    assert!(!status.manual_uninstall_cmd.is_empty());
+
+    let exe = find_server_executable();
+    let cmd = get_manual_install_command(&exe, Path::new("/custom/config.yaml"));
+    assert!(cmd.contains("config.yaml"));
+
+    let uninst = get_manual_uninstall_command();
+    assert!(!uninst.is_empty());
+}
+
 
 

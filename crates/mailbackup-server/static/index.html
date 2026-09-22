@@ -319,6 +319,27 @@
                     </div>
                   </div>
                 </div>
+
+                <div class="setting-toggle-row" style="border-top: 1px solid var(--border-color); padding-top: 12px; margin-top: 4px;">
+                  <input type="checkbox" id="settings-run-as-service" style="width: 18px; height: 18px; margin-top: 2px; accent-color: var(--primary); cursor: pointer;">
+                  <div style="flex: 1;">
+                    <label for="settings-run-as-service" style="cursor: pointer; font-size: 0.9rem; font-weight: 500; display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                      <span>Run as OS Background Service (without user logged on)</span>
+                      <span id="service-setting-status" class="badge" style="background: rgba(148, 163, 184, 0.15); color: var(--text-secondary); font-size: 0.72rem; padding: 2px 7px; border-radius: 9999px;">Not Installed</span>
+                    </label>
+                    <div style="font-size: 0.78rem; color: var(--text-secondary); margin-top: 4px; line-height: 1.45;">
+                      Installs MailBackup Server as an OS background service (Windows Task / macOS LaunchDaemon / Linux systemd) that starts automatically at machine boot and performs scheduled backups even when no user is logged into the computer.
+                    </div>
+                    <div id="service-details-box" style="margin-top: 8px; font-size: 0.75rem; background: var(--bg-tertiary); padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border-color); display: none;">
+                      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                        <span style="font-weight: 600; color: var(--text-primary);" id="service-type-label">OS Service</span>
+                        <button type="button" id="btn-copy-service-cmd" class="btn btn-secondary btn-sm" style="font-size: 0.7rem; padding: 2px 6px;">Copy Terminal Command</button>
+                      </div>
+                      <div id="service-details-text" style="color: var(--text-secondary); margin-bottom: 4px;"></div>
+                      <code id="service-manual-cmd" style="display: block; white-space: pre-wrap; word-break: break-all; background: rgba(0,0,0,0.25); padding: 6px; border-radius: 4px; font-family: monospace; font-size: 0.72rem; max-height: 80px; overflow-y: auto;"></code>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
 

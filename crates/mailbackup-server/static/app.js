@@ -83,6 +83,13 @@ const el = {
   traySettingStatus: document.getElementById('tray-setting-status'),
   settingsAutostart: document.getElementById('settings-autostart'),
   autostartSettingStatus: document.getElementById('autostart-setting-status'),
+  settingsRunAsService: document.getElementById('settings-run-as-service'),
+  serviceSettingStatus: document.getElementById('service-setting-status'),
+  serviceDetailsBox: document.getElementById('service-details-box'),
+  serviceTypeLabel: document.getElementById('service-type-label'),
+  serviceDetailsText: document.getElementById('service-details-text'),
+  serviceManualCmd: document.getElementById('service-manual-cmd'),
+  btnCopyServiceCmd: document.getElementById('btn-copy-service-cmd'),
 
   // Header & Logs Elements
   syncProgressBanner: document.getElementById('sync-progress-banner'),
@@ -134,6 +141,8 @@ function initEventListeners() {
   if (el.settingsStorageForm) el.settingsStorageForm.addEventListener('submit', handleSaveStorageSettings);
   if (el.settingsCloseToTray) el.settingsCloseToTray.addEventListener('change', handleToggleCloseToTray);
   if (el.settingsAutostart) el.settingsAutostart.addEventListener('change', handleToggleAutostart);
+  if (el.settingsRunAsService) el.settingsRunAsService.addEventListener('change', handleToggleService);
+  if (el.btnCopyServiceCmd) el.btnCopyServiceCmd.addEventListener('click', handleCopyServiceCmd);
 
   // Logs Actions & Direct Nav
   if (el.btnOpenLogs) {
@@ -795,6 +804,12 @@ async function loadSettings() {
       el.settingsAutostart.checked = !!data.autostart;
       updateAutostartBadge(data.autostart);
     }
+    if (el.settingsRunAsService) {
+      el.settingsRunAsService.checked = !!data.run_as_service;
+    }
+    if (data.service_status) {
+      updateServiceBadge(data.service_status, !!data.run_as_service);
+    }
   } catch (err) {
     console.error('Failed to load settings:', err);
   }
@@ -823,6 +838,43 @@ function updateAutostartBadge(enabled) {
     el.autostartSettingStatus.textContent = 'Disabled';
     el.autostartSettingStatus.style.background = 'rgba(148, 163, 184, 0.15)';
     el.autostartSettingStatus.style.color = 'var(--text-secondary)';
+  }
+}
+
+function updateServiceBadge(status, configured) {
+  if (!el.serviceSettingStatus) return;
+
+  if (el.serviceDetailsBox) {
+    el.serviceDetailsBox.style.display = 'block';
+  }
+  if (el.serviceTypeLabel && status.service_type) {
+    el.serviceTypeLabel.textContent = `${status.service_type}`;
+  }
+  if (el.serviceDetailsText && status.details) {
+    el.serviceDetailsText.textContent = status.details;
+  }
+  if (el.serviceManualCmd && status.manual_install_cmd) {
+    el.serviceManualCmd.textContent = status.installed
+      ? (status.manual_uninstall_cmd || 'Service installed')
+      : status.manual_install_cmd;
+  }
+
+  if (status.installed && status.running) {
+    el.serviceSettingStatus.textContent = 'Active (Running)';
+    el.serviceSettingStatus.style.background = 'rgba(34, 197, 94, 0.15)';
+    el.serviceSettingStatus.style.color = '#4ade80';
+  } else if (status.installed) {
+    el.serviceSettingStatus.textContent = 'Installed (Idle)';
+    el.serviceSettingStatus.style.background = 'rgba(234, 179, 8, 0.15)';
+    el.serviceSettingStatus.style.color = '#facc15';
+  } else if (status.service_type === 'Unsupported') {
+    el.serviceSettingStatus.textContent = 'Unsupported';
+    el.serviceSettingStatus.style.background = 'rgba(239, 68, 68, 0.15)';
+    el.serviceSettingStatus.style.color = '#f87171';
+  } else {
+    el.serviceSettingStatus.textContent = 'Not Installed';
+    el.serviceSettingStatus.style.background = 'rgba(148, 163, 184, 0.15)';
+    el.serviceSettingStatus.style.color = 'var(--text-secondary)';
   }
 }
 
@@ -890,6 +942,53 @@ async function handleToggleAutostart(e) {
   }
 }
 
+async function handleToggleService(e) {
+  const isChecked = e.target.checked;
+  showToast(isChecked ? 'Registering OS system background service... (check for admin prompt)' : 'Removing system service...');
+
+  try {
+    const res = await fetch('/api/service/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled: isChecked,
+      }),
+    });
+
+    const data = await res.json();
+    if (res.ok && data.success) {
+      showToast(
+        isChecked
+          ? 'System Service Activated: MailBackup will run at boot without user login! ⚙️'
+          : 'System Service Removed 🛑'
+      );
+      if (data.service_status) {
+        updateServiceBadge(data.service_status, isChecked);
+      }
+    } else {
+      showToast(`Service setup failed: ${data.message || 'Permission denied'}`);
+      e.target.checked = !isChecked;
+      if (data.service_status) {
+        updateServiceBadge(data.service_status, !isChecked);
+      }
+    }
+  } catch (err) {
+    showToast(`Error setting service: ${err.message}`);
+    e.target.checked = !isChecked;
+  }
+}
+
+function handleCopyServiceCmd() {
+  if (!el.serviceManualCmd) return;
+  const cmd = el.serviceManualCmd.textContent;
+  if (!cmd) return;
+  navigator.clipboard.writeText(cmd).then(() => {
+    showToast('Terminal command copied to clipboard! 📋');
+  }).catch(() => {
+    showToast('Failed to copy command');
+  });
+}
+
 async function handleSaveStorageSettings(e) {
   e.preventDefault();
   const newDir = el.settingsDataDir.value.trim();
@@ -904,6 +1003,7 @@ async function handleSaveStorageSettings(e) {
   const moveDbExisting = el.settingsMoveDbExisting ? el.settingsMoveDbExisting.checked : true;
   const closeToTray = el.settingsCloseToTray ? el.settingsCloseToTray.checked : true;
   const autostartVal = el.settingsAutostart ? el.settingsAutostart.checked : false;
+  const runAsServiceVal = el.settingsRunAsService ? el.settingsRunAsService.checked : false;
 
   const btn = el.btnSaveStorage;
   const originalHtml = btn ? btn.innerHTML : '';
@@ -923,6 +1023,7 @@ async function handleSaveStorageSettings(e) {
         move_db_existing: moveDbExisting,
         close_to_tray: closeToTray,
         autostart: autostartVal,
+        run_as_service: runAsServiceVal,
       }),
     });
 
@@ -938,6 +1039,12 @@ async function handleSaveStorageSettings(e) {
       if (el.settingsAutostart) {
         el.settingsAutostart.checked = !!data.autostart;
         updateAutostartBadge(data.autostart);
+      }
+      if (el.settingsRunAsService) {
+        el.settingsRunAsService.checked = !!data.run_as_service;
+      }
+      if (data.service_status) {
+        updateServiceBadge(data.service_status, !!data.run_as_service);
       }
       showToast(data.message || 'Settings saved successfully! ✅');
       await loadStats();
