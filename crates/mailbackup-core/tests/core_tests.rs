@@ -63,14 +63,77 @@ fn test_config_serialization() {
 fn test_credential_fallback_store() {
     let dir = tempdir().unwrap();
     let cred_file = dir.path().join("secrets.json");
-    let store = CredentialStore::with_fallback_path(cred_file);
+    let store = CredentialStore::with_fallback_path(cred_file.clone());
 
     store.set_password("acc1", "supersecret123").unwrap();
     let retrieved = store.get_password("acc1").unwrap();
     assert_eq!(retrieved, "supersecret123");
 
+    // Verify that the file on disk is encrypted and DOES NOT contain plaintext!
+    let raw_file = std::fs::read_to_string(&cred_file).unwrap();
+    assert!(!raw_file.contains("supersecret123"), "Plaintext password must not be present on disk!");
+    assert!(raw_file.contains("enc:v1:"), "Stored secrets must be encrypted with enc:v1: prefix");
+
     store.delete_password("acc1").unwrap();
     assert!(store.get_password("acc1").is_err());
+}
+
+#[test]
+fn test_legacy_plaintext_credential_migration() {
+    let dir = tempdir().unwrap();
+    let cred_file = dir.path().join(".credentials_store.json");
+
+    // Write a legacy unencrypted plaintext file
+    let legacy_content = serde_json::json!({
+        "account:legacy_user": "cleartext_password_999"
+    });
+    std::fs::write(&cred_file, serde_json::to_string_pretty(&legacy_content).unwrap()).unwrap();
+
+    // Verify the unencrypted file actually has the plaintext password
+    let initial_raw = std::fs::read_to_string(&cred_file).unwrap();
+    assert!(initial_raw.contains("cleartext_password_999"));
+
+    let store = CredentialStore::with_fallback_path(cred_file.clone());
+
+    // Reading legacy password must succeed seamlessly
+    let retrieved = store.get_password("legacy_user").unwrap();
+    assert_eq!(retrieved, "cleartext_password_999");
+
+    // The file on disk must now be automatically upgraded to AES-256-GCM ciphertext
+    let upgraded_raw = std::fs::read_to_string(&cred_file).unwrap();
+    assert!(!upgraded_raw.contains("cleartext_password_999"), "Plaintext must be erased from disk!");
+    assert!(upgraded_raw.contains("enc:v1:"), "Upgraded credentials must be encrypted");
+
+    // Reading again after encryption must still succeed
+    let retrieved_again = store.get_password("legacy_user").unwrap();
+    assert_eq!(retrieved_again, "cleartext_password_999");
+}
+
+#[test]
+fn test_legacy_undotted_file_migration() {
+    let dir = tempdir().unwrap();
+    let undotted_file = dir.path().join("credentials_store.json");
+    let target_file = dir.path().join(".credentials_store.json");
+
+    // Write to legacy undotted file
+    let legacy_content = serde_json::json!({
+        "account:user2": "secret456"
+    });
+    std::fs::write(&undotted_file, serde_json::to_string_pretty(&legacy_content).unwrap()).unwrap();
+
+    let store = CredentialStore::with_fallback_path(target_file.clone());
+
+    // Reading password should migrate from undotted to dotted encrypted file
+    let retrieved = store.get_password("user2").unwrap();
+    assert_eq!(retrieved, "secret456");
+
+    // Old undotted file must have been cleaned up
+    assert!(!undotted_file.exists(), "Old undotted file should be deleted after migration");
+    // New target file must exist and be encrypted
+    assert!(target_file.exists());
+    let raw = std::fs::read_to_string(&target_file).unwrap();
+    assert!(!raw.contains("secret456"));
+    assert!(raw.contains("enc:v1:"));
 }
 
 #[test]

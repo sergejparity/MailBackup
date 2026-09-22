@@ -29,6 +29,7 @@ tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
 webpki-roots.workspace = true
 futures-util.workspace = true
+aes-gcm.workspace = true
 
 [dev-dependencies]
 tempfile = "3.12"
