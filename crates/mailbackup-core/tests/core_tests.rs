@@ -1,5 +1,5 @@
 use mailbackup_core::config::{AccountConfig, AppConfig, AuthType, FolderFilter, ProviderType};
-use mailbackup_core::db::Database;
+use mailbackup_core::db::{AdvancedSearchFilter, Database};
 use mailbackup_core::keyring::CredentialStore;
 use mailbackup_core::mbox::MboxExporter;
 use mailbackup_core::retention::RetentionManager;
@@ -205,6 +205,147 @@ fn test_database_and_fts5_search() {
     // Search attachment name
     let results_att = db.search_fts("report.xlsx", 10).unwrap();
     assert_eq!(results_att.len(), 1);
+}
+
+#[test]
+fn test_advanced_search_filters() {
+    let db = Database::open_in_memory().unwrap();
+
+    db.upsert_account("acc1", "Alice", "alice@example.com", "generic_imap").unwrap();
+    let folder = db.get_or_create_folder("acc1", "INBOX", "inbox", Some(12345)).unwrap();
+
+    let now = Utc::now();
+    let five_days_ago = now - Duration::days(5);
+    let twenty_days_ago = now - Duration::days(20);
+
+    // Message 1: CFO with XLSX
+    db.insert_message(
+        "acc1",
+        &folder.id,
+        1,
+        Some("<msg001@example.com>"),
+        Some("Urgent Financial Report"),
+        Some("cfo@company.com"),
+        Some("alice@example.com"),
+        Some("legal@company.com"),
+        Some(twenty_days_ago),
+        5000,
+        "acc1/inbox/1.eml",
+        "hash1",
+        Some("Please review the financial spreadsheet."),
+        &[("report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 50000)],
+    ).unwrap();
+
+    // Message 2: Supplier with PDF invoice
+    db.insert_message(
+        "acc1",
+        &folder.id,
+        2,
+        Some("<msg002@example.com>"),
+        Some("Monthly Invoice for Services"),
+        Some("billing@supplier.com"),
+        Some("alice@example.com"),
+        None,
+        Some(five_days_ago),
+        15000,
+        "acc1/inbox/2.eml",
+        "hash2",
+        Some("Here is your invoice for August."),
+        &[("invoice_august.pdf", "application/pdf", 120000)],
+    ).unwrap();
+
+    // Message 3: Team notification (no attachments, small)
+    db.insert_message(
+        "acc1",
+        &folder.id,
+        3,
+        Some("<msg003@example.com>"),
+        Some("Weekly Team Standup"),
+        Some("manager@company.com"),
+        Some("team@company.com"),
+        None,
+        Some(now),
+        500,
+        "acc1/inbox/3.eml",
+        "hash3",
+        Some("Don't forget the weekly standup meeting today."),
+        &[],
+    ).unwrap();
+
+    // 1. Filter by Sender
+    let by_sender = db.search_advanced(&AdvancedSearchFilter {
+        from: Some("billing".to_string()),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(by_sender.len(), 1);
+    assert_eq!(by_sender[0].subject, "Monthly Invoice for Services");
+
+    // 2. Filter by CC
+    let by_cc = db.search_advanced(&AdvancedSearchFilter {
+        cc: Some("legal".to_string()),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(by_cc.len(), 1);
+    assert_eq!(by_cc[0].subject, "Urgent Financial Report");
+
+    // 3. Filter by Subject
+    let by_subject = db.search_advanced(&AdvancedSearchFilter {
+        subject: Some("Standup".to_string()),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(by_subject.len(), 1);
+    assert_eq!(by_subject[0].subject, "Weekly Team Standup");
+
+    // 4. Filter by has_attachments
+    let with_att = db.search_advanced(&AdvancedSearchFilter {
+        has_attachments: Some(true),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(with_att.len(), 2);
+
+    // 5. Filter by attachment_type: PDF
+    let pdf_only = db.search_advanced(&AdvancedSearchFilter {
+        attachment_type: Some("pdf".to_string()),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(pdf_only.len(), 1);
+    assert_eq!(pdf_only[0].subject, "Monthly Invoice for Services");
+
+    // 6. Filter by min size (>= 10,000 bytes)
+    let large_msgs = db.search_advanced(&AdvancedSearchFilter {
+        min_size_bytes: Some(10000),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(large_msgs.len(), 1);
+    assert_eq!(large_msgs[0].subject, "Monthly Invoice for Services");
+
+    // 7. Filter by date range (past 10 days)
+    let ten_days_ago_str = (now - Duration::days(10)).format("%Y-%m-%d").to_string();
+    let tomorrow_str = (now + Duration::days(1)).format("%Y-%m-%d").to_string();
+    let recent = db.search_advanced(&AdvancedSearchFilter {
+        date_from: Some(ten_days_ago_str),
+        date_to: Some(tomorrow_str),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(recent.len(), 2); // Message 2 and 3
+
+    // 8. Exclude words
+    let excluded = db.search_advanced(&AdvancedSearchFilter {
+        exclude_words: Some("Urgent Monthly".to_string()),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(excluded.len(), 1);
+    assert_eq!(excluded[0].subject, "Weekly Team Standup");
+
+    // 9. Combined FTS query + metadata filter
+    let combined = db.search_advanced(&AdvancedSearchFilter {
+        query: Some("spreadsheet".to_string()),
+        from: Some("cfo".to_string()),
+        ..Default::default()
+    }).unwrap();
+    assert_eq!(combined.len(), 1);
+    assert_eq!(combined[0].subject, "Urgent Financial Report");
+    assert!(combined[0].snippet.contains("spreadsheet"));
 }
 
 #[test]

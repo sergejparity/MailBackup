@@ -26,14 +26,21 @@
         </div>
       </div>
 
-      <!-- Quick Global Search Bar -->
-      <div class="search-container">
-        <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="11" cy="11" r="8"></circle>
-          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-        </svg>
-        <input type="text" id="global-search" placeholder="Search emails, bodies, attachments (FTS5)..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
-        <kbd class="shortcut-key">⌘K</kbd>
+      <!-- Quick Global Search Bar & Advanced Search -->
+      <div class="search-bar-wrap">
+        <div class="search-container">
+          <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          <input type="text" id="global-search" placeholder="Search emails, bodies, attachments (FTS5)..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+          <kbd class="shortcut-key">⌘K</kbd>
+        </div>
+        <button type="button" id="btn-open-advanced-search" class="btn btn-secondary btn-icon-only search-adv-trigger" title="Advanced Search">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
+          </svg>
+        </button>
       </div>
 
       <!-- Storage & Sync Stats Widget -->
@@ -599,6 +606,155 @@
             <div class="form-actions" style="display: flex; flex-direction: column; gap: 8px;">
               <button type="submit" id="btn-export-submit" class="btn btn-primary w-100">Export Archive to Disk</button>
               <button type="button" id="btn-download-browser" class="btn btn-secondary w-100">Download Archive via Browser</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: Advanced Search -->
+    <div id="advanced-search-modal" class="modal-backdrop" style="display: none;">
+      <div class="modal-card modal-adv-search">
+        <div class="modal-header">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--primary);">
+              <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
+            </svg>
+            <h2>Advanced Email Search</h2>
+          </div>
+          <button id="btn-close-advanced-search" class="btn-close">&times;</button>
+        </div>
+        <div class="modal-body" style="max-height: 80vh; overflow-y: auto;">
+          <form id="advanced-search-form" class="form-grid">
+            <!-- Section 1: People & Headers -->
+            <div class="adv-section-title">People & Headers</div>
+            <div class="form-row-3">
+              <div class="form-group">
+                <label for="adv-search-from">From</label>
+                <input type="text" id="adv-search-from" class="form-input" placeholder="Sender name or email">
+              </div>
+              <div class="form-group">
+                <label for="adv-search-to">To</label>
+                <input type="text" id="adv-search-to" class="form-input" placeholder="Recipient name or email">
+              </div>
+              <div class="form-group">
+                <label for="adv-search-cc">CC</label>
+                <input type="text" id="adv-search-cc" class="form-input" placeholder="CC recipient">
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label for="adv-search-subject">Subject</label>
+              <input type="text" id="adv-search-subject" class="form-input" placeholder="Keywords in subject line">
+            </div>
+
+            <!-- Section 2: Content & Keywords -->
+            <div class="adv-section-title">Content & Keywords</div>
+            <div class="form-row-2">
+              <div class="form-group">
+                <label for="adv-search-keywords">Has Words (Body & Text)</label>
+                <input type="text" id="adv-search-keywords" class="form-input" placeholder="Keywords in email body">
+              </div>
+              <div class="form-group">
+                <label for="adv-search-exclude">Doesn't Have Words</label>
+                <input type="text" id="adv-search-exclude" class="form-input" placeholder="Words to exclude">
+              </div>
+            </div>
+
+            <!-- Section 3: Date Range & Presets -->
+            <div class="adv-section-title">Date of Messages</div>
+            <div class="date-presets-row">
+              <button type="button" class="btn-date-preset active" data-preset="all">Any time</button>
+              <button type="button" class="btn-date-preset" data-preset="7d">Past 7 days</button>
+              <button type="button" class="btn-date-preset" data-preset="30d">Past 30 days</button>
+              <button type="button" class="btn-date-preset" data-preset="90d">Past 3 months</button>
+              <button type="button" class="btn-date-preset" data-preset="year">This year</button>
+            </div>
+            <div class="form-row-2">
+              <div class="form-group">
+                <label for="adv-search-date-from">Date From</label>
+                <input type="date" id="adv-search-date-from" class="form-input">
+              </div>
+              <div class="form-group">
+                <label for="adv-search-date-to">Date To</label>
+                <input type="date" id="adv-search-date-to" class="form-input">
+              </div>
+            </div>
+
+            <!-- Section 4: Scope & Location -->
+            <div class="adv-section-title">Location & Scope</div>
+            <div class="form-row-2">
+              <div class="form-group">
+                <label for="adv-search-account">Account</label>
+                <select id="adv-search-account" class="form-input">
+                  <option value="ALL">All Accounts</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="adv-search-folder">Folder</label>
+                <select id="adv-search-folder" class="form-input">
+                  <option value="ALL">All Folders</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Section 5: Attachments & Size -->
+            <div class="adv-section-title">Attachments & Size</div>
+            <div class="form-row-3">
+              <div class="form-group">
+                <label for="adv-search-att-name">Attachment Filename</label>
+                <input type="text" id="adv-search-att-name" class="form-input" placeholder="e.g. invoice, .pdf, report">
+              </div>
+              <div class="form-group">
+                <label for="adv-search-att-type">Attachment Type</label>
+                <select id="adv-search-att-type" class="form-input">
+                  <option value="all">Any Type</option>
+                  <option value="pdf">PDF Documents (.pdf)</option>
+                  <option value="spreadsheet">Spreadsheets (.xlsx, .csv)</option>
+                  <option value="document">Office Docs (.docx, .doc, .odt)</option>
+                  <option value="image">Images (.png, .jpg, .gif)</option>
+                  <option value="archive">Archives (.zip, .tar, .7z)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="adv-search-min-size">Minimum Size</label>
+                <select id="adv-search-min-size" class="form-input">
+                  <option value="0">Any Size</option>
+                  <option value="0.5">> 500 KB</option>
+                  <option value="1">> 1 MB</option>
+                  <option value="5">> 5 MB</option>
+                  <option value="10">> 10 MB</option>
+                  <option value="25">> 25 MB</option>
+                </select>
+              </div>
+            </div>
+
+            <div style="display: flex; gap: 24px; align-items: center; margin-top: 4px; flex-wrap: wrap;">
+              <label class="checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.84rem;">
+                <input type="checkbox" id="adv-search-has-att" style="cursor: pointer; accent-color: var(--primary);">
+                <span>Must have attachments</span>
+              </label>
+              <label class="checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.84rem;">
+                <input type="checkbox" id="adv-search-include-deleted" style="cursor: pointer; accent-color: var(--primary);">
+                <span>Include remotely deleted emails</span>
+              </label>
+            </div>
+
+            <!-- Modal Footer Actions -->
+            <div class="modal-footer-actions" style="display: flex; justify-content: space-between; align-items: center; margin-top: 16px; border-top: 1px solid var(--border-subtle); padding-top: 14px;">
+              <button type="button" id="btn-reset-advanced-search" class="btn btn-secondary">
+                Reset Filters
+              </button>
+              <div style="display: flex; gap: 8px;">
+                <button type="button" id="btn-cancel-advanced-search" class="btn btn-secondary">Cancel</button>
+                <button type="submit" id="btn-submit-advanced-search" class="btn btn-primary" style="min-width: 120px;">
+                  <svg class="btn-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                  </svg>
+                  Search Emails
+                </button>
+              </div>
             </div>
           </form>
         </div>

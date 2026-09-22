@@ -9,7 +9,7 @@ use axum::{
 };
 use mail_parser::{MessageParser, MimeHeaders};
 use mailbackup_core::config::{AccountConfig, AppConfig, AuthType, FolderFilter, ProviderType};
-use mailbackup_core::db::Database;
+use mailbackup_core::db::{AdvancedSearchFilter, Database};
 use mailbackup_core::imap::ImapSyncEngine;
 use mailbackup_core::keyring::CredentialStore;
 use mailbackup_core::mbox::MboxExporter;
@@ -582,16 +582,52 @@ async fn api_download_eml(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct SearchParams {
-    q: String,
+    q: Option<String>,
+    exclude: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    cc: Option<String>,
+    subject: Option<String>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    account_id: Option<String>,
+    folder_id: Option<String>,
+    has_attachments: Option<bool>,
+    att_name: Option<String>,
+    att_type: Option<String>,
+    min_size_mb: Option<f64>,
+    include_deleted: Option<bool>,
+    limit: Option<u32>,
 }
 
 async fn api_search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
-    match state.db.search_fts(&params.q, 30) {
+    let min_size_bytes = params.min_size_mb.map(|mb| (mb * 1024.0 * 1024.0) as u64);
+
+    let filter = AdvancedSearchFilter {
+        query: params.q,
+        exclude_words: params.exclude,
+        from: params.from,
+        to: params.to,
+        cc: params.cc,
+        subject: params.subject,
+        date_from: params.date_from,
+        date_to: params.date_to,
+        account_id: params.account_id,
+        folder_id: params.folder_id,
+        has_attachments: params.has_attachments,
+        attachment_name: params.att_name,
+        attachment_type: params.att_type,
+        min_size_bytes,
+        include_deleted: params.include_deleted,
+        limit: params.limit.or(Some(50)),
+    };
+
+    match state.db.search_advanced(&filter) {
         Ok(results) => Json(results).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

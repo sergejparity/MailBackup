@@ -1,6 +1,6 @@
 use crate::error::Result;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -57,6 +57,26 @@ pub struct SearchResult {
     pub date: Option<DateTime<Utc>>,
     pub relative_path: String,
     pub snippet: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdvancedSearchFilter {
+    pub query: Option<String>,
+    pub exclude_words: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub cc: Option<String>,
+    pub subject: Option<String>,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+    pub account_id: Option<String>,
+    pub folder_id: Option<String>,
+    pub has_attachments: Option<bool>,
+    pub attachment_name: Option<String>,
+    pub attachment_type: Option<String>,
+    pub min_size_bytes: Option<u64>,
+    pub include_deleted: Option<bool>,
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,26 +581,187 @@ impl Database {
     }
 
     pub fn search_fts(&self, query: &str, limit: u32) -> Result<Vec<SearchResult>> {
+        let filter = AdvancedSearchFilter {
+            query: Some(query.to_string()),
+            limit: Some(limit),
+            ..Default::default()
+        };
+        self.search_advanced(&filter)
+    }
+
+    pub fn search_advanced(&self, filter: &AdvancedSearchFilter) -> Result<Vec<SearchResult>> {
         let conn = self.conn.lock().unwrap();
-        // Clean query for FTS5 (escape quotes if needed)
-        let sanitized_query = query.replace('"', "\"\"");
-        let fts_query = format!("\"{}\"", sanitized_query);
+        let limit = filter.limit.unwrap_or(50).min(500);
 
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT 
-                m.id, m.account_id, f.remote_name, m.subject, m.from_addr, m.to_addrs, m.date, m.relative_path,
-                snippet(messages_fts, -1, '<b>', '</b>', '...', 15) as snip
-            FROM messages_fts
-            JOIN messages m ON m.id = messages_fts.message_id
-            JOIN folders f ON f.id = m.folder_id
-            WHERE messages_fts MATCH ?1
-            ORDER BY rank
-            LIMIT ?2
-            "#,
-        )?;
+        let query_trimmed = filter.query.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let has_fts = query_trimmed.is_some();
 
-        let rows = stmt.query_map(params![fts_query, limit], |row| {
+        let mut conditions: Vec<String> = Vec::new();
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+
+        if let Some(q) = query_trimmed {
+            let fts_query = if q.contains('"') {
+                q.to_string()
+            } else {
+                let tokens: Vec<String> = q
+                    .split_whitespace()
+                    .filter(|w| !w.is_empty())
+                    .map(|w| {
+                        let clean = w.replace('"', "\"\"").replace('*', "");
+                        format!("\"{}\"*", clean)
+                    })
+                    .collect();
+                if tokens.is_empty() {
+                    format!("\"{}\"", q.replace('"', "\"\""))
+                } else {
+                    tokens.join(" ")
+                }
+            };
+            conditions.push("messages_fts MATCH ?".to_string());
+            params.push(rusqlite::types::Value::Text(fts_query));
+        }
+
+        if let Some(from) = filter.from.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            for word in from.split_whitespace().filter(|w| !w.is_empty()) {
+                conditions.push("m.from_addr LIKE ?".to_string());
+                params.push(rusqlite::types::Value::Text(format!("%{}%", word)));
+            }
+        }
+
+        if let Some(to) = filter.to.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            for word in to.split_whitespace().filter(|w| !w.is_empty()) {
+                conditions.push("m.to_addrs LIKE ?".to_string());
+                params.push(rusqlite::types::Value::Text(format!("%{}%", word)));
+            }
+        }
+
+        if let Some(cc) = filter.cc.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            for word in cc.split_whitespace().filter(|w| !w.is_empty()) {
+                conditions.push("m.cc_addrs LIKE ?".to_string());
+                params.push(rusqlite::types::Value::Text(format!("%{}%", word)));
+            }
+        }
+
+        if let Some(sub) = filter.subject.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            for word in sub.split_whitespace().filter(|w| !w.is_empty()) {
+                conditions.push("m.subject LIKE ?".to_string());
+                params.push(rusqlite::types::Value::Text(format!("%{}%", word)));
+            }
+        }
+
+        if let Some(df) = filter.date_from.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let clean_df = if df.len() >= 10 { &df[..10] } else { df };
+            conditions.push("date(m.date) >= ?".to_string());
+            params.push(rusqlite::types::Value::Text(clean_df.to_string()));
+        }
+
+        if let Some(dt) = filter.date_to.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let clean_dt = if dt.len() >= 10 { &dt[..10] } else { dt };
+            conditions.push("date(m.date) <= ?".to_string());
+            params.push(rusqlite::types::Value::Text(clean_dt.to_string()));
+        }
+
+        if let Some(acc) = filter.account_id.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "ALL") {
+            conditions.push("m.account_id = ?".to_string());
+            params.push(rusqlite::types::Value::Text(acc.to_string()));
+        }
+
+        if let Some(fld) = filter.folder_id.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "ALL") {
+            conditions.push("m.folder_id = ?".to_string());
+            params.push(rusqlite::types::Value::Text(fld.to_string()));
+        }
+
+        if filter.include_deleted != Some(true) {
+            conditions.push("m.is_remote_deleted = 0".to_string());
+        }
+
+        if let Some(min_size) = filter.min_size_bytes {
+            if min_size > 0 {
+                conditions.push("m.size_bytes >= ?".to_string());
+                params.push(rusqlite::types::Value::Integer(min_size as i64));
+            }
+        }
+
+        if filter.has_attachments == Some(true) {
+            conditions.push("EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id)".to_string());
+        }
+
+        if let Some(att_name) = filter.attachment_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            conditions.push("EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id AND a.filename LIKE ?)".to_string());
+            params.push(rusqlite::types::Value::Text(format!("%{}%", att_name)));
+        }
+
+        if let Some(att_type) = filter.attachment_type.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "all") {
+            match att_type.to_lowercase().as_str() {
+                "pdf" => {
+                    conditions.push("EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id AND (a.mime_type LIKE '%pdf%' OR a.filename LIKE '%.pdf'))".to_string());
+                }
+                "image" => {
+                    conditions.push("EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id AND (a.mime_type LIKE 'image/%' OR a.filename LIKE '%.png' OR a.filename LIKE '%.jpg' OR a.filename LIKE '%.jpeg' OR a.filename LIKE '%.gif' OR a.filename LIKE '%.webp'))".to_string());
+                }
+                "spreadsheet" => {
+                    conditions.push("EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id AND (a.filename LIKE '%.xlsx' OR a.filename LIKE '%.xls' OR a.filename LIKE '%.csv'))".to_string());
+                }
+                "archive" => {
+                    conditions.push("EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id AND (a.mime_type LIKE '%zip%' OR a.mime_type LIKE '%tar%' OR a.mime_type LIKE '%compressed%' OR a.filename LIKE '%.zip' OR a.filename LIKE '%.tar%' OR a.filename LIKE '%.gz' OR a.filename LIKE '%.7z' OR a.filename LIKE '%.rar'))".to_string());
+                }
+                "document" => {
+                    conditions.push("EXISTS (SELECT 1 FROM attachments a WHERE a.message_id = m.id AND (a.filename LIKE '%.doc%' OR a.filename LIKE '%.docx' OR a.filename LIKE '%.odt' OR a.filename LIKE '%.rtf' OR a.filename LIKE '%.txt'))".to_string());
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(exc) = filter.exclude_words.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            for word in exc.split_whitespace() {
+                if !word.is_empty() {
+                    conditions.push("m.subject NOT LIKE ?".to_string());
+                    params.push(rusqlite::types::Value::Text(format!("%{}%", word)));
+                }
+            }
+        }
+
+        let where_clause = if conditions.is_empty() {
+            "".to_string()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        params.push(rusqlite::types::Value::Integer(limit as i64));
+
+        let sql = if has_fts {
+            format!(
+                r#"
+                SELECT 
+                    m.id, m.account_id, f.remote_name, m.subject, m.from_addr, m.to_addrs, m.date, m.relative_path,
+                    snippet(messages_fts, -1, '<b>', '</b>', '...', 15) as snip
+                FROM messages_fts
+                JOIN messages m ON m.id = messages_fts.message_id
+                JOIN folders f ON f.id = m.folder_id
+                {}
+                ORDER BY messages_fts.rank, m.date DESC
+                LIMIT ?
+                "#,
+                where_clause
+            )
+        } else {
+            format!(
+                r#"
+                SELECT 
+                    m.id, m.account_id, f.remote_name, m.subject, m.from_addr, m.to_addrs, m.date, m.relative_path,
+                    '' as snip
+                FROM messages m
+                JOIN folders f ON f.id = m.folder_id
+                {}
+                ORDER BY m.date DESC
+                LIMIT ?
+                "#,
+                where_clause
+            )
+        };
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), |row| {
             let date_str: Option<String> = row.get(6)?;
             let date = date_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc)));
 

@@ -108,9 +108,38 @@ body {
 }
 
 /* Search Bar */
+.search-bar-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .search-container {
   position: relative;
   width: 440px;
+}
+
+.search-adv-trigger {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-full);
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: var(--transition-normal);
+  flex-shrink: 0;
+}
+
+.search-adv-trigger:hover {
+  background: #192337;
+  border-color: var(--primary);
+  color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-glow);
 }
 
 .search-icon {
@@ -824,6 +853,91 @@ body.is-modal-resizing * {
   width: 440px;
   min-width: 380px;
   min-height: auto;
+}
+
+.modal-adv-search {
+  width: 680px;
+  max-width: 95vw;
+  min-height: auto;
+}
+
+.adv-section-title {
+  font-size: 0.74rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--primary);
+  margin-top: 10px;
+  margin-bottom: 2px;
+  padding-bottom: 4px;
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.08);
+}
+
+.form-row-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.form-row-3 {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+}
+
+.date-presets-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.btn-date-preset {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: var(--transition-normal);
+}
+
+.btn-date-preset:hover {
+  border-color: var(--primary);
+  color: var(--text-main);
+  background: #192337;
+}
+
+.btn-date-preset.active {
+  background: var(--primary-glow);
+  border-color: var(--primary);
+  color: var(--primary);
+  font-weight: 600;
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.8);
+  cursor: pointer;
+}
+
+.btn-clear-search {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+  padding: 2px 8px;
+  cursor: pointer;
+  margin-left: 8px;
+  vertical-align: middle;
+  transition: var(--transition-normal);
+}
+
+.btn-clear-search:hover {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
 }
 
 .modal-header {

@@ -53,6 +53,29 @@ const el = {
   toast: document.getElementById('toast'),
   toastMessage: document.getElementById('toast-message'),
 
+  // Advanced Search Elements
+  btnOpenAdvancedSearch: document.getElementById('btn-open-advanced-search'),
+  advancedSearchModal: document.getElementById('advanced-search-modal'),
+  btnCloseAdvancedSearch: document.getElementById('btn-close-advanced-search'),
+  btnCancelAdvancedSearch: document.getElementById('btn-cancel-advanced-search'),
+  btnResetAdvancedSearch: document.getElementById('btn-reset-advanced-search'),
+  advancedSearchForm: document.getElementById('advanced-search-form'),
+  advSearchFrom: document.getElementById('adv-search-from'),
+  advSearchTo: document.getElementById('adv-search-to'),
+  advSearchCc: document.getElementById('adv-search-cc'),
+  advSearchSubject: document.getElementById('adv-search-subject'),
+  advSearchKeywords: document.getElementById('adv-search-keywords'),
+  advSearchExclude: document.getElementById('adv-search-exclude'),
+  advSearchDateFrom: document.getElementById('adv-search-date-from'),
+  advSearchDateTo: document.getElementById('adv-search-date-to'),
+  advSearchAccount: document.getElementById('adv-search-account'),
+  advSearchFolder: document.getElementById('adv-search-folder'),
+  advSearchAttName: document.getElementById('adv-search-att-name'),
+  advSearchAttType: document.getElementById('adv-search-att-type'),
+  advSearchMinSize: document.getElementById('adv-search-min-size'),
+  advSearchHasAtt: document.getElementById('adv-search-has-att'),
+  advSearchIncludeDeleted: document.getElementById('adv-search-include-deleted'),
+
   // Edit Account Modal Elements
   editAccountModal: document.getElementById('edit-account-modal'),
   btnCloseEditModal: document.getElementById('btn-close-edit-modal'),
@@ -424,8 +447,31 @@ function initEventListeners() {
   if (el.btnCancelEdit) el.btnCancelEdit.addEventListener('click', () => closeModal(el.editAccountModal));
   if (el.editAccountForm) el.editAccountForm.addEventListener('submit', handleSaveAccountEdit);
 
+  // Advanced Search Modal
+  if (el.btnOpenAdvancedSearch) el.btnOpenAdvancedSearch.addEventListener('click', openAdvancedSearchModal);
+  if (el.btnCloseAdvancedSearch) el.btnCloseAdvancedSearch.addEventListener('click', () => closeModal(el.advancedSearchModal));
+  if (el.btnCancelAdvancedSearch) el.btnCancelAdvancedSearch.addEventListener('click', () => closeModal(el.advancedSearchModal));
+  if (el.btnResetAdvancedSearch) el.btnResetAdvancedSearch.addEventListener('click', handleResetAdvancedSearch);
+  if (el.advancedSearchForm) el.advancedSearchForm.addEventListener('submit', handleAdvancedSearchSubmit);
+  if (el.advSearchAccount) el.advSearchAccount.addEventListener('change', updateAdvSearchFolders);
+
+  // Date preset buttons
+  document.querySelectorAll('.btn-date-preset').forEach(btn => {
+    btn.addEventListener('click', (e) => handleDatePresetClick(e.currentTarget));
+  });
+  if (el.advSearchDateFrom) {
+    el.advSearchDateFrom.addEventListener('input', () => {
+      document.querySelectorAll('.btn-date-preset').forEach(b => b.classList.remove('active'));
+    });
+  }
+  if (el.advSearchDateTo) {
+    el.advSearchDateTo.addEventListener('input', () => {
+      document.querySelectorAll('.btn-date-preset').forEach(b => b.classList.remove('active'));
+    });
+  }
+
   // Backdrop click to dismiss modals
-  [el.settingsModal, el.editAccountModal, el.exportModal].forEach(modal => {
+  [el.settingsModal, el.editAccountModal, el.exportModal, el.advancedSearchModal].forEach(modal => {
     if (modal) {
       modal.addEventListener('click', (e) => {
         if (e.target === modal && !document.body.classList.contains('is-modal-resizing')) {
@@ -530,6 +576,7 @@ function initEventListeners() {
       if (el.settingsModal && el.settingsModal.style.display === 'flex') closeModal(el.settingsModal);
       if (el.editAccountModal && el.editAccountModal.style.display === 'flex') closeModal(el.editAccountModal);
       if (el.exportModal && el.exportModal.style.display === 'flex') closeModal(el.exportModal);
+      if (el.advancedSearchModal && el.advancedSearchModal.style.display === 'flex') closeModal(el.advancedSearchModal);
     }
   });
 }
@@ -998,6 +1045,210 @@ async function performSearch(query) {
     });
   } catch (err) {
     console.error('Search error:', err);
+  }
+}
+
+async function openAdvancedSearchModal() {
+  if (!el.advancedSearchModal) return;
+  await populateAdvancedSearchAccounts();
+
+  // If user had something typed in the quick search bar, seed keywords if empty
+  if (el.globalSearch && el.globalSearch.value.trim() && el.advSearchKeywords && !el.advSearchKeywords.value) {
+    el.advSearchKeywords.value = el.globalSearch.value.trim();
+  }
+
+  openModal(el.advancedSearchModal);
+  if (el.advSearchFrom) el.advSearchFrom.focus();
+}
+
+async function populateAdvancedSearchAccounts() {
+  if (!el.advSearchAccount) return;
+  const currentVal = el.advSearchAccount.value;
+  el.advSearchAccount.innerHTML = '<option value="ALL">All Accounts</option>';
+  state.accounts.forEach(acc => {
+    const opt = document.createElement('option');
+    opt.value = acc.id;
+    opt.textContent = `${acc.name || acc.email} (${acc.email})`;
+    el.advSearchAccount.appendChild(opt);
+  });
+  if (currentVal) el.advSearchAccount.value = currentVal;
+  await updateAdvSearchFolders();
+}
+
+async function updateAdvSearchFolders() {
+  if (!el.advSearchFolder) return;
+  const accountId = el.advSearchAccount ? el.advSearchAccount.value : 'ALL';
+  el.advSearchFolder.innerHTML = '<option value="ALL">All Folders</option>';
+  if (accountId === 'ALL' || !accountId) return;
+
+  let folders = state.accountFolders[accountId];
+  if (!folders) {
+    try {
+      const res = await fetch(`/api/accounts/${accountId}/folders`);
+      if (res.ok) {
+        folders = await res.json();
+        state.accountFolders[accountId] = folders;
+      }
+    } catch (err) {
+      console.error('Failed to load folders for advanced search:', err);
+    }
+  }
+
+  if (folders && folders.length > 0) {
+    folders.forEach(f => {
+      const opt = document.createElement('option');
+      opt.value = f.id;
+      opt.textContent = f.remote_name;
+      el.advSearchFolder.appendChild(opt);
+    });
+  }
+}
+
+function handleDatePresetClick(btn) {
+  const preset = btn.dataset.preset;
+  document.querySelectorAll('.btn-date-preset').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+
+  const now = new Date();
+  if (preset === 'all') {
+    if (el.advSearchDateFrom) el.advSearchDateFrom.value = '';
+    if (el.advSearchDateTo) el.advSearchDateTo.value = '';
+  } else if (preset === '7d') {
+    const past = new Date();
+    past.setDate(now.getDate() - 7);
+    if (el.advSearchDateFrom) el.advSearchDateFrom.value = past.toISOString().split('T')[0];
+    if (el.advSearchDateTo) el.advSearchDateTo.value = now.toISOString().split('T')[0];
+  } else if (preset === '30d') {
+    const past = new Date();
+    past.setDate(now.getDate() - 30);
+    if (el.advSearchDateFrom) el.advSearchDateFrom.value = past.toISOString().split('T')[0];
+    if (el.advSearchDateTo) el.advSearchDateTo.value = now.toISOString().split('T')[0];
+  } else if (preset === '90d') {
+    const past = new Date();
+    past.setDate(now.getDate() - 90);
+    if (el.advSearchDateFrom) el.advSearchDateFrom.value = past.toISOString().split('T')[0];
+    if (el.advSearchDateTo) el.advSearchDateTo.value = now.toISOString().split('T')[0];
+  } else if (preset === 'year') {
+    const startOfYear = new Date(now.getFullYear(), 0, 1);
+    if (el.advSearchDateFrom) el.advSearchDateFrom.value = startOfYear.toISOString().split('T')[0];
+    if (el.advSearchDateTo) el.advSearchDateTo.value = now.toISOString().split('T')[0];
+  }
+}
+
+function handleResetAdvancedSearch() {
+  if (el.advancedSearchForm) el.advancedSearchForm.reset();
+  document.querySelectorAll('.btn-date-preset').forEach(b => {
+    b.classList.toggle('active', b.dataset.preset === 'all');
+  });
+  if (el.advSearchFolder) {
+    el.advSearchFolder.innerHTML = '<option value="ALL">All Folders</option>';
+  }
+}
+
+async function handleAdvancedSearchSubmit(e) {
+  e.preventDefault();
+
+  const from = el.advSearchFrom ? el.advSearchFrom.value.trim() : '';
+  const to = el.advSearchTo ? el.advSearchTo.value.trim() : '';
+  const cc = el.advSearchCc ? el.advSearchCc.value.trim() : '';
+  const subject = el.advSearchSubject ? el.advSearchSubject.value.trim() : '';
+  const q = el.advSearchKeywords ? el.advSearchKeywords.value.trim() : '';
+  const exclude = el.advSearchExclude ? el.advSearchExclude.value.trim() : '';
+  const dateFrom = el.advSearchDateFrom ? el.advSearchDateFrom.value : '';
+  const dateTo = el.advSearchDateTo ? el.advSearchDateTo.value : '';
+  const accountId = el.advSearchAccount ? el.advSearchAccount.value : 'ALL';
+  const folderId = el.advSearchFolder ? el.advSearchFolder.value : 'ALL';
+  const attName = el.advSearchAttName ? el.advSearchAttName.value.trim() : '';
+  const attType = el.advSearchAttType ? el.advSearchAttType.value : 'all';
+  const minSizeMb = el.advSearchMinSize ? (parseFloat(el.advSearchMinSize.value) || 0) : 0;
+  const hasAtt = el.advSearchHasAtt ? el.advSearchHasAtt.checked : false;
+  const includeDeleted = el.advSearchIncludeDeleted ? el.advSearchIncludeDeleted.checked : false;
+
+  const params = new URLSearchParams();
+  const filterDesc = [];
+
+  if (q) { params.set('q', q); filterDesc.push(`Keywords: "${q}"`); }
+  if (from) { params.set('from', from); filterDesc.push(`From: "${from}"`); }
+  if (to) { params.set('to', to); filterDesc.push(`To: "${to}"`); }
+  if (cc) { params.set('cc', cc); filterDesc.push(`CC: "${cc}"`); }
+  if (subject) { params.set('subject', subject); filterDesc.push(`Subject: "${subject}"`); }
+  if (exclude) { params.set('exclude', exclude); filterDesc.push(`Exclude: "${exclude}"`); }
+  if (dateFrom) { params.set('date_from', dateFrom); filterDesc.push(`After: ${dateFrom}`); }
+  if (dateTo) { params.set('date_to', dateTo); filterDesc.push(`Before: ${dateTo}`); }
+  if (accountId && accountId !== 'ALL') { params.set('account_id', accountId); }
+  if (folderId && folderId !== 'ALL') { params.set('folder_id', folderId); }
+  if (hasAtt) { params.set('has_attachments', 'true'); filterDesc.push('Has Attachments'); }
+  if (attName) { params.set('att_name', attName); filterDesc.push(`File: "${attName}"`); }
+  if (attType && attType !== 'all') { params.set('att_type', attType); filterDesc.push(`Type: ${attType}`); }
+  if (minSizeMb > 0) { params.set('min_size_mb', minSizeMb); filterDesc.push(`Size > ${minSizeMb}MB`); }
+  if (includeDeleted) { params.set('include_deleted', 'true'); filterDesc.push('Include Deleted'); }
+
+  if ([...params.keys()].length === 0) {
+    showToast('Please specify at least one search filter.');
+    return;
+  }
+
+  closeModal(el.advancedSearchModal);
+  await executeAdvancedSearch(params, filterDesc.join(' • '));
+}
+
+async function executeAdvancedSearch(params, desc) {
+  if (el.globalSearch) el.globalSearch.value = '';
+  el.currentFolderTitle.innerHTML = desc
+    ? `<span>Filtered: ${escapeHtml(desc)}</span> <button type="button" class="btn-clear-search" id="btn-clear-search" title="Clear search and return to mailbox">✕ Clear</button>`
+    : '<span>Advanced Search Results</span>';
+  
+  const btnClearSearch = document.getElementById('btn-clear-search');
+  if (btnClearSearch) {
+    btnClearSearch.addEventListener('click', () => {
+      if (state.selectedFolderId) {
+        loadFolderMessages(state.selectedFolderId);
+      } else if (state.accounts.length > 0) {
+        loadFolders(state.accounts[0].id);
+      }
+    });
+  }
+
+  el.emailItemsContainer.innerHTML = `<div class="empty-state"><p>Searching across archives...</p></div>`;
+
+  try {
+    const res = await fetch(`/api/search?${params.toString()}`);
+    if (!res.ok) {
+      showToast('Search failed');
+      return;
+    }
+    const results = await res.json();
+    state.messages = results;
+    el.folderMsgCount.textContent = `${results.length} matches`;
+
+    el.emailItemsContainer.innerHTML = '';
+    if (results.length === 0) {
+      el.emailItemsContainer.innerHTML = `<div class="empty-state"><div class="empty-icon">🔍</div><h3>No matches found</h3><p>Try adjusting your search criteria or date ranges.</p></div>`;
+      return;
+    }
+
+    const sortedResults = applySort(results);
+
+    sortedResults.forEach(item => {
+      const card = document.createElement('div');
+      card.className = `email-card ${item.message_id === state.selectedMessageId ? 'active' : ''}`;
+      const dateStr = formatMailDateTime(item.date);
+      const fullDateTitle = item.date ? new Date(item.date).toLocaleString() : '';
+
+      card.innerHTML = `
+        <div class="card-top-row">
+          <span class="card-sender" title="${escapeHtml(item.from_addr)}">${escapeHtml(item.from_addr || '(Unknown Sender)')}</span>
+          <span class="card-date" title="${escapeHtml(fullDateTitle)}">${dateStr}</span>
+        </div>
+        <div class="card-subject">${escapeHtml(item.subject || '(No Subject)')}</div>
+        <div class="card-snippet">${item.snippet || escapeHtml(item.folder_name ? `Folder: ${item.folder_name}` : '')}</div>
+      `;
+      card.addEventListener('click', () => selectMessage(item.message_id));
+      el.emailItemsContainer.appendChild(card);
+    });
+  } catch (err) {
+    console.error('Advanced search error:', err);
+    showToast('Error performing advanced search');
   }
 }
 
