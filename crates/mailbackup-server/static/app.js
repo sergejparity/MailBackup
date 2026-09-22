@@ -55,11 +55,12 @@ const el = {
 
   // Advanced Search Elements
   btnOpenAdvancedSearch: document.getElementById('btn-open-advanced-search'),
-  advancedSearchModal: document.getElementById('advanced-search-modal'),
+  advancedSearchPanel: document.getElementById('advanced-search-panel'),
   btnCloseAdvancedSearch: document.getElementById('btn-close-advanced-search'),
   btnCancelAdvancedSearch: document.getElementById('btn-cancel-advanced-search'),
   btnResetAdvancedSearch: document.getElementById('btn-reset-advanced-search'),
   advancedSearchForm: document.getElementById('advanced-search-form'),
+  advFilterCountBadge: document.getElementById('adv-filter-count-badge'),
   advSearchFrom: document.getElementById('adv-search-from'),
   advSearchTo: document.getElementById('adv-search-to'),
   advSearchCc: document.getElementById('adv-search-cc'),
@@ -447,10 +448,10 @@ function initEventListeners() {
   if (el.btnCancelEdit) el.btnCancelEdit.addEventListener('click', () => closeModal(el.editAccountModal));
   if (el.editAccountForm) el.editAccountForm.addEventListener('submit', handleSaveAccountEdit);
 
-  // Advanced Search Modal
-  if (el.btnOpenAdvancedSearch) el.btnOpenAdvancedSearch.addEventListener('click', openAdvancedSearchModal);
-  if (el.btnCloseAdvancedSearch) el.btnCloseAdvancedSearch.addEventListener('click', () => closeModal(el.advancedSearchModal));
-  if (el.btnCancelAdvancedSearch) el.btnCancelAdvancedSearch.addEventListener('click', () => closeModal(el.advancedSearchModal));
+  // Advanced Search Panel
+  if (el.btnOpenAdvancedSearch) el.btnOpenAdvancedSearch.addEventListener('click', () => toggleAdvancedSearchPanel());
+  if (el.btnCloseAdvancedSearch) el.btnCloseAdvancedSearch.addEventListener('click', () => toggleAdvancedSearchPanel(false));
+  if (el.btnCancelAdvancedSearch) el.btnCancelAdvancedSearch.addEventListener('click', () => toggleAdvancedSearchPanel(false));
   if (el.btnResetAdvancedSearch) el.btnResetAdvancedSearch.addEventListener('click', handleResetAdvancedSearch);
   if (el.advancedSearchForm) el.advancedSearchForm.addEventListener('submit', handleAdvancedSearchSubmit);
   if (el.advSearchAccount) el.advSearchAccount.addEventListener('change', updateAdvSearchFolders);
@@ -471,7 +472,7 @@ function initEventListeners() {
   }
 
   // Backdrop click to dismiss modals
-  [el.settingsModal, el.editAccountModal, el.exportModal, el.advancedSearchModal].forEach(modal => {
+  [el.settingsModal, el.editAccountModal, el.exportModal].forEach(modal => {
     if (modal) {
       modal.addEventListener('click', (e) => {
         if (e.target === modal && !document.body.classList.contains('is-modal-resizing')) {
@@ -573,10 +574,12 @@ function initEventListeners() {
       el.globalSearch.focus();
     }
     if (e.key === 'Escape') {
-      if (el.settingsModal && el.settingsModal.style.display === 'flex') closeModal(el.settingsModal);
-      if (el.editAccountModal && el.editAccountModal.style.display === 'flex') closeModal(el.editAccountModal);
-      if (el.exportModal && el.exportModal.style.display === 'flex') closeModal(el.exportModal);
-      if (el.advancedSearchModal && el.advancedSearchModal.style.display === 'flex') closeModal(el.advancedSearchModal);
+      if (el.settingsModal && el.settingsModal.style.display === 'flex') { closeModal(el.settingsModal); return; }
+      if (el.editAccountModal && el.editAccountModal.style.display === 'flex') { closeModal(el.editAccountModal); return; }
+      if (el.exportModal && el.exportModal.style.display === 'flex') { closeModal(el.exportModal); return; }
+      if (isAdvancedSearchPanelOpen()) {
+        toggleAdvancedSearchPanel(false);
+      }
     }
   });
 }
@@ -1048,17 +1051,52 @@ async function performSearch(query) {
   }
 }
 
-async function openAdvancedSearchModal() {
-  if (!el.advancedSearchModal) return;
-  await populateAdvancedSearchAccounts();
+function isAdvancedSearchPanelOpen() {
+  if (!el.advancedSearchPanel) return false;
+  return el.advancedSearchPanel.classList.contains('is-expanded');
+}
 
-  // If user had something typed in the quick search bar, seed keywords if empty
-  if (el.globalSearch && el.globalSearch.value.trim() && el.advSearchKeywords && !el.advSearchKeywords.value) {
-    el.advSearchKeywords.value = el.globalSearch.value.trim();
+async function toggleAdvancedSearchPanel(expand) {
+  if (!el.advancedSearchPanel) return;
+  const currentlyOpen = isAdvancedSearchPanelOpen();
+  const shouldOpen = (expand !== undefined) ? !!expand : !currentlyOpen;
+
+  if (shouldOpen) {
+    await populateAdvancedSearchAccounts();
+
+    // If user had something typed in the quick search bar, seed keywords if empty
+    if (el.globalSearch && el.globalSearch.value.trim() && el.advSearchKeywords && !el.advSearchKeywords.value) {
+      el.advSearchKeywords.value = el.globalSearch.value.trim();
+    }
+
+    el.advancedSearchPanel.style.display = 'block';
+    requestAnimationFrame(() => {
+      el.advancedSearchPanel.classList.remove('is-collapsed');
+      el.advancedSearchPanel.classList.add('is-expanded');
+      el.advancedSearchPanel.setAttribute('aria-expanded', 'true');
+    });
+
+    if (el.btnOpenAdvancedSearch) {
+      el.btnOpenAdvancedSearch.classList.add('active');
+      el.btnOpenAdvancedSearch.setAttribute('title', 'Collapse Advanced Search Filters');
+    }
+    if (el.advSearchFrom) el.advSearchFrom.focus();
+  } else {
+    el.advancedSearchPanel.classList.remove('is-expanded');
+    el.advancedSearchPanel.classList.add('is-collapsed');
+    el.advancedSearchPanel.setAttribute('aria-expanded', 'false');
+
+    if (el.btnOpenAdvancedSearch) {
+      el.btnOpenAdvancedSearch.classList.remove('active');
+      el.btnOpenAdvancedSearch.setAttribute('title', 'Advanced Search Filters');
+    }
+
+    setTimeout(() => {
+      if (!isAdvancedSearchPanelOpen() && el.advancedSearchPanel) {
+        el.advancedSearchPanel.style.display = 'none';
+      }
+    }, 280);
   }
-
-  openModal(el.advancedSearchModal);
-  if (el.advSearchFrom) el.advSearchFrom.focus();
 }
 
 async function populateAdvancedSearchAccounts() {
@@ -1143,6 +1181,9 @@ function handleResetAdvancedSearch() {
   if (el.advSearchFolder) {
     el.advSearchFolder.innerHTML = '<option value="ALL">All Folders</option>';
   }
+  if (el.advFilterCountBadge) {
+    el.advFilterCountBadge.style.display = 'none';
+  }
 }
 
 async function handleAdvancedSearchSubmit(e) {
@@ -1188,7 +1229,12 @@ async function handleAdvancedSearchSubmit(e) {
     return;
   }
 
-  closeModal(el.advancedSearchModal);
+  if (el.advFilterCountBadge) {
+    const count = [...params.keys()].length;
+    el.advFilterCountBadge.style.display = 'inline-block';
+    el.advFilterCountBadge.textContent = `${count} active`;
+  }
+
   await executeAdvancedSearch(params, filterDesc.join(' • '));
 }
 
@@ -1201,6 +1247,7 @@ async function executeAdvancedSearch(params, desc) {
   const btnClearSearch = document.getElementById('btn-clear-search');
   if (btnClearSearch) {
     btnClearSearch.addEventListener('click', () => {
+      if (el.advFilterCountBadge) el.advFilterCountBadge.style.display = 'none';
       if (state.selectedFolderId) {
         loadFolderMessages(state.selectedFolderId);
       } else if (state.accounts.length > 0) {

@@ -142,6 +142,13 @@ body {
   box-shadow: 0 0 0 3px var(--primary-glow);
 }
 
+.search-adv-trigger.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #ffffff;
+  box-shadow: 0 0 12px var(--primary-glow);
+}
+
 .search-icon {
   position: absolute;
   left: 14px;
@@ -269,6 +276,27 @@ body {
 .workspace-layout {
   display: flex;
   flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+/* Center & Right Workspaces Wrapper */
+.workspace-main-area {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+  position: relative;
+}
+
+.workspace-panes-split {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
   overflow: hidden;
   position: relative;
 }
@@ -855,34 +883,176 @@ body.is-modal-resizing * {
   min-height: auto;
 }
 
-.modal-adv-search {
-  width: 680px;
-  max-width: 95vw;
-  min-height: auto;
+/* Collapsible Advanced Search Panel (Above Message List & Reader Pane) */
+.advanced-search-panel {
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border-subtle);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+  z-index: 20;
+  flex-shrink: 0;
+  transition: max-height 0.28s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.2s ease;
+  overflow: hidden;
 }
 
-.adv-section-title {
-  font-size: 0.74rem;
+.advanced-search-panel.is-collapsed {
+  max-height: 0 !important;
+  opacity: 0;
+  pointer-events: none;
+  border-bottom: none;
+}
+
+.advanced-search-panel.is-expanded {
+  max-height: 520px;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.adv-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: rgba(11, 15, 25, 0.7);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.adv-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.adv-panel-icon {
+  color: var(--primary);
+  flex-shrink: 0;
+}
+
+.adv-panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.adv-panel-close-btn {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  transition: var(--transition-fast);
+}
+
+.adv-panel-close-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-main);
+}
+
+.adv-panel-body {
+  padding: 12px 18px 14px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.adv-panel-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+}
+
+@media (max-width: 1280px) {
+  .adv-panel-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 14px;
+  }
+}
+
+@media (max-width: 680px) {
+  .adv-panel-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.adv-grid-col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.adv-col-header {
+  font-size: 0.72rem;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.05em;
   color: var(--primary);
-  margin-top: 10px;
-  margin-bottom: 2px;
-  padding-bottom: 4px;
   border-bottom: 1px dashed rgba(255, 255, 255, 0.08);
+  padding-bottom: 3px;
+  margin-bottom: 2px;
 }
 
-.form-row-2 {
+.form-input-sm {
+  height: 30px;
+  padding: 4px 8px;
+  font-size: 0.78rem;
+  border-radius: var(--radius-sm);
+}
+
+.input-split-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 12px;
+  gap: 6px;
 }
 
-.form-row-3 {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 10px;
+.adv-checkboxes-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.adv-checkboxes-row .checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+.adv-checkboxes-row .checkbox-label input {
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+.adv-panel-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 10px;
+  margin-top: 12px;
+}
+
+.adv-panel-tip {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.adv-panel-tip b {
+  color: var(--text-muted);
+}
+
+.adv-panel-btn-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .date-presets-row {

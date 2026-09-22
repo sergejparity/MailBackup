@@ -116,100 +116,257 @@
         <div class="resizer-indicator"></div>
       </div>
 
-      <!-- 2. Middle Pane: Email List -->
-      <section class="email-list-pane" id="email-list-pane">
-        <div class="list-header">
-          <div class="list-title-group">
-            <h2 id="current-folder-title">Inbox</h2>
-            <span id="folder-msg-count" class="badge-subtle">0 messages</span>
-          </div>
-          <div class="list-sort">
-            <select id="sort-select" class="select-subtle">
-              <option value="newest">Newest First</option>
-              <option value="oldest">Oldest First</option>
-              <option value="sender">Sender (A-Z)</option>
-              <option value="subject">Subject (A-Z)</option>
-            </select>
-          </div>
-        </div>
-
-        <div id="email-items-container" class="email-items-container">
-          <div class="empty-state">
-            <div class="empty-icon">📫</div>
-            <h3>No emails selected</h3>
-            <p>Choose an account and folder from the sidebar or initiate a sync.</p>
-          </div>
-        </div>
-      </section>
-
-      <!-- Message List Resizer Splitter -->
-      <div id="resizer-msglist" class="pane-resizer" role="separator" aria-orientation="vertical" title="Drag to resize message list • Double-click to reset">
-        <div class="resizer-indicator"></div>
-      </div>
-
-      <!-- 3. Right Pane: Email Reader & Full Preview -->
-      <section class="email-reader-pane" id="email-reader-pane">
-        <div id="reader-empty" class="reader-empty-state">
-          <div class="empty-icon">✉️</div>
-          <h3>Select an email to view</h3>
-          <p>Read full headers, body content, and manage attachments offline.</p>
-        </div>
-
-        <div id="reader-content" class="reader-content" style="display: none;">
-          <div class="reader-toolbar">
-            <div class="toolbar-left">
-              <span id="view-folder-tag" class="folder-tag">INBOX</span>
-              <span id="view-date-tag" class="date-tag">2026-09-21</span>
+      <!-- Main Content Area: Collapsible Advanced Search Panel + Workspace Panes -->
+      <div class="workspace-main-area" id="workspace-main-area">
+        <!-- Collapsible Advanced Search Panel (Above Message List & Reader Pane) -->
+        <section id="advanced-search-panel" class="advanced-search-panel is-collapsed" aria-expanded="false" style="display: none;">
+          <div class="adv-panel-header">
+            <div class="adv-panel-title">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="adv-panel-icon">
+                <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
+              </svg>
+              <span>Advanced Search Filters</span>
+              <span id="adv-filter-count-badge" class="badge-subtle" style="display: none;">0 active</span>
             </div>
-            <div class="toolbar-right">
-              <button id="btn-download-raw-eml" class="btn btn-sm btn-ghost" title="Download Raw RFC 822 .eml">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                  <polyline points="7 10 12 15 17 10"></polyline>
-                  <line x1="12" y1="15" x2="12" y2="3"></line>
+            <div class="adv-panel-header-actions">
+              <button type="button" id="btn-reset-advanced-search" class="btn btn-sm btn-ghost" title="Reset all search filters">Reset</button>
+              <button type="button" id="btn-close-advanced-search" class="btn-icon-subtle adv-panel-close-btn" title="Collapse search panel (Esc)">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
                 </svg>
-                Raw .eml
               </button>
             </div>
           </div>
 
-          <div class="email-view-header">
-            <h2 id="view-subject" class="view-subject">Subject Title</h2>
-            <div class="view-meta-row">
-              <div class="avatar-circle" id="view-avatar">A</div>
-              <div class="meta-details">
-                <div class="meta-from-line">
-                  <span class="meta-label">From:</span>
-                  <span id="view-from" class="meta-val highlight-val"></span>
+          <div class="adv-panel-body">
+            <form id="advanced-search-form" class="adv-panel-form">
+              <div class="adv-panel-grid">
+                <!-- Col 1: People & Scope -->
+                <div class="adv-grid-col">
+                  <div class="adv-col-header">People & Scope</div>
+                  <div class="form-group">
+                    <label for="adv-search-from">From</label>
+                    <input type="text" id="adv-search-from" class="form-input form-input-sm" placeholder="Sender name or email">
+                  </div>
+                  <div class="form-group">
+                    <label for="adv-search-to">To & CC</label>
+                    <div class="input-split-row">
+                      <input type="text" id="adv-search-to" class="form-input form-input-sm" placeholder="To recipient">
+                      <input type="text" id="adv-search-cc" class="form-input form-input-sm" placeholder="CC recipient">
+                    </div>
+                  </div>
+                  <div class="form-group">
+                    <label for="adv-search-account">Account & Folder</label>
+                    <div class="input-split-row">
+                      <select id="adv-search-account" class="form-input form-input-sm">
+                        <option value="ALL">All Accounts</option>
+                      </select>
+                      <select id="adv-search-folder" class="form-input form-input-sm">
+                        <option value="ALL">All Folders</option>
+                      </select>
+                    </div>
+                  </div>
                 </div>
-                <div class="meta-to-line">
-                  <span class="meta-label">To:</span>
-                  <span id="view-to" class="meta-val"></span>
+
+                <!-- Col 2: Content & Keywords -->
+                <div class="adv-grid-col">
+                  <div class="adv-col-header">Subject & Keywords</div>
+                  <div class="form-group">
+                    <label for="adv-search-subject">Subject</label>
+                    <input type="text" id="adv-search-subject" class="form-input form-input-sm" placeholder="Subject line keywords">
+                  </div>
+                  <div class="form-group">
+                    <label for="adv-search-keywords">Has Words (Body & Text)</label>
+                    <input type="text" id="adv-search-keywords" class="form-input form-input-sm" placeholder="Keywords in email body">
+                  </div>
+                  <div class="form-group">
+                    <label for="adv-search-exclude">Doesn't Have Words</label>
+                    <input type="text" id="adv-search-exclude" class="form-input form-input-sm" placeholder="Words to exclude">
+                  </div>
+                </div>
+
+                <!-- Col 3: Date Range -->
+                <div class="adv-grid-col">
+                  <div class="adv-col-header">Date of Messages</div>
+                  <div class="form-group">
+                    <label>Quick Presets</label>
+                    <div class="date-presets-row">
+                      <button type="button" class="btn-date-preset active" data-preset="all">Any</button>
+                      <button type="button" class="btn-date-preset" data-preset="7d">7 days</button>
+                      <button type="button" class="btn-date-preset" data-preset="30d">30 days</button>
+                      <button type="button" class="btn-date-preset" data-preset="90d">3 mo</button>
+                      <button type="button" class="btn-date-preset" data-preset="year">Year</button>
+                    </div>
+                  </div>
+                  <div class="form-group">
+                    <label for="adv-search-date-from">Custom Range</label>
+                    <div class="input-split-row">
+                      <input type="date" id="adv-search-date-from" class="form-input form-input-sm" title="From date">
+                      <input type="date" id="adv-search-date-to" class="form-input form-input-sm" title="To date">
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Col 4: Attachments & Flags -->
+                <div class="adv-grid-col">
+                  <div class="adv-col-header">Attachments & Flags</div>
+                  <div class="form-group">
+                    <label for="adv-search-att-name">Attachment Filename</label>
+                    <input type="text" id="adv-search-att-name" class="form-input form-input-sm" placeholder="e.g. invoice, .pdf">
+                  </div>
+                  <div class="form-group">
+                    <label for="adv-search-att-type">Type & Min Size</label>
+                    <div class="input-split-row">
+                      <select id="adv-search-att-type" class="form-input form-input-sm">
+                        <option value="all">Any Type</option>
+                        <option value="pdf">PDF (.pdf)</option>
+                        <option value="spreadsheet">Sheets (.xlsx, .csv)</option>
+                        <option value="document">Docs (.docx, .doc)</option>
+                        <option value="image">Images (.png, .jpg)</option>
+                        <option value="archive">Archives (.zip, .7z)</option>
+                      </select>
+                      <select id="adv-search-min-size" class="form-input form-input-sm">
+                        <option value="0">Any Size</option>
+                        <option value="0.5">> 500 KB</option>
+                        <option value="1">> 1 MB</option>
+                        <option value="5">> 5 MB</option>
+                        <option value="10">> 10 MB</option>
+                        <option value="25">> 25 MB</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="adv-checkboxes-row">
+                    <label class="checkbox-label" title="Only emails that have attachments">
+                      <input type="checkbox" id="adv-search-has-att">
+                      <span>Must have attachments</span>
+                    </label>
+                    <label class="checkbox-label" title="Include emails that were deleted on IMAP server">
+                      <input type="checkbox" id="adv-search-include-deleted">
+                      <span>Include deleted</span>
+                    </label>
+                  </div>
                 </div>
               </div>
+
+              <!-- Action Bar -->
+              <div class="adv-panel-actions">
+                <div class="adv-panel-tip">
+                  <span>💡 Press <b>Enter</b> to search • Results display immediately below</span>
+                </div>
+                <div class="adv-panel-btn-group">
+                  <button type="button" id="btn-cancel-advanced-search" class="btn btn-sm btn-secondary">Collapse</button>
+                  <button type="submit" id="btn-submit-advanced-search" class="btn btn-sm btn-primary">
+                    <svg class="btn-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <circle cx="11" cy="11" r="8"></circle>
+                      <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                    </svg>
+                    Search Emails
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </section>
+
+        <!-- Message List & Reader Panes Split -->
+        <div class="workspace-panes-split" id="workspace-panes-split">
+          <!-- 2. Middle Pane: Email List -->
+          <section class="email-list-pane" id="email-list-pane">
+            <div class="list-header">
+              <div class="list-title-group">
+                <h2 id="current-folder-title">Inbox</h2>
+                <span id="folder-msg-count" class="badge-subtle">0 messages</span>
+              </div>
+              <div class="list-sort">
+                <select id="sort-select" class="select-subtle">
+                  <option value="newest">Newest First</option>
+                  <option value="oldest">Oldest First</option>
+                  <option value="sender">Sender (A-Z)</option>
+                  <option value="subject">Subject (A-Z)</option>
+                </select>
+              </div>
             </div>
+
+            <div id="email-items-container" class="email-items-container">
+              <div class="empty-state">
+                <div class="empty-icon">📫</div>
+                <h3>No emails selected</h3>
+                <p>Choose an account and folder from the sidebar or initiate a sync.</p>
+              </div>
+            </div>
+          </section>
+
+          <!-- Message List Resizer Splitter -->
+          <div id="resizer-msglist" class="pane-resizer" role="separator" aria-orientation="vertical" title="Drag to resize message list • Double-click to reset">
+            <div class="resizer-indicator"></div>
           </div>
 
-          <!-- Attachments Bar -->
-          <div id="view-attachments-bar" class="attachments-bar" style="display: none;">
-            <div class="attachments-header">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
-              </svg>
-              <span>Attachments (<span id="view-att-count">0</span>)</span>
+          <!-- 3. Right Pane: Email Reader & Full Preview -->
+          <section class="email-reader-pane" id="email-reader-pane">
+            <div id="reader-empty" class="reader-empty-state">
+              <div class="empty-icon">✉️</div>
+              <h3>Select an email to view</h3>
+              <p>Read full headers, body content, and manage attachments offline.</p>
             </div>
-            <div id="view-attachments-list" class="attachments-chips">
-              <!-- Populated by JS -->
-            </div>
-          </div>
 
-          <!-- Email Body Frame/Text -->
-          <div class="email-body-container">
-            <iframe id="view-body-frame" class="email-body-frame" sandbox="allow-same-origin"></iframe>
-            <div id="view-body-plain" class="email-body-plain" style="display: none;"></div>
-          </div>
+            <div id="reader-content" class="reader-content" style="display: none;">
+              <div class="reader-toolbar">
+                <div class="toolbar-left">
+                  <span id="view-folder-tag" class="folder-tag">INBOX</span>
+                  <span id="view-date-tag" class="date-tag">2026-09-21</span>
+                </div>
+                <div class="toolbar-right">
+                  <button id="btn-download-raw-eml" class="btn btn-sm btn-ghost" title="Download Raw RFC 822 .eml">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                      <polyline points="7 10 12 15 17 10"></polyline>
+                      <line x1="12" y1="15" x2="12" y2="3"></line>
+                    </svg>
+                    Raw .eml
+                  </button>
+                </div>
+              </div>
+
+              <div class="email-view-header">
+                <h2 id="view-subject" class="view-subject">Subject Title</h2>
+                <div class="view-meta-row">
+                  <div class="avatar-circle" id="view-avatar">A</div>
+                  <div class="meta-details">
+                    <div class="meta-from-line">
+                      <span class="meta-label">From:</span>
+                      <span id="view-from" class="meta-val highlight-val"></span>
+                    </div>
+                    <div class="meta-to-line">
+                      <span class="meta-label">To:</span>
+                      <span id="view-to" class="meta-val"></span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Attachments Bar -->
+              <div id="view-attachments-bar" class="attachments-bar" style="display: none;">
+                <div class="attachments-header">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path>
+                  </svg>
+                  <span>Attachments (<span id="view-att-count">0</span>)</span>
+                </div>
+                <div id="view-attachments-list" class="attachments-chips">
+                  <!-- Populated by JS -->
+                </div>
+              </div>
+
+              <!-- Email Body Frame/Text -->
+              <div class="email-body-container">
+                <iframe id="view-body-frame" class="email-body-frame" sandbox="allow-same-origin"></iframe>
+                <div id="view-body-plain" class="email-body-plain" style="display: none;"></div>
+              </div>
+            </div>
+          </section>
         </div>
-      </section>
+      </div>
     </main>
 
     <!-- Modal: Settings & Account Management -->
@@ -612,154 +769,7 @@
       </div>
     </div>
 
-    <!-- Modal: Advanced Search -->
-    <div id="advanced-search-modal" class="modal-backdrop" style="display: none;">
-      <div class="modal-card modal-adv-search">
-        <div class="modal-header">
-          <div style="display: flex; align-items: center; gap: 8px;">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--primary);">
-              <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
-            </svg>
-            <h2>Advanced Email Search</h2>
-          </div>
-          <button id="btn-close-advanced-search" class="btn-close">&times;</button>
-        </div>
-        <div class="modal-body" style="max-height: 80vh; overflow-y: auto;">
-          <form id="advanced-search-form" class="form-grid">
-            <!-- Section 1: People & Headers -->
-            <div class="adv-section-title">People & Headers</div>
-            <div class="form-row-3">
-              <div class="form-group">
-                <label for="adv-search-from">From</label>
-                <input type="text" id="adv-search-from" class="form-input" placeholder="Sender name or email">
-              </div>
-              <div class="form-group">
-                <label for="adv-search-to">To</label>
-                <input type="text" id="adv-search-to" class="form-input" placeholder="Recipient name or email">
-              </div>
-              <div class="form-group">
-                <label for="adv-search-cc">CC</label>
-                <input type="text" id="adv-search-cc" class="form-input" placeholder="CC recipient">
-              </div>
-            </div>
 
-            <div class="form-group">
-              <label for="adv-search-subject">Subject</label>
-              <input type="text" id="adv-search-subject" class="form-input" placeholder="Keywords in subject line">
-            </div>
-
-            <!-- Section 2: Content & Keywords -->
-            <div class="adv-section-title">Content & Keywords</div>
-            <div class="form-row-2">
-              <div class="form-group">
-                <label for="adv-search-keywords">Has Words (Body & Text)</label>
-                <input type="text" id="adv-search-keywords" class="form-input" placeholder="Keywords in email body">
-              </div>
-              <div class="form-group">
-                <label for="adv-search-exclude">Doesn't Have Words</label>
-                <input type="text" id="adv-search-exclude" class="form-input" placeholder="Words to exclude">
-              </div>
-            </div>
-
-            <!-- Section 3: Date Range & Presets -->
-            <div class="adv-section-title">Date of Messages</div>
-            <div class="date-presets-row">
-              <button type="button" class="btn-date-preset active" data-preset="all">Any time</button>
-              <button type="button" class="btn-date-preset" data-preset="7d">Past 7 days</button>
-              <button type="button" class="btn-date-preset" data-preset="30d">Past 30 days</button>
-              <button type="button" class="btn-date-preset" data-preset="90d">Past 3 months</button>
-              <button type="button" class="btn-date-preset" data-preset="year">This year</button>
-            </div>
-            <div class="form-row-2">
-              <div class="form-group">
-                <label for="adv-search-date-from">Date From</label>
-                <input type="date" id="adv-search-date-from" class="form-input">
-              </div>
-              <div class="form-group">
-                <label for="adv-search-date-to">Date To</label>
-                <input type="date" id="adv-search-date-to" class="form-input">
-              </div>
-            </div>
-
-            <!-- Section 4: Scope & Location -->
-            <div class="adv-section-title">Location & Scope</div>
-            <div class="form-row-2">
-              <div class="form-group">
-                <label for="adv-search-account">Account</label>
-                <select id="adv-search-account" class="form-input">
-                  <option value="ALL">All Accounts</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label for="adv-search-folder">Folder</label>
-                <select id="adv-search-folder" class="form-input">
-                  <option value="ALL">All Folders</option>
-                </select>
-              </div>
-            </div>
-
-            <!-- Section 5: Attachments & Size -->
-            <div class="adv-section-title">Attachments & Size</div>
-            <div class="form-row-3">
-              <div class="form-group">
-                <label for="adv-search-att-name">Attachment Filename</label>
-                <input type="text" id="adv-search-att-name" class="form-input" placeholder="e.g. invoice, .pdf, report">
-              </div>
-              <div class="form-group">
-                <label for="adv-search-att-type">Attachment Type</label>
-                <select id="adv-search-att-type" class="form-input">
-                  <option value="all">Any Type</option>
-                  <option value="pdf">PDF Documents (.pdf)</option>
-                  <option value="spreadsheet">Spreadsheets (.xlsx, .csv)</option>
-                  <option value="document">Office Docs (.docx, .doc, .odt)</option>
-                  <option value="image">Images (.png, .jpg, .gif)</option>
-                  <option value="archive">Archives (.zip, .tar, .7z)</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label for="adv-search-min-size">Minimum Size</label>
-                <select id="adv-search-min-size" class="form-input">
-                  <option value="0">Any Size</option>
-                  <option value="0.5">> 500 KB</option>
-                  <option value="1">> 1 MB</option>
-                  <option value="5">> 5 MB</option>
-                  <option value="10">> 10 MB</option>
-                  <option value="25">> 25 MB</option>
-                </select>
-              </div>
-            </div>
-
-            <div style="display: flex; gap: 24px; align-items: center; margin-top: 4px; flex-wrap: wrap;">
-              <label class="checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.84rem;">
-                <input type="checkbox" id="adv-search-has-att" style="cursor: pointer; accent-color: var(--primary);">
-                <span>Must have attachments</span>
-              </label>
-              <label class="checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.84rem;">
-                <input type="checkbox" id="adv-search-include-deleted" style="cursor: pointer; accent-color: var(--primary);">
-                <span>Include remotely deleted emails</span>
-              </label>
-            </div>
-
-            <!-- Modal Footer Actions -->
-            <div class="modal-footer-actions" style="display: flex; justify-content: space-between; align-items: center; margin-top: 16px; border-top: 1px solid var(--border-subtle); padding-top: 14px;">
-              <button type="button" id="btn-reset-advanced-search" class="btn btn-secondary">
-                Reset Filters
-              </button>
-              <div style="display: flex; gap: 8px;">
-                <button type="button" id="btn-cancel-advanced-search" class="btn btn-secondary">Cancel</button>
-                <button type="submit" id="btn-submit-advanced-search" class="btn btn-primary" style="min-width: 120px;">
-                  <svg class="btn-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <circle cx="11" cy="11" r="8"></circle>
-                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-                  </svg>
-                  Search Emails
-                </button>
-              </div>
-            </div>
-          </form>
-        </div>
-      </div>
-    </div>
 
     <!-- Notification Toast -->
     <div id="toast" class="toast" style="display: none;">
