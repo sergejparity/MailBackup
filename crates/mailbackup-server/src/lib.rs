@@ -78,6 +78,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/sync/:account_id", post(api_sync_account))
         .route("/api/export/mbox", post(api_export_mbox))
         .route("/api/export/mbox/download", get(api_download_mbox))
+        .route("/api/export/locations", get(api_export_locations))
+        .route("/api/export/check-path", get(api_export_check_path))
+        .route("/api/dialog/pick-directory", post(api_pick_directory))
         .route("/api/settings", get(api_get_settings).put(api_update_settings))
         .route("/api/service/status", get(api_service_status))
         .route("/api/service/toggle", post(api_service_toggle))
@@ -937,12 +940,22 @@ struct ExportMboxPayload {
     account_id: String,
     folder_id: Option<String>,
     output_path: String,
+    #[serde(default)]
+    overwrite: bool,
 }
 
 #[derive(Serialize)]
 struct ExportResult {
     exported_count: usize,
     output_path: String,
+}
+
+#[derive(Serialize)]
+struct ExportConflictResponse {
+    error: String,
+    message: String,
+    existing_path: String,
+    suggested_path: String,
 }
 
 async fn api_export_mbox(
@@ -955,7 +968,11 @@ async fn api_export_mbox(
     };
 
     let target_folders: Vec<_> = if let Some(ref fid) = payload.folder_id {
-        folders.into_iter().filter(|f| f.id == *fid).collect()
+        if fid == "ALL" || fid.trim().is_empty() {
+            folders
+        } else {
+            folders.into_iter().filter(|f| f.id == *fid).collect()
+        }
     } else {
         folders
     };
@@ -970,6 +987,21 @@ async fn api_export_mbox(
     }
 
     let final_output_path = mailbackup_core::config::resolve_export_path(&payload.output_path);
+
+    if !payload.overwrite && final_output_path.exists() {
+        let suggested = mailbackup_core::config::find_available_path(&final_output_path);
+        let path_str = final_output_path.to_string_lossy().to_string();
+        return (
+            StatusCode::CONFLICT,
+            Json(ExportConflictResponse {
+                error: "FILE_EXISTS".to_string(),
+                message: format!("A file already exists at '{}'. Overwrite?", path_str),
+                existing_path: path_str,
+                suggested_path: suggested.to_string_lossy().to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     let exporter = MboxExporter::new(&state.storage);
     match exporter.export_to_mbox(&paths, &final_output_path) {
@@ -993,6 +1025,136 @@ async fn api_export_mbox(
     }
 }
 
+#[derive(Serialize)]
+struct ExportLocationItem {
+    name: String,
+    path: String,
+}
+
+#[derive(Serialize)]
+struct ExportLocationsResponse {
+    default_dir: String,
+    locations: Vec<ExportLocationItem>,
+}
+
+async fn api_export_locations() -> impl IntoResponse {
+    let default_dir = mailbackup_core::config::default_export_dir()
+        .to_string_lossy()
+        .to_string();
+    let locs = mailbackup_core::config::system_export_locations();
+    let locations = locs
+        .into_iter()
+        .map(|(name, path)| ExportLocationItem {
+            name: name.to_string(),
+            path: path.to_string_lossy().to_string(),
+        })
+        .collect();
+
+    Json(ExportLocationsResponse {
+        default_dir,
+        locations,
+    })
+}
+
+#[derive(Deserialize)]
+struct CheckPathQuery {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct CheckPathResponse {
+    exists: bool,
+    resolved_path: String,
+    suggested_path: String,
+}
+
+async fn api_export_check_path(
+    Query(query): Query<CheckPathQuery>,
+) -> impl IntoResponse {
+    let resolved = mailbackup_core::config::resolve_export_path(&query.path);
+    let exists = resolved.exists();
+    let suggested = if exists {
+        mailbackup_core::config::find_available_path(&resolved)
+    } else {
+        resolved.clone()
+    };
+
+    Json(CheckPathResponse {
+        exists,
+        resolved_path: resolved.to_string_lossy().to_string(),
+        suggested_path: suggested.to_string_lossy().to_string(),
+    })
+}
+
+#[derive(Serialize)]
+struct PickDirectoryResponse {
+    selected: bool,
+    path: Option<String>,
+}
+
+async fn api_pick_directory() -> impl IntoResponse {
+    let res = tokio::task::spawn_blocking(pick_directory_native)
+        .await
+        .unwrap_or(None);
+
+    match res {
+        Some(path) => Json(PickDirectoryResponse {
+            selected: true,
+            path: Some(path.to_string_lossy().to_string()),
+        }),
+        None => Json(PickDirectoryResponse {
+            selected: false,
+            path: None,
+        }),
+    }
+}
+
+fn pick_directory_native() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg("POSIX path of (choose folder with prompt \"Select Export Destination Folder:\")")
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path_str.is_empty() {
+                return Some(PathBuf::from(path_str));
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let script = "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Select Export Destination Folder'; if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }";
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path_str.is_empty() {
+                return Some(PathBuf::from(path_str));
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = std::process::Command::new("zenity")
+            .args(["--file-selection", "--directory", "--title=Select Export Destination Folder"])
+            .output()
+        {
+            if output.status.success() {
+                let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path_str.is_empty() {
+                    return Some(PathBuf::from(path_str));
+                }
+            }
+        }
+    }
+    None
+}
+
 #[derive(Deserialize)]
 struct DownloadMboxQuery {
     account_id: String,
@@ -1009,7 +1171,7 @@ async fn api_download_mbox(
     };
 
     let target_folders: Vec<_> = if let Some(ref fid) = query.folder_id {
-        if fid == "ALL" {
+        if fid == "ALL" || fid.trim().is_empty() {
             folders
         } else {
             folders.into_iter().filter(|f| f.id == *fid).collect()

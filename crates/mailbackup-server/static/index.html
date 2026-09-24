@@ -867,7 +867,7 @@
 
     <!-- Modal: Export to Mbox -->
     <div id="export-modal" class="modal-backdrop" style="display: none;">
-      <div class="modal-card modal-sm">
+      <div class="modal-card modal-md">
         <div class="modal-header">
           <h2>Export to .mbox Archive</h2>
           <button id="btn-close-export" class="btn-close">&times;</button>
@@ -875,23 +875,60 @@
         <div class="modal-body">
           <form id="export-form" class="form-grid">
             <div class="form-group">
-              <label>Select Account</label>
+              <label for="export-account-select">Select Account</label>
               <select id="export-account-select" class="form-input"></select>
             </div>
             <div class="form-group">
-              <label>Select Folder</label>
+              <label for="export-folder-select">Select Folder</label>
               <select id="export-folder-select" class="form-input">
                 <option value="ALL">All Folders</option>
               </select>
             </div>
+
+            <!-- Destination Directory Section -->
             <div class="form-group">
-              <label>Output Destination</label>
-              <input type="text" id="export-output-path" class="form-input" placeholder="/path/to/archive.mbox" required>
-              <small class="form-hint" style="font-size: 0.76rem; color: var(--text-secondary); margin-top: 4px; display: block;">
-                File will be saved to your local disk (defaults to your Downloads folder).
-              </small>
+              <label for="export-dir-input">Export Directory</label>
+              <div class="input-with-button">
+                <input type="text" id="export-dir-input" class="form-input" placeholder="/path/to/folder" required>
+                <button type="button" id="btn-browse-export-dir" class="btn btn-secondary" title="Choose destination folder on your computer">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 4px;">
+                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                  </svg>
+                  Browse...
+                </button>
+              </div>
+              <div id="export-location-pills" class="location-pills-row">
+                <!-- Populated dynamically: Downloads, Documents, Desktop, Home -->
+              </div>
             </div>
-            <div class="form-actions" style="display: flex; flex-direction: column; gap: 8px;">
+
+            <!-- Filename Section -->
+            <div class="form-group">
+              <label for="export-filename-input">Archive Filename</label>
+              <input type="text" id="export-filename-input" class="form-input" placeholder="backup.mbox" required>
+            </div>
+
+            <!-- Full Path Preview & Overwrite Warning -->
+            <div id="export-preview-container" class="export-path-preview-card">
+              <div class="preview-label">Full Target Destination:</div>
+              <div id="export-full-dest-path" class="preview-path">/Users/SP/Downloads/backup.mbox</div>
+              <div id="export-overwrite-warning" class="export-warning-alert" style="display: none;">
+                <div class="warning-text">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <line x1="12" y1="8" x2="12" y2="12"></line>
+                    <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                  </svg>
+                  <span>A file already exists at this destination and will be overwritten.</span>
+                </div>
+                <button type="button" id="btn-auto-rename-export" class="warning-btn">Use Suggested Name</button>
+              </div>
+            </div>
+
+            <!-- Hidden field for compatibility -->
+            <input type="hidden" id="export-output-path">
+
+            <div class="form-actions" style="display: flex; flex-direction: column; gap: 8px; margin-top: 10px;">
               <button type="submit" id="btn-export-submit" class="btn btn-primary w-100">Export Archive to Disk</button>
               <button type="button" id="btn-download-browser" class="btn btn-secondary w-100">Download Archive via Browser</button>
             </div>

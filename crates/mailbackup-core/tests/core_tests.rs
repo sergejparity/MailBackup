@@ -753,6 +753,34 @@ not-an-email,pass2,Bad Email
     assert!(cfg.enabled);
 }
 
+#[test]
+fn test_export_locations_and_available_path() {
+    use mailbackup_core::config::{find_available_path, system_export_locations};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let target_file = dir.path().join("my_backup.mbox");
+
+    // 1. When file does not exist, returns original path
+    let avail1 = find_available_path(&target_file);
+    assert_eq!(avail1, target_file);
+
+    // 2. When file exists, auto-increments
+    std::fs::write(&target_file, b"content").unwrap();
+    let avail2 = find_available_path(&target_file);
+    assert_eq!(avail2, dir.path().join("my_backup (1).mbox"));
+
+    // 3. When (1) also exists, auto-increments to (2)
+    std::fs::write(&avail2, b"content2").unwrap();
+    let avail3 = find_available_path(&target_file);
+    assert_eq!(avail3, dir.path().join("my_backup (2).mbox"));
+
+    // 4. System locations returns valid directories
+    let locs = system_export_locations();
+    assert!(!locs.is_empty());
+}
+
+
 
 
 

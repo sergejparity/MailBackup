@@ -204,6 +204,54 @@ pub fn resolve_export_path(input: &str) -> PathBuf {
     }
 }
 
+pub fn find_available_path(target: &Path) -> PathBuf {
+    if !target.exists() {
+        return target.to_path_buf();
+    }
+
+    let parent = target.parent().unwrap_or_else(|| Path::new(""));
+    let stem = target
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("backup");
+    let ext = target
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mbox");
+
+    let mut counter = 1;
+    loop {
+        let candidate_filename = format!("{} ({}).{}", stem, counter, ext);
+        let candidate = if parent.as_os_str().is_empty() {
+            PathBuf::from(candidate_filename)
+        } else {
+            parent.join(candidate_filename)
+        };
+
+        if !candidate.exists() || counter > 999 {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
+pub fn system_export_locations() -> Vec<(&'static str, PathBuf)> {
+    let mut locs = Vec::new();
+    if let Some(p) = dirs::download_dir() {
+        locs.push(("Downloads", p));
+    }
+    if let Some(p) = dirs::document_dir() {
+        locs.push(("Documents", p));
+    }
+    if let Some(p) = dirs::desktop_dir() {
+        locs.push(("Desktop", p));
+    }
+    if let Some(p) = dirs::home_dir() {
+        locs.push(("Home", p));
+    }
+    locs
+}
+
 impl AppConfig {
     pub fn load_or_create(path: Option<&Path>) -> Result<Self> {
         let config_path = match path {

@@ -1920,4 +1920,118 @@ input[type="date"]::-webkit-calendar-picker-indicator {
   font-size: 0.74rem;
 }
 
+/* Export to MBOX Modal Enhancements */
+.input-with-button {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.input-with-button .form-input {
+  flex: 1;
+}
+
+.input-with-button .btn {
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+}
+
+.location-pills-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.location-pill {
+  font-size: 0.75rem;
+  padding: 3px 9px;
+  border-radius: var(--radius-sm, 6px);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.location-pill:hover {
+  background: rgba(99, 102, 241, 0.15);
+  border-color: var(--primary);
+  color: var(--text-primary);
+}
+
+.location-pill.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+
+.export-path-preview-card {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md, 8px);
+  padding: 10px 14px;
+  margin-top: 4px;
+}
+
+.export-path-preview-card .preview-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+
+.export-path-preview-card .preview-path {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  color: var(--text-primary);
+  word-break: break-all;
+  margin-top: 4px;
+}
+
+.export-warning-alert {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: rgba(234, 179, 8, 0.12);
+  border: 1px solid rgba(234, 179, 8, 0.35);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.export-warning-alert .warning-text {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #facc15;
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+
+.export-warning-alert .warning-btn {
+  font-size: 0.74rem;
+  padding: 3px 8px;
+  background: rgba(234, 179, 8, 0.22);
+  color: #fef08a;
+  border: 1px solid rgba(234, 179, 8, 0.45);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.export-warning-alert .warning-btn:hover {
+  background: rgba(234, 179, 8, 0.35);
+  color: #fff;
+}
+
+
 

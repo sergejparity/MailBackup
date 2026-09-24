@@ -10,6 +10,9 @@ let state = {
   currentSort: 'newest',
   csvImportContent: '',
   csvImportMode: 'file',
+  exportLocations: [],
+  exportTargetExists: false,
+  suggestedExportFilename: '',
 };
 
 // DOM Elements
@@ -31,6 +34,14 @@ const el = {
   btnCloseExport: document.getElementById('btn-close-export'),
   exportAccountSelect: document.getElementById('export-account-select'),
   exportFolderSelect: document.getElementById('export-folder-select'),
+  exportDirInput: document.getElementById('export-dir-input'),
+  btnBrowseExportDir: document.getElementById('btn-browse-export-dir'),
+  exportLocationPills: document.getElementById('export-location-pills'),
+  exportFilenameInput: document.getElementById('export-filename-input'),
+  exportFullDestPath: document.getElementById('export-full-dest-path'),
+  exportOverwriteWarning: document.getElementById('export-overwrite-warning'),
+  btnAutoRenameExport: document.getElementById('btn-auto-rename-export'),
+  exportOutputPath: document.getElementById('export-output-path'),
   exportForm: document.getElementById('export-form'),
   readerEmpty: document.getElementById('reader-empty'),
   readerContent: document.getElementById('reader-content'),
@@ -463,8 +474,8 @@ function initEventListeners() {
   });
   el.btnCloseModal.addEventListener('click', () => closeModal(el.settingsModal));
   
-  el.btnOpenExport.addEventListener('click', () => {
-    populateExportModal();
+  el.btnOpenExport.addEventListener('click', async () => {
+    await populateExportModal();
     openModal(el.exportModal);
   });
   el.btnCloseExport.addEventListener('click', () => closeModal(el.exportModal));
@@ -617,8 +628,35 @@ function initEventListeners() {
   // Forms
   el.addAccountForm.addEventListener('submit', handleAddAccount);
   el.btnTestAccount.addEventListener('click', handleTestAccount);
-  if (el.exportForm) el.exportForm.addEventListener('submit', handleExportMbox);
-  if (el.exportAccountSelect) el.exportAccountSelect.addEventListener('change', updateExportDefaultPath);
+  if (el.exportForm) el.exportForm.addEventListener('submit', (e) => handleExportMbox(e, false));
+  if (el.exportAccountSelect) {
+    el.exportAccountSelect.addEventListener('change', async () => {
+      await updateExportFoldersForSelectedAccount();
+      if (el.exportFilenameInput) el.exportFilenameInput.value = generateSmartExportFilename();
+      updateExportFullPreview();
+    });
+  }
+  if (el.exportFolderSelect) {
+    el.exportFolderSelect.addEventListener('change', () => {
+      if (el.exportFilenameInput) el.exportFilenameInput.value = generateSmartExportFilename();
+      updateExportFullPreview();
+    });
+  }
+  if (el.exportDirInput) {
+    el.exportDirInput.addEventListener('input', () => {
+      updateExportFullPreview();
+      renderExportLocationPills();
+    });
+  }
+  if (el.exportFilenameInput) {
+    el.exportFilenameInput.addEventListener('input', updateExportFullPreview);
+  }
+  if (el.btnBrowseExportDir) {
+    el.btnBrowseExportDir.addEventListener('click', handleBrowseExportDir);
+  }
+  if (el.btnAutoRenameExport) {
+    el.btnAutoRenameExport.addEventListener('click', handleAutoRenameExport);
+  }
   const btnDownloadBrowser = document.getElementById('btn-download-browser');
   if (btnDownloadBrowser) btnDownloadBrowser.addEventListener('click', handleDownloadMboxBrowser);
 
@@ -902,6 +940,19 @@ async function handleSaveAccountEdit(e) {
     }
   } catch (err) {
     showToast(`Network error: ${err}`);
+  }
+}
+
+async function selectAccount(accountId) {
+  state.selectedAccountId = accountId;
+  state.expandedAccounts.add(accountId);
+  renderAccounts();
+  if (!state.accountFolders[accountId]) {
+    await loadFolders(accountId);
+  }
+  const folders = state.accountFolders[accountId];
+  if (folders && folders.length > 0 && !state.selectedFolderId) {
+    await selectFolder(folders[0]);
   }
 }
 
@@ -1500,56 +1551,261 @@ async function deleteAccount(accountId) {
   }
 }
 
-function populateExportModal() {
+async function loadExportLocations() {
+  try {
+    const res = await fetch('/api/export/locations');
+    if (!res.ok) return;
+    const data = await res.json();
+    state.exportLocations = data.locations || [];
+    if (data.default_dir && !state.defaultExportDir) {
+      state.defaultExportDir = data.default_dir;
+    }
+    renderExportLocationPills();
+  } catch (err) {
+    console.error('Failed to load export locations:', err);
+  }
+}
+
+function renderExportLocationPills() {
+  if (!el.exportLocationPills) return;
+  el.exportLocationPills.innerHTML = '';
+
+  const currentDir = el.exportDirInput ? el.exportDirInput.value.trim() : '';
+
+  state.exportLocations.forEach(loc => {
+    const pill = document.createElement('button');
+    pill.type = 'button';
+    pill.className = `location-pill ${currentDir === loc.path ? 'active' : ''}`;
+    
+    let icon = '📁';
+    if (loc.name === 'Downloads') icon = '📥';
+    else if (loc.name === 'Documents') icon = '📄';
+    else if (loc.name === 'Desktop') icon = '🖥️';
+    else if (loc.name === 'Home') icon = '🏠';
+
+    pill.textContent = `${icon} ${loc.name}`;
+    pill.title = loc.path;
+    pill.addEventListener('click', () => {
+      if (el.exportDirInput) {
+        el.exportDirInput.value = loc.path;
+        updateExportFullPreview();
+        renderExportLocationPills();
+      }
+    });
+    el.exportLocationPills.appendChild(pill);
+  });
+}
+
+async function handleBrowseExportDir() {
+  if (!el.btnBrowseExportDir) return;
+  const originalHtml = el.btnBrowseExportDir.innerHTML;
+  el.btnBrowseExportDir.disabled = true;
+  el.btnBrowseExportDir.innerHTML = 'Selecting...';
+
+  try {
+    const res = await fetch('/api/dialog/pick-directory', { method: 'POST' });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.selected && data.path) {
+        if (el.exportDirInput) {
+          el.exportDirInput.value = data.path;
+          updateExportFullPreview();
+          renderExportLocationPills();
+        }
+      }
+    }
+  } catch (err) {
+    showToast(`Directory picker error: ${err.message || err}`);
+  } finally {
+    if (el.btnBrowseExportDir) {
+      el.btnBrowseExportDir.disabled = false;
+      el.btnBrowseExportDir.innerHTML = originalHtml;
+    }
+  }
+}
+
+function generateSmartExportFilename() {
+  const timestamp = new Date().toISOString().split('T')[0];
+  const selectedAccId = el.exportAccountSelect ? el.exportAccountSelect.value : '';
+  const acc = state.accounts ? state.accounts.find(a => a.id === selectedAccId) : null;
+  const accSlug = acc ? (acc.name || acc.email || 'backup').replace(/[^a-zA-Z0-9_-]/g, '_') : 'backup';
+
+  const folderVal = el.exportFolderSelect ? el.exportFolderSelect.value : 'ALL';
+  let folderSuffix = '';
+  if (folderVal && folderVal !== 'ALL') {
+    const folders = state.accountFolders ? (state.accountFolders[selectedAccId] || []) : [];
+    const f = folders.find(item => item.id === folderVal);
+    if (f) {
+      folderSuffix = `_${f.remote_name.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    }
+  }
+
+  return `${accSlug}${folderSuffix}_${timestamp}.mbox`;
+}
+
+let checkPathDebounce = null;
+
+function updateExportFullPreview() {
+  const dir = el.exportDirInput ? el.exportDirInput.value.trim() : (state.defaultExportDir || '');
+  let filename = el.exportFilenameInput ? el.exportFilenameInput.value.trim() : '';
+  if (!filename) {
+    filename = generateSmartExportFilename();
+    if (el.exportFilenameInput) el.exportFilenameInput.value = filename;
+  }
+  if (!filename.endsWith('.mbox')) {
+    filename += '.mbox';
+  }
+
+  const sep = dir.includes('\\') ? '\\' : '/';
+  const fullPath = dir ? (dir.endsWith('/') || dir.endsWith('\\') ? `${dir}${filename}` : `${dir}${sep}${filename}`) : filename;
+
+  if (el.exportOutputPath) el.exportOutputPath.value = fullPath;
+  if (el.exportFullDestPath) el.exportFullDestPath.textContent = fullPath;
+
+  clearTimeout(checkPathDebounce);
+  checkPathDebounce = setTimeout(() => {
+    checkExportPathCollision(fullPath);
+  }, 250);
+}
+
+async function checkExportPathCollision(fullPath) {
+  if (!fullPath) return;
+  try {
+    const res = await fetch(`/api/export/check-path?path=${encodeURIComponent(fullPath)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    state.exportTargetExists = data.exists;
+
+    if (data.exists) {
+      if (el.exportOverwriteWarning) el.exportOverwriteWarning.style.display = 'flex';
+      const suggestedParts = data.suggested_path.split(/[/\\]/);
+      const suggestedFilename = suggestedParts[suggestedParts.length - 1];
+      state.suggestedExportFilename = suggestedFilename;
+      if (el.btnAutoRenameExport) {
+        el.btnAutoRenameExport.textContent = `Use: ${suggestedFilename}`;
+      }
+    } else {
+      if (el.exportOverwriteWarning) el.exportOverwriteWarning.style.display = 'none';
+      state.suggestedExportFilename = '';
+    }
+  } catch (err) {
+    console.error('Error checking export path:', err);
+  }
+}
+
+function handleAutoRenameExport() {
+  if (state.suggestedExportFilename && el.exportFilenameInput) {
+    el.exportFilenameInput.value = state.suggestedExportFilename;
+    updateExportFullPreview();
+  }
+}
+
+async function populateExportModal() {
+  if (!el.exportAccountSelect) return;
   el.exportAccountSelect.innerHTML = '';
+
+  if (!state.accounts || state.accounts.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'No accounts available';
+    el.exportAccountSelect.appendChild(opt);
+    if (el.exportFolderSelect) el.exportFolderSelect.innerHTML = '<option value="ALL">All Folders</option>';
+    return;
+  }
+
   state.accounts.forEach(acc => {
     const opt = document.createElement('option');
     opt.value = acc.id;
     opt.textContent = `${acc.name} (${acc.email})`;
+    if (acc.id === state.selectedAccountId) {
+      opt.selected = true;
+    }
     el.exportAccountSelect.appendChild(opt);
   });
 
-  el.exportFolderSelect.innerHTML = '<option value="ALL">All Folders</option>';
-  state.folders.forEach(f => {
-    const opt = document.createElement('option');
-    opt.value = f.id;
-    opt.textContent = f.remote_name;
-    el.exportFolderSelect.appendChild(opt);
-  });
+  await updateExportFoldersForSelectedAccount();
 
-  updateExportDefaultPath();
+  // Set default export dir if empty
+  if (el.exportDirInput && !el.exportDirInput.value.trim()) {
+    el.exportDirInput.value = state.defaultExportDir || '/Users/SP/Downloads';
+  }
+
+  if (el.exportFilenameInput) {
+    el.exportFilenameInput.value = generateSmartExportFilename();
+  }
+
+  if (state.exportLocations.length === 0) {
+    await loadExportLocations();
+  } else {
+    renderExportLocationPills();
+  }
+
+  updateExportFullPreview();
 }
 
-function updateExportDefaultPath() {
-  const timestamp = new Date().toISOString().split('T')[0];
+async function updateExportFoldersForSelectedAccount() {
   const selectedAccId = el.exportAccountSelect ? el.exportAccountSelect.value : '';
-  const acc = state.accounts.find(a => a.id === selectedAccId);
-  const accSlug = acc ? acc.name.replace(/[^a-zA-Z0-9_-]/g, '_') : 'backup';
-  const fileName = `${accSlug}_${timestamp}.mbox`;
+  if (!selectedAccId) {
+    if (el.exportFolderSelect) el.exportFolderSelect.innerHTML = '<option value="ALL">All Folders</option>';
+    return;
+  }
 
-  const input = document.getElementById('export-output-path');
-  if (!input) return;
+  let folders = state.accountFolders ? state.accountFolders[selectedAccId] : null;
+  if (!folders) {
+    try {
+      const res = await fetch(`/api/accounts/${selectedAccId}/folders`);
+      if (res.ok) {
+        folders = await res.json();
+        if (!state.accountFolders) state.accountFolders = {};
+        state.accountFolders[selectedAccId] = folders;
+      }
+    } catch (err) {
+      console.error('Failed to load folders for export:', err);
+    }
+  }
 
-  if (state.defaultExportDir) {
-    const sep = state.defaultExportDir.includes('\\') ? '\\' : '/';
-    input.value = `${state.defaultExportDir}${sep}${fileName}`;
-  } else {
-    input.value = fileName;
+  if (el.exportFolderSelect) {
+    el.exportFolderSelect.innerHTML = '<option value="ALL">All Folders</option>';
+    if (folders && folders.length > 0) {
+      folders.forEach(f => {
+        const opt = document.createElement('option');
+        opt.value = f.id;
+        opt.textContent = `${f.remote_name} (${f.message_count || 0})`;
+        if (f.id === state.selectedFolderId && selectedAccId === state.selectedAccountId) {
+          opt.selected = true;
+        }
+        el.exportFolderSelect.appendChild(opt);
+      });
+    }
   }
 }
 
-async function handleExportMbox(e) {
-  e.preventDefault();
-  const rawPath = document.getElementById('export-output-path').value.trim();
+async function handleExportMbox(e, forceOverwrite = false) {
+  if (e && e.preventDefault) e.preventDefault();
+  updateExportFullPreview();
+  const rawPath = el.exportOutputPath ? el.exportOutputPath.value.trim() : (document.getElementById('export-output-path')?.value.trim() || '');
   if (!rawPath) {
-    showToast('Please enter an output destination path');
+    showToast('Please specify a destination directory and filename');
     return;
+  }
+
+  // Pre-emptive warning if file already exists
+  if (state.exportTargetExists && !forceOverwrite) {
+    const filename = el.exportFilenameInput ? el.exportFilenameInput.value.trim() : rawPath;
+    const proceed = confirm(
+      `⚠️ Warning: A file named "${filename}" already exists at this destination:\n\n${rawPath}\n\nDo you want to overwrite it?`
+    );
+    if (!proceed) {
+      return;
+    }
+    forceOverwrite = true;
   }
 
   const payload = {
     account_id: el.exportAccountSelect.value,
     folder_id: el.exportFolderSelect.value === 'ALL' ? null : el.exportFolderSelect.value,
     output_path: rawPath,
+    overwrite: forceOverwrite,
   };
 
   const btn = document.getElementById('btn-export-submit');
@@ -1570,6 +1826,14 @@ async function handleExportMbox(e) {
       const result = await res.json();
       showToast(`Exported ${result.exported_count} message(s) to ${result.output_path || 'archive'}! ✅`);
       closeModal(el.exportModal);
+    } else if (res.status === 409) {
+      const conflict = await res.json();
+      const proceed = confirm(
+        `⚠️ File Exists: A file already exists at:\n\n${conflict.existing_path}\n\nDo you want to overwrite it?`
+      );
+      if (proceed) {
+        await handleExportMbox(null, true);
+      }
     } else {
       const err = await res.text();
       showToast(`Export failed: ${err}`);
@@ -1592,7 +1856,12 @@ function handleDownloadMboxBrowser() {
   }
   const folderId = el.exportFolderSelect.value;
   showToast('Preparing .mbox archive download in browser... 📦');
-  window.location.href = `/api/export/mbox/download?account_id=${encodeURIComponent(accountId)}&folder_id=${encodeURIComponent(folderId)}`;
+  const a = document.createElement('a');
+  a.href = `/api/export/mbox/download?account_id=${encodeURIComponent(accountId)}&folder_id=${encodeURIComponent(folderId)}`;
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
   closeModal(el.exportModal);
 }
 
