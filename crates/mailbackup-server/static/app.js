@@ -1906,6 +1906,15 @@ async function loadSettings() {
     if (data.default_export_dir) {
       state.defaultExportDir = data.default_export_dir;
     }
+    if (data.version) {
+      const vStr = `v${data.version}`;
+      const headerV = document.getElementById('header-app-version');
+      if (headerV) headerV.textContent = vStr;
+      const pillV = document.getElementById('settings-app-version-pill');
+      if (pillV) pillV.textContent = vStr;
+      const valV = document.getElementById('settings-app-version-val');
+      if (valV) valV.textContent = vStr;
+    }
   } catch (err) {
     console.error('Failed to load settings:', err);
   }

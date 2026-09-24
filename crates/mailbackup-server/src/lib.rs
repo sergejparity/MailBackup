@@ -82,6 +82,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/export/check-path", get(api_export_check_path))
         .route("/api/dialog/pick-directory", post(api_pick_directory))
         .route("/api/settings", get(api_get_settings).put(api_update_settings))
+        .route("/api/version", get(api_get_version))
         .route("/api/service/status", get(api_service_status))
         .route("/api/service/toggle", post(api_service_toggle))
         .route("/api/logs", get(api_get_logs))
@@ -1228,6 +1229,13 @@ pub struct SettingsResponse {
     pub run_as_service: bool,
     pub service_status: mailbackup_core::service::ServiceStatus,
     pub default_export_dir: String,
+    pub version: String,
+}
+
+async fn api_get_version() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION")
+    })).into_response()
 }
 
 async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
@@ -1244,6 +1252,7 @@ async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
         run_as_service: cfg.settings.run_as_service,
         service_status: mailbackup_core::service::get_service_status(),
         default_export_dir: mailbackup_core::config::default_export_dir().to_string_lossy().to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
     };
     Json(res).into_response()
 }

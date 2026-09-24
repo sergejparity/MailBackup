@@ -21,7 +21,7 @@
           </svg>
         </div>
         <div class="brand-text">
-          <h1>MailBackup <span class="badge-pro">Studio</span></h1>
+          <h1>MailBackup <span class="badge-pro">Studio</span> <span class="badge-version" id="header-app-version">v0.1.1</span></h1>
           <span class="brand-subtitle">Resilient Local Email Archive</span>
         </div>
       </div>
@@ -718,6 +718,31 @@
                   </button>
                 </div>
               </form>
+            </div>
+
+            <!-- Application & Build Info -->
+            <div class="settings-card" style="margin-top: 14px;">
+              <div class="settings-header">
+                <div>
+                  <h3>Application & Build Information</h3>
+                  <p class="settings-desc">MailBackup Studio release version and engine details.</p>
+                </div>
+                <span class="badge-pill badge-pill-info" id="settings-app-version-pill">v0.1.1</span>
+              </div>
+              <div style="margin-top: 12px; font-size: 0.85rem; color: var(--text-secondary); display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; justify-content: space-between; border-bottom: 1px solid var(--border-color); padding-bottom: 6px;">
+                  <span>Release Version</span>
+                  <code id="settings-app-version-val" style="font-weight: 600; color: var(--text-primary);">v0.1.1</code>
+                </div>
+                <div style="display: flex; justify-content: space-between; border-bottom: 1px solid var(--border-color); padding-bottom: 6px;">
+                  <span>Engine</span>
+                  <span style="color: var(--text-primary);">MailBackup Core (Rust / SQLite FTS5)</span>
+                </div>
+                <div style="display: flex; justify-content: space-between;">
+                  <span>License</span>
+                  <span style="color: var(--text-primary);">MIT OR Apache-2.0</span>
+                </div>
+              </div>
             </div>
           </div>
 
