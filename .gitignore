@@ -19,3 +19,4 @@ test_config.yaml
 *.eml
 *.mbox
 credentials.json
+WORKLOG/*
