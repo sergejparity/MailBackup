@@ -3,7 +3,21 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
   <title>MailBackup Studio</title>
+  <script>
+    (function() {
+      try {
+        const savedTheme = localStorage.getItem('mailbackup_theme') || 'system';
+        let effective = savedTheme;
+        if (savedTheme === 'system') {
+          effective = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+        }
+        document.documentElement.setAttribute('data-theme', effective);
+        document.documentElement.setAttribute('data-theme-preference', savedTheme);
+      } catch (e) {}
+    })();
+  </script>
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon.png">
   <link rel="icon" type="image/png" sizes="64x64" href="/favicon-64.png">
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
@@ -77,6 +91,24 @@
             <line x1="16" y1="13" x2="8" y2="13"></line>
             <line x1="16" y1="17" x2="8" y2="17"></line>
             <polyline points="10 9 9 9 8 9"></polyline>
+          </svg>
+        </button>
+        <button type="button" id="btn-theme-toggle" class="btn btn-secondary theme-toggle-btn" title="Switch Theme (Light / Dark)" aria-label="Switch Theme">
+          <!-- Sun Icon (displayed in dark theme to switch to light) -->
+          <svg class="theme-icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="5"></circle>
+            <line x1="12" y1="1" x2="12" y2="3"></line>
+            <line x1="12" y1="21" x2="12" y2="23"></line>
+            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+            <line x1="1" y1="12" x2="3" y2="12"></line>
+            <line x1="21" y1="12" x2="23" y2="12"></line>
+            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+          </svg>
+          <!-- Moon Icon (displayed in light theme to switch to dark) -->
+          <svg class="theme-icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
           </svg>
         </button>
         <button id="btn-open-settings" class="btn btn-secondary" title="Settings & Accounts">
@@ -594,6 +626,97 @@
 
           <!-- Tab 3: Settings -->
           <div id="tab-settings" class="tab-content">
+            <!-- Appearance & Theme Settings -->
+            <div class="settings-card">
+              <div class="settings-header" style="display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap;">
+                <div>
+                  <h3>Appearance & Theme</h3>
+                  <p class="settings-desc">Choose your preferred visual theme or automatically match your operating system.</p>
+                </div>
+                <div id="theme-active-indicator" class="theme-status-badge">
+                  <span id="theme-active-dot" style="width: 8px; height: 8px; border-radius: 50%; background: var(--primary);"></span>
+                  <span id="theme-active-text">Active: Dark</span>
+                </div>
+              </div>
+
+              <div class="theme-options-grid">
+                <!-- Option 1: Dark Theme -->
+                <div class="theme-option-card active" data-theme-value="dark" id="theme-opt-dark" tabindex="0" role="button" aria-label="Select Dark Theme">
+                  <div class="theme-option-badge-check">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+                      <polyline points="20 6 9 17 4 12"></polyline>
+                    </svg>
+                  </div>
+                  <div class="theme-preview-visual theme-preview-dark">
+                    <div class="preview-sidebar">
+                      <div class="preview-sidebar-item active"></div>
+                      <div class="preview-sidebar-item"></div>
+                      <div class="preview-sidebar-item"></div>
+                    </div>
+                    <div class="preview-content">
+                      <div class="preview-line-pri"></div>
+                      <div class="preview-line-sub"></div>
+                      <div class="preview-card"></div>
+                    </div>
+                  </div>
+                  <div class="theme-option-title">
+                    <span>🌙 Dark Theme</span>
+                  </div>
+                  <div class="theme-option-desc">Deep space dark aesthetic for low light comfort</div>
+                </div>
+
+                <!-- Option 2: Light Theme -->
+                <div class="theme-option-card" data-theme-value="light" id="theme-opt-light" tabindex="0" role="button" aria-label="Select Light Theme">
+                  <div class="theme-option-badge-check">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+                      <polyline points="20 6 9 17 4 12"></polyline>
+                    </svg>
+                  </div>
+                  <div class="theme-preview-visual theme-preview-light">
+                    <div class="preview-sidebar">
+                      <div class="preview-sidebar-item active"></div>
+                      <div class="preview-sidebar-item"></div>
+                      <div class="preview-sidebar-item"></div>
+                    </div>
+                    <div class="preview-content">
+                      <div class="preview-line-pri"></div>
+                      <div class="preview-line-sub"></div>
+                      <div class="preview-card"></div>
+                    </div>
+                  </div>
+                  <div class="theme-option-title">
+                    <span>☀️ Light Theme</span>
+                  </div>
+                  <div class="theme-option-desc">Clean, crisp daylight aesthetic with high contrast</div>
+                </div>
+
+                <!-- Option 3: Match System -->
+                <div class="theme-option-card" data-theme-value="system" id="theme-opt-system" tabindex="0" role="button" aria-label="Select Follow System Theme">
+                  <div class="theme-option-badge-check">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+                      <polyline points="20 6 9 17 4 12"></polyline>
+                    </svg>
+                  </div>
+                  <div class="theme-preview-visual theme-preview-system">
+                    <div class="preview-sidebar">
+                      <div class="preview-sidebar-item active"></div>
+                      <div class="preview-sidebar-item"></div>
+                      <div class="preview-sidebar-item"></div>
+                    </div>
+                    <div class="preview-content">
+                      <div class="preview-line-pri"></div>
+                      <div class="preview-line-sub"></div>
+                      <div class="preview-card"></div>
+                    </div>
+                  </div>
+                  <div class="theme-option-title">
+                    <span>💻 Follow System</span>
+                  </div>
+                  <div class="theme-option-desc">Automatically switch with your OS appearance</div>
+                </div>
+              </div>
+            </div>
+
             <!-- Desktop & Background Execution Settings -->
             <div class="settings-card">
               <div class="settings-header">

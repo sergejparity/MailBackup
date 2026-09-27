@@ -175,10 +175,19 @@ const el = {
   logsFilePath: document.getElementById('logs-file-path'),
   logsStorageInfo: document.getElementById('logs-storage-info'),
   logsEntryCount: document.getElementById('logs-entry-count'),
+
+  // Theme Switcher Elements
+  btnThemeToggle: document.getElementById('btn-theme-toggle'),
+  themeOptDark: document.getElementById('theme-opt-dark'),
+  themeOptLight: document.getElementById('theme-opt-light'),
+  themeOptSystem: document.getElementById('theme-opt-system'),
+  themeActiveText: document.getElementById('theme-active-text'),
+  themeActiveDot: document.getElementById('theme-active-dot'),
 };
 
 // Initialization
 document.addEventListener('DOMContentLoaded', () => {
+  initTheme();
   initSplitterResizing();
   initModalResizing();
   initEventListeners();
@@ -186,6 +195,116 @@ document.addEventListener('DOMContentLoaded', () => {
   loadAccounts();
   loadSettings();
 });
+
+// Theme Management (Light, Dark, Follow System)
+function initTheme() {
+  const THEME_STORAGE_KEY = 'mailbackup_theme';
+
+  function getSystemPreference() {
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  }
+
+  function applyTheme(preference, showFeedback = false) {
+    const effectiveTheme = preference === 'system' ? getSystemPreference() : preference;
+
+    document.documentElement.setAttribute('data-theme', effectiveTheme);
+    document.documentElement.setAttribute('data-theme-preference', preference);
+
+    // Update Header Toggle Button
+    if (el.btnThemeToggle) {
+      if (effectiveTheme === 'dark') {
+        el.btnThemeToggle.setAttribute('title', 'Switch to Light Theme');
+        el.btnThemeToggle.setAttribute('aria-label', 'Switch to Light Theme');
+      } else {
+        el.btnThemeToggle.setAttribute('title', 'Switch to Dark Theme');
+        el.btnThemeToggle.setAttribute('aria-label', 'Switch to Dark Theme');
+      }
+    }
+
+    // Update Settings Modal Theme Option Cards
+    const cards = [
+      { el: el.themeOptDark, val: 'dark' },
+      { el: el.themeOptLight, val: 'light' },
+      { el: el.themeOptSystem, val: 'system' },
+    ];
+
+    cards.forEach(({ el: card, val }) => {
+      if (!card) return;
+      if (val === preference) {
+        card.classList.add('active');
+        card.setAttribute('aria-checked', 'true');
+      } else {
+        card.classList.remove('active');
+        card.setAttribute('aria-checked', 'false');
+      }
+    });
+
+    // Update Theme Active Indicator in Settings Modal
+    if (el.themeActiveText) {
+      if (preference === 'system') {
+        const sysLabel = effectiveTheme === 'light' ? 'Light' : 'Dark';
+        el.themeActiveText.textContent = `Active: ${sysLabel} (System)`;
+      } else {
+        const prefLabel = preference === 'light' ? 'Light' : 'Dark';
+        el.themeActiveText.textContent = `Active: ${prefLabel}`;
+      }
+    }
+
+    if (showFeedback) {
+      const modeName = preference === 'system'
+        ? `System theme (${effectiveTheme} mode)`
+        : `${preference.charAt(0).toUpperCase() + preference.slice(1)} theme`;
+      showToast(`Switched to ${modeName}`);
+    }
+  }
+
+  // 1. Initial Apply
+  const initialPref = localStorage.getItem(THEME_STORAGE_KEY) || 'system';
+  applyTheme(initialPref, false);
+
+  // 2. React to OS preference changes in real-time
+  if (window.matchMedia) {
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+      const currentPref = localStorage.getItem(THEME_STORAGE_KEY) || 'system';
+      if (currentPref === 'system') {
+        applyTheme('system', false);
+      }
+    });
+  }
+
+  // 3. Header Toggle Button Click Handler
+  if (el.btnThemeToggle) {
+    el.btnThemeToggle.addEventListener('click', () => {
+      const currentEffective = document.documentElement.getAttribute('data-theme') || 'dark';
+      const nextTheme = currentEffective === 'dark' ? 'light' : 'dark';
+      localStorage.setItem(THEME_STORAGE_KEY, nextTheme);
+      applyTheme(nextTheme, true);
+    });
+  }
+
+  // 4. Settings Modal Theme Option Cards Click Handlers
+  const themeCards = [
+    { card: el.themeOptDark, val: 'dark' },
+    { card: el.themeOptLight, val: 'light' },
+    { card: el.themeOptSystem, val: 'system' },
+  ];
+
+  themeCards.forEach(({ card, val }) => {
+    if (!card) return;
+    const selectTheme = () => {
+      localStorage.setItem(THEME_STORAGE_KEY, val);
+      applyTheme(val, true);
+    };
+
+    card.addEventListener('click', selectTheme);
+    card.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        selectTheme();
+      }
+    });
+  });
+}
 
 // Workspace Panes Draggable Splitters
 function initSplitterResizing() {
