@@ -4,6 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MailBackup Studio</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon.png">
+  <link rel="icon" type="image/png" sizes="64x64" href="/favicon-64.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -14,14 +18,11 @@
     <!-- Top Navigation Bar -->
     <header class="app-header">
       <div class="brand">
-        <div class="logo-icon">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path>
-            <polyline points="22,6 12,13 2,6"></polyline>
-          </svg>
+        <div class="logo-icon" title="MailBackup Studio">
+          <img src="/logo-mark.png" alt="MailBackup" class="brand-logo-img">
         </div>
         <div class="brand-text">
-          <h1>MailBackup <span class="badge-pro">Studio</span> <span class="badge-version" id="header-app-version">v0.1.1</span></h1>
+          <h1>MailBackup <span class="badge-pro">Studio</span> <span class="badge-version" id="header-app-version">v0.2.0</span></h1>
           <span class="brand-subtitle">Resilient Local Email Archive</span>
         </div>
       </div>
@@ -773,12 +774,25 @@
 
             <!-- Application & Build Info -->
             <div class="settings-card" style="margin-top: 14px;">
+              <div class="settings-about-brand" style="display: flex; align-items: center; gap: 14px; margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--border-color);">
+                <div class="logo-icon" style="width: 44px; height: 44px; padding: 5px;">
+                  <img src="/logo-mark.png" alt="MailBackup" class="brand-logo-img">
+                </div>
+                <div>
+                  <div style="font-weight: 700; font-size: 1.05rem; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
+                    MailBackup Studio <span class="badge-pro">Studio</span>
+                  </div>
+                  <div style="font-size: 0.78rem; color: var(--text-secondary); margin-top: 2px;">
+                    Resilient Local Email Archive &amp; Non-Destructive Backup
+                  </div>
+                </div>
+              </div>
               <div class="settings-header">
                 <div>
                   <h3>Application & Build Information</h3>
                   <p class="settings-desc">MailBackup Studio release version and engine details.</p>
                 </div>
-                <span class="badge-pill badge-pill-info" id="settings-app-version-pill">v0.1.1</span>
+                <span class="badge-pill badge-pill-info" id="settings-app-version-pill">v0.2.0</span>
               </div>
               <div style="margin-top: 12px; font-size: 0.85rem; color: var(--text-secondary); display: flex; flex-direction: column; gap: 8px;">
                 <div style="display: flex; justify-content: space-between; border-bottom: 1px solid var(--border-color); padding-bottom: 6px;">

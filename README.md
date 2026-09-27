@@ -1,6 +1,17 @@
-# MailBackup Studio 📬
+<div align="center">
+  <img src="assets/logo.png" alt="MailBackup Studio" width="440" />
 
-A high-performance, resilient, and non-destructive **Email Backup Utility written in Rust**.
+  # MailBackup Studio 📬
+
+  <p><strong>A high-performance, resilient, and non-destructive Email Backup Utility written in Rust.</strong></p>
+
+  <p>
+    <img src="https://img.shields.io/badge/rust-2021-orange.svg" alt="Rust Edition 2021" />
+    <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue.svg" alt="Cross Platform" />
+    <img src="https://img.shields.io/badge/storage-EML%20%2B%20SQLite%20FTS5-purple.svg" alt="Storage" />
+    <img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-green.svg" alt="License" />
+  </p>
+</div>
 
 Built with a modular architecture featuring:
 - **CLI**: Rapid commands with Rich progress bars, interactive setup wizard, FTS5 search, and headless daemon.
