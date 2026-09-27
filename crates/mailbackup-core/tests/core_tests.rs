@@ -529,8 +529,11 @@ fn test_database_relocate_and_swap() {
     assert_eq!(stats_final.total_folders, 2);
 }
 
+static LOG_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn test_event_log_operations() {
+    let _lock = LOG_TEST_MUTEX.lock().unwrap();
     use mailbackup_core::event_log::{clear_log, get_raw_log, get_recent_logs, log_event};
 
     clear_log().unwrap();
@@ -591,6 +594,7 @@ fn test_service_status_and_config() {
 
 #[tokio::test]
 async fn test_scheduler_event_logging_and_listener() {
+    let _lock = LOG_TEST_MUTEX.lock().unwrap();
     use mailbackup_core::config::{AccountConfig, AuthType, FolderFilter, ProviderType};
     use mailbackup_core::db::Database;
     use mailbackup_core::event_log::clear_log;
@@ -779,6 +783,117 @@ fn test_export_locations_and_available_path() {
     let locs = system_export_locations();
     assert!(!locs.is_empty());
 }
+
+#[test]
+fn test_config_log_retention_defaults() {
+    // 1. Default should be 30 days
+    let default_config = AppConfig::default();
+    assert_eq!(default_config.settings.log_retention_days, Some(30));
+
+    // 2. Deserializing yaml without log_retention_days should default to Some(30)
+    let yaml_missing = r#"
+data_dir: /tmp/mailbackup/data
+db_path: /tmp/mailbackup/mailbackup.db
+settings:
+  default_schedule: "0 0 * * *"
+accounts: []
+"#;
+    let parsed: AppConfig = serde_yaml::from_str(yaml_missing).unwrap();
+    assert_eq!(parsed.settings.log_retention_days, Some(30));
+
+    // 3. Custom retention period
+    let yaml_custom = r#"
+data_dir: /tmp/mailbackup/data
+db_path: /tmp/mailbackup/mailbackup.db
+settings:
+  default_schedule: "0 0 * * *"
+  log_retention_days: 90
+accounts: []
+"#;
+    let parsed_custom: AppConfig = serde_yaml::from_str(yaml_custom).unwrap();
+    assert_eq!(parsed_custom.settings.log_retention_days, Some(90));
+}
+
+#[test]
+fn test_log_rotation_and_retention_policy() {
+    let _lock = LOG_TEST_MUTEX.lock().unwrap();
+    use mailbackup_core::event_log::{
+        clear_log, get_log_file_content, get_recent_logs, list_log_files, log_dir, log_event,
+        prune_logs, rotate_active_log,
+    };
+    use std::fs;
+
+    clear_log().unwrap();
+    // Clean up any stray rotated test logs in log_dir
+    let dir = log_dir();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("events-") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    // 1. Write initial entries to active log
+    log_event("TEST_EVENT", "First message in active log");
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    log_event("TEST_EVENT_2", "Second message in active log");
+
+    let active_entries = get_recent_logs(10).unwrap();
+    assert!(active_entries.len() >= 2);
+
+    // 2. Perform rotation
+    let rotated_name = rotate_active_log().unwrap();
+    assert!(rotated_name.is_some(), "Rotation should produce a filename");
+    let rotated_filename = rotated_name.unwrap();
+    assert!(rotated_filename.starts_with("events-"));
+    assert!(rotated_filename.ends_with(".log"));
+
+    // 3. Write a new entry to the freshly rotated active log
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    log_event("NEW_DAY_EVENT", "Message after rotation");
+    let after_entries = get_recent_logs(10).unwrap();
+    assert!(!after_entries.is_empty());
+    assert_eq!(after_entries[0].event_type, "NEW_DAY_EVENT");
+
+    // 4. Listing log files should show both active events.log and rotated file
+    let files = list_log_files().unwrap();
+    assert!(files.len() >= 2);
+    let active_file = files.iter().find(|f| f.is_active).unwrap();
+    assert_eq!(active_file.name, "events.log");
+    let rotated_found = files.iter().find(|f| f.name == rotated_filename);
+    assert!(rotated_found.is_some());
+
+    // 5. Test safe content retrieval and path traversal prevention
+    let content = get_log_file_content(&rotated_filename).unwrap();
+    assert!(content.contains("First message in active log"));
+    assert!(get_log_file_content("../secret.txt").is_err());
+    assert!(get_log_file_content("/etc/passwd").is_err());
+
+    // 6. Test retention pruning
+    let dir = log_dir();
+    let old_log_name = "events-2020-01-01.log";
+    let old_log_path = dir.join(old_log_name);
+    fs::write(&old_log_path, b"[2020-01-01T00:00:00Z] [OLD] Ancient log entry\n").unwrap();
+    assert!(old_log_path.exists());
+
+    let recent_log_name = format!("events-{}.log", chrono::Utc::now().format("%Y-%m-%d"));
+    let recent_log_path = dir.join(&recent_log_name);
+    fs::write(&recent_log_path, b"[2026-09-28T00:00:00Z] [RECENT] Today log\n").unwrap();
+
+    // Prune with 30 days retention policy
+    let prune_report = prune_logs(Some(30)).unwrap();
+    assert!(prune_report.pruned_files.contains(&old_log_name.to_string()));
+    assert!(!old_log_path.exists(), "Ancient log should be deleted");
+    assert!(recent_log_path.exists(), "Recent log within 30 days should be preserved");
+
+    // Cleanup
+    let _ = fs::remove_file(recent_log_path);
+    let _ = fs::remove_file(dir.join(rotated_filename));
+    clear_log().unwrap();
+}
+
 
 
 

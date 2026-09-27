@@ -151,18 +151,29 @@ const el = {
   serviceManualCmd: document.getElementById('service-manual-cmd'),
   btnCopyServiceCmd: document.getElementById('btn-copy-service-cmd'),
 
+  // Settings Log Elements
+  settingsLogRetention: document.getElementById('settings-log-retention'),
+  settingsActiveLogFile: document.getElementById('settings-active-log-file'),
+  settingsLogStats: document.getElementById('settings-log-stats'),
+  btnManualRotateSettings: document.getElementById('btn-manual-rotate-settings'),
+  btnSaveLogRetention: document.getElementById('btn-save-log-retention'),
+
   // Header & Logs Elements
   syncProgressBanner: document.getElementById('sync-progress-banner'),
   syncStatusTitle: document.getElementById('sync-status-title'),
   syncStatusSubtitle: document.getElementById('sync-status-subtitle'),
   syncProgressBarFill: document.getElementById('sync-progress-bar-fill'),
   btnOpenLogs: document.getElementById('btn-open-logs'),
+  logsFileSelect: document.getElementById('logs-file-select'),
   logsFilter: document.getElementById('logs-filter'),
+  logsRetentionPill: document.getElementById('logs-retention-pill'),
+  btnRotateLogs: document.getElementById('btn-rotate-logs'),
   btnRefreshLogs: document.getElementById('btn-refresh-logs'),
   btnDownloadLogs: document.getElementById('btn-download-logs'),
   btnClearLogs: document.getElementById('btn-clear-logs'),
   logsEntriesList: document.getElementById('logs-entries-list'),
   logsFilePath: document.getElementById('logs-file-path'),
+  logsStorageInfo: document.getElementById('logs-storage-info'),
   logsEntryCount: document.getElementById('logs-entry-count'),
 };
 
@@ -587,6 +598,10 @@ function initEventListeners() {
     });
   }
   if (el.logsFilter) el.logsFilter.addEventListener('change', () => renderLogs(cachedLogs));
+  if (el.logsFileSelect) el.logsFileSelect.addEventListener('change', handleLogFileSelectChange);
+  if (el.btnRotateLogs) el.btnRotateLogs.addEventListener('click', handleRotateLogs);
+  if (el.btnManualRotateSettings) el.btnManualRotateSettings.addEventListener('click', handleRotateLogs);
+  if (el.btnSaveLogRetention) el.btnSaveLogRetention.addEventListener('click', handleSaveLogRetention);
   if (el.btnRefreshLogs) el.btnRefreshLogs.addEventListener('click', loadLogs);
   if (el.btnDownloadLogs) el.btnDownloadLogs.addEventListener('click', handleDownloadLogs);
   if (el.btnClearLogs) el.btnClearLogs.addEventListener('click', handleClearLogs);
@@ -1906,6 +1921,11 @@ async function loadSettings() {
     if (data.default_export_dir) {
       state.defaultExportDir = data.default_export_dir;
     }
+    if (el.settingsLogRetention) {
+      el.settingsLogRetention.value = data.log_retention_days !== null && data.log_retention_days !== undefined
+        ? data.log_retention_days
+        : 30;
+    }
     if (data.version) {
       const vStr = `v${data.version}`;
       const headerV = document.getElementById('header-app-version');
@@ -2239,6 +2259,14 @@ async function checkSyncProgress() {
 
 // Event Logs Functions
 let cachedLogs = [];
+let cachedLogFiles = [];
+
+function formatLogBytes(bytes) {
+  if (!bytes || bytes === 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
 
 async function loadLogs() {
   try {
@@ -2246,14 +2274,143 @@ async function loadLogs() {
     if (!res.ok) return;
     const data = await res.json();
     cachedLogs = data.logs || [];
+    cachedLogFiles = data.files || [];
 
     if (el.logsFilePath) {
       el.logsFilePath.textContent = data.path || '';
     }
 
+    if (el.logsStorageInfo) {
+      el.logsStorageInfo.textContent = `${data.total_files || 1} file(s) • ${formatLogBytes(data.total_size_bytes || 0)}`;
+    }
+
+    if (el.settingsLogStats) {
+      el.settingsLogStats.textContent = `${data.total_files || 1} file(s) totaling ${formatLogBytes(data.total_size_bytes || 0)}`;
+    }
+
+    if (el.logsRetentionPill) {
+      const days = data.log_retention_days;
+      if (days && days > 0) {
+        el.logsRetentionPill.textContent = `Retention: ${days}d`;
+      } else {
+        el.logsRetentionPill.textContent = 'Retention: Forever';
+      }
+    }
+
+    if (el.settingsLogRetention && data.log_retention_days !== undefined) {
+      el.settingsLogRetention.value = data.log_retention_days !== null ? data.log_retention_days : 0;
+    }
+
+    // Populate file select
+    if (el.logsFileSelect) {
+      const currentSelected = el.logsFileSelect.value;
+      let optionsHtml = '<option value="">Active (events.log)</option>';
+      if (cachedLogFiles && cachedLogFiles.length > 0) {
+        cachedLogFiles.forEach(f => {
+          if (!f.is_active) {
+            optionsHtml += `<option value="${escapeHtml(f.name)}">${escapeHtml(f.name)} (${formatLogBytes(f.size_bytes)})</option>`;
+          }
+        });
+      }
+      el.logsFileSelect.innerHTML = optionsHtml;
+      if (currentSelected) {
+        el.logsFileSelect.value = currentSelected;
+      }
+    }
+
     renderLogs(cachedLogs);
   } catch (err) {
     console.error('Failed to load logs:', err);
+  }
+}
+
+async function handleLogFileSelectChange() {
+  if (!el.logsFileSelect) return;
+  const selectedFile = el.logsFileSelect.value;
+  if (!selectedFile) {
+    // Back to active log
+    await loadLogs();
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/logs/download?file=${encodeURIComponent(selectedFile)}`);
+    if (!res.ok) {
+      showToast('Failed to load selected log file');
+      return;
+    }
+    const rawText = await res.text();
+    const lines = rawText.split('\n');
+    const parsed = [];
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith('[')) continue;
+      const tsEnd = trimmed.indexOf(']');
+      if (tsEnd === -1) continue;
+      const tsStr = trimmed.slice(1, tsEnd);
+      const afterTs = trimmed.slice(tsEnd + 1).trimStart();
+      if (!afterTs.startsWith('[')) continue;
+      const typeEnd = afterTs.indexOf(']');
+      if (typeEnd === -1) continue;
+      const eventType = afterTs.slice(1, typeEnd);
+      const details = afterTs.slice(typeEnd + 1).trim();
+      parsed.push({
+        timestamp: new Date(tsStr).toISOString(),
+        event_type: eventType,
+        details: details,
+      });
+    }
+    parsed.reverse();
+    renderLogs(parsed);
+  } catch (err) {
+    console.error('Failed to load log file entries:', err);
+  }
+}
+
+async function handleRotateLogs() {
+  try {
+    const res = await fetch('/api/logs/rotate', { method: 'POST' });
+    const data = await res.json();
+    if (res.ok && data.success) {
+      if (data.rotated) {
+        let msg = `Log rotated to ${data.rotated_filename || 'daily archive'}! 🔄`;
+        if (data.pruned_files && data.pruned_files.length > 0) {
+          msg += ` (${data.pruned_files.length} expired file(s) pruned)`;
+        }
+        showToast(msg);
+      } else {
+        showToast('Active log was empty or already rotated ℹ️');
+      }
+      await loadLogs();
+      await loadSettings();
+    } else {
+      showToast('Failed to rotate log file');
+    }
+  } catch (err) {
+    showToast(`Error rotating log: ${err.message}`);
+  }
+}
+
+async function handleSaveLogRetention() {
+  if (!el.settingsLogRetention) return;
+  const days = parseInt(el.settingsLogRetention.value, 10);
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        log_retention_days: days,
+      }),
+    });
+    if (res.ok) {
+      showToast(days > 0 ? `Log retention policy set to ${days} days! 📜` : 'Log retention set to Keep Forever! 📜');
+      await loadSettings();
+      await loadLogs();
+    } else {
+      showToast('Failed to save log retention policy');
+    }
+  } catch (err) {
+    showToast(`Error: ${err.message}`);
   }
 }
 
@@ -2288,6 +2445,7 @@ function renderLogs(logs) {
     else if (type.includes('SUCCESS')) tagClass = 'tag-success';
     else if (type.includes('ERROR') || type.includes('FAIL')) tagClass = 'tag-error';
     else if (type.startsWith('SYNC')) tagClass = 'tag-sync';
+    else if (type.includes('ROTATION') || type.includes('RETENTION')) tagClass = 'tag-rotation';
 
     const timeStr = new Date(item.timestamp).toLocaleTimeString();
     const dateStr = new Date(item.timestamp).toLocaleDateString();
@@ -2303,7 +2461,12 @@ function renderLogs(logs) {
 }
 
 function handleDownloadLogs() {
-  window.open('/api/logs/download', '_blank');
+  const selected = el.logsFileSelect ? el.logsFileSelect.value : '';
+  if (selected) {
+    window.open(`/api/logs/download?file=${encodeURIComponent(selected)}`, '_blank');
+  } else {
+    window.open('/api/logs/download', '_blank');
+  }
 }
 
 async function handleClearLogs() {

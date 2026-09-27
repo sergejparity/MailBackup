@@ -1633,6 +1633,11 @@ input[type="date"]::-webkit-calendar-picker-indicator {
   color: #fbbf24;
 }
 
+.log-badge.tag-rotation {
+  background: rgba(14, 165, 233, 0.15);
+  color: #38bdf8;
+}
+
 .log-msg {
   color: #E2E8F0;
   word-break: break-word;

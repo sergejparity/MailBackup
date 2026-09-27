@@ -194,6 +194,52 @@ impl BackupScheduler {
                 Error::Other(format!("Failed to add job to scheduler: {}", e))
             })?;
         }
+
+        // Register daily log rotation and retention maintenance job (runs daily at midnight)
+        let log_retention = self.config.settings.log_retention_days;
+        let daily_cron = normalize_cron("0 0 * * *");
+        let log_rotation_job = Job::new_async(&daily_cron, move |_uuid, _lock| {
+            Box::pin(async move {
+                info!("Running scheduled daily log rotation and retention maintenance");
+                match crate::event_log::rotate_and_prune_logs(log_retention) {
+                    Ok(report) => {
+                        if report.rotated {
+                            let rotated_name = report.rotated_filename.as_deref().unwrap_or("events-daily.log");
+                            let details = if !report.pruned_files.is_empty() {
+                                let mb = (report.reclaimed_bytes as f64) / (1024.0 * 1024.0);
+                                format!(
+                                    "Rotated to {}; pruned {} expired log file(s) ({:.2} MB reclaimed)",
+                                    rotated_name,
+                                    report.pruned_files.len(),
+                                    mb
+                                )
+                            } else {
+                                format!("Rotated active log to {}", rotated_name)
+                            };
+                            crate::event_log::log_event("LOG_ROTATION", &details);
+                        } else if !report.pruned_files.is_empty() {
+                            let mb = (report.reclaimed_bytes as f64) / (1024.0 * 1024.0);
+                            crate::event_log::log_event(
+                                "LOG_RETENTION",
+                                &format!(
+                                    "Pruned {} expired log file(s) ({:.2} MB reclaimed)",
+                                    report.pruned_files.len(),
+                                    mb
+                                ),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Daily log rotation maintenance error: {}", e);
+                    }
+                }
+            })
+        }).map_err(|e| Error::Other(format!("Failed to register daily log rotation job: {}", e)))?;
+
+        self.scheduler.add(log_rotation_job).await.map_err(|e| {
+            Error::Other(format!("Failed to add log rotation job to scheduler: {}", e))
+        })?;
+
         Ok(())
     }
 

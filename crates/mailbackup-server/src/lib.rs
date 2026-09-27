@@ -88,6 +88,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/logs", get(api_get_logs))
         .route("/api/logs/download", get(api_download_logs))
         .route("/api/logs/clear", post(api_clear_logs))
+        .route("/api/logs/rotate", post(api_rotate_logs))
+        .route("/api/logs/files", get(api_list_log_files))
         .route("/*file", get(serve_static))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -1227,6 +1229,7 @@ pub struct SettingsResponse {
     pub close_to_tray: bool,
     pub autostart: bool,
     pub run_as_service: bool,
+    pub log_retention_days: Option<u32>,
     pub service_status: mailbackup_core::service::ServiceStatus,
     pub default_export_dir: String,
     pub version: String,
@@ -1250,6 +1253,7 @@ async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
         close_to_tray: cfg.settings.close_to_tray,
         autostart: cfg.settings.autostart,
         run_as_service: cfg.settings.run_as_service,
+        log_retention_days: cfg.settings.log_retention_days,
         service_status: mailbackup_core::service::get_service_status(),
         default_export_dir: mailbackup_core::config::default_export_dir().to_string_lossy().to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1266,6 +1270,7 @@ pub struct UpdateSettingsPayload {
     pub close_to_tray: Option<bool>,
     pub autostart: Option<bool>,
     pub run_as_service: Option<bool>,
+    pub log_retention_days: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -1277,6 +1282,7 @@ pub struct UpdateSettingsResponse {
     pub close_to_tray: bool,
     pub autostart: bool,
     pub run_as_service: bool,
+    pub log_retention_days: Option<u32>,
     pub service_status: mailbackup_core::service::ServiceStatus,
     pub message: String,
 }
@@ -1365,6 +1371,7 @@ async fn api_update_settings(
     let current_close_to_tray;
     let current_autostart;
     let current_run_as_service;
+    let current_log_retention;
 
     // 3. Update config and save to disk
     {
@@ -1411,6 +1418,18 @@ async fn api_update_settings(
             );
         }
 
+        if let Some(log_retention) = payload.log_retention_days {
+            cfg.settings.log_retention_days = if log_retention == 0 { None } else { Some(log_retention) };
+            let _ = mailbackup_core::event_log::prune_logs(cfg.settings.log_retention_days);
+            mailbackup_core::event_log::log_event(
+                "SETTINGS_UPDATED",
+                &format!(
+                    "Log retention policy set to {}",
+                    cfg.settings.log_retention_days.map(|d| format!("{} days", d)).unwrap_or_else(|| "Forever".to_string())
+                ),
+            );
+        }
+
         if let Err(e) = cfg.save(&state.config_path) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1424,6 +1443,7 @@ async fn api_update_settings(
         current_close_to_tray = cfg.settings.close_to_tray;
         current_autostart = cfg.settings.autostart;
         current_run_as_service = cfg.settings.run_as_service;
+        current_log_retention = cfg.settings.log_retention_days;
     }
 
     // 4. If storage or db location changed, reload scheduler
@@ -1454,6 +1474,7 @@ async fn api_update_settings(
         close_to_tray: current_close_to_tray,
         autostart: current_autostart,
         run_as_service: current_run_as_service,
+        log_retention_days: current_log_retention,
         service_status: mailbackup_core::service::get_service_status(),
         message: messages.join(" "),
     })
@@ -1530,25 +1551,94 @@ pub struct LogsResponse {
     pub logs: Vec<mailbackup_core::event_log::LogEntry>,
     pub raw: String,
     pub path: String,
+    pub log_retention_days: Option<u32>,
+    pub total_files: usize,
+    pub total_size_bytes: u64,
+    pub files: Vec<mailbackup_core::event_log::LogFileInfo>,
 }
 
-async fn api_get_logs() -> impl IntoResponse {
+#[derive(Deserialize)]
+pub struct DownloadLogQuery {
+    pub file: Option<String>,
+}
+
+async fn api_get_logs(State(state): State<AppState>) -> impl IntoResponse {
     let logs = mailbackup_core::event_log::get_recent_logs(200).unwrap_or_default();
     let raw = mailbackup_core::event_log::get_raw_log().unwrap_or_default();
     let path = mailbackup_core::event_log::log_file_path().to_string_lossy().to_string();
-    Json(LogsResponse { logs, raw, path }).into_response()
+    let files = mailbackup_core::event_log::list_log_files().unwrap_or_default();
+    let total_files = files.len();
+    let total_size_bytes = files.iter().map(|f| f.size_bytes).sum();
+    let log_retention_days = {
+        let cfg = state.config.read().await;
+        cfg.settings.log_retention_days
+    };
+
+    Json(LogsResponse {
+        logs,
+        raw,
+        path,
+        log_retention_days,
+        total_files,
+        total_size_bytes,
+        files,
+    }).into_response()
 }
 
-async fn api_download_logs() -> impl IntoResponse {
-    let raw = mailbackup_core::event_log::get_raw_log().unwrap_or_default();
+async fn api_list_log_files() -> impl IntoResponse {
+    let files = mailbackup_core::event_log::list_log_files().unwrap_or_default();
+    Json(files).into_response()
+}
+
+async fn api_download_logs(Query(query): Query<DownloadLogQuery>) -> impl IntoResponse {
+    let (filename, content) = if let Some(ref name) = query.file {
+        match mailbackup_core::event_log::get_log_file_content(name) {
+            Ok(c) => (name.clone(), c),
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("Invalid log file: {}", e)).into_response();
+            }
+        }
+    } else {
+        ("mailbackup-events.log".to_string(), mailbackup_core::event_log::get_raw_log().unwrap_or_default())
+    };
+
     Response::builder()
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(
             header::CONTENT_DISPOSITION,
-            "attachment; filename=\"mailbackup-events.log\"",
+            format!("attachment; filename=\"{}\"", filename),
         )
-        .body(Body::from(raw))
+        .body(Body::from(content))
         .unwrap()
+        .into_response()
+}
+
+async fn api_rotate_logs(State(state): State<AppState>) -> impl IntoResponse {
+    let retention = {
+        let cfg = state.config.read().await;
+        cfg.settings.log_retention_days
+    };
+    match mailbackup_core::event_log::rotate_and_prune_logs(retention) {
+        Ok(report) => {
+            if report.rotated {
+                let name = report.rotated_filename.as_deref().unwrap_or("events-daily.log");
+                mailbackup_core::event_log::log_event(
+                    "LOG_ROTATION",
+                    &format!("Manual log rotation: rotated to {}", name),
+                );
+            }
+            Json(serde_json::json!({
+                "success": true,
+                "rotated": report.rotated,
+                "rotated_filename": report.rotated_filename,
+                "pruned_files": report.pruned_files,
+                "reclaimed_bytes": report.reclaimed_bytes,
+            })).into_response()
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to rotate logs: {}", e)).into_response()
+        }
+    }
 }
 
 async fn api_clear_logs() -> impl IntoResponse {

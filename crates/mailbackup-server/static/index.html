@@ -720,6 +720,57 @@
               </form>
             </div>
 
+            <!-- Log File Rotation & Retention Policy -->
+            <div class="settings-card" style="margin-top: 14px;">
+              <div class="settings-header">
+                <div>
+                  <h3>Log Rotation & Retention</h3>
+                  <p class="settings-desc">Configure automated daily log file rotation and retention period.</p>
+                </div>
+              </div>
+              <div style="margin-top: 14px; display: flex; flex-direction: column; gap: 14px;">
+                <div class="form-group">
+                  <label for="settings-log-retention">Log Retention Period</label>
+                  <select id="settings-log-retention" class="form-input">
+                    <option value="7">7 Days</option>
+                    <option value="14">14 Days</option>
+                    <option value="30" selected>30 Days (Default)</option>
+                    <option value="60">60 Days</option>
+                    <option value="90">90 Days</option>
+                    <option value="180">180 Days (6 Months)</option>
+                    <option value="365">365 Days (1 Year)</option>
+                    <option value="0">Keep Forever (Disabled)</option>
+                  </select>
+                  <small class="form-hint">
+                    Active event logs are automatically rotated on a daily basis (<code>events-YYYY-MM-DD.log</code>). Rotated logs older than this period are pruned automatically at midnight and during startup.
+                  </small>
+                </div>
+
+                <div class="settings-info-box">
+                  <div class="info-row">
+                    <span class="info-label">Active Log File:</span>
+                    <span class="info-val" id="settings-active-log-file">events.log</span>
+                  </div>
+                  <div class="info-row">
+                    <span class="info-label">Total Log Archives:</span>
+                    <span class="info-val" id="settings-log-stats">Loading...</span>
+                  </div>
+                </div>
+
+                <div class="form-actions" style="justify-content: space-between; align-items: center; margin-top: 4px;">
+                  <button type="button" id="btn-manual-rotate-settings" class="btn btn-secondary btn-sm" title="Manually rotate active events.log now">
+                    <svg class="btn-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                    </svg>
+                    Rotate Active Log Now
+                  </button>
+                  <button type="button" id="btn-save-log-retention" class="btn btn-primary btn-sm">
+                    Save Retention Policy
+                  </button>
+                </div>
+              </div>
+            </div>
+
             <!-- Application & Build Info -->
             <div class="settings-card" style="margin-top: 14px;">
               <div class="settings-header">
@@ -750,8 +801,13 @@
           <div id="tab-logs" class="tab-content">
             <div class="settings-card">
               <div class="logs-toolbar">
-                <div class="logs-filter-group">
-                  <label for="logs-filter">Event Filter:</label>
+                <div class="logs-filter-group" style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                  <label for="logs-file-select" style="font-size: 0.82rem; font-weight: 500;">Log File:</label>
+                  <select id="logs-file-select" class="form-input" style="width: auto; padding: 4px 10px; font-size: 0.82rem; max-width: 220px;">
+                    <option value="">Active (events.log)</option>
+                  </select>
+
+                  <label for="logs-filter" style="font-size: 0.82rem; font-weight: 500; margin-left: 6px;">Filter:</label>
                   <select id="logs-filter" class="form-input" style="width: auto; padding: 4px 10px; font-size: 0.82rem;">
                     <option value="ALL">All Events</option>
                     <option value="ACCOUNT">Account Events</option>
@@ -759,15 +815,23 @@
                     <option value="STORAGE">Storage & Database</option>
                     <option value="ERROR">Errors Only</option>
                   </select>
+
+                  <span id="logs-retention-pill" class="badge" style="background: rgba(56, 189, 248, 0.15); color: #38bdf8; font-size: 0.72rem; padding: 3px 8px; border-radius: 9999px; margin-left: 4px;" title="Configured log retention period">Retention: 30d</span>
                 </div>
                 <div class="logs-actions">
+                  <button type="button" id="btn-rotate-logs" class="btn btn-secondary btn-sm" title="Rotate active log file now into daily archive">
+                    <svg class="btn-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                    </svg>
+                    Rotate Log
+                  </button>
                   <button type="button" id="btn-refresh-logs" class="btn btn-secondary btn-sm" title="Refresh Logs">
                     <svg class="btn-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                       <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
                     </svg>
                     Refresh
                   </button>
-                  <button type="button" id="btn-download-logs" class="btn btn-secondary btn-sm" title="Download Log File">
+                  <button type="button" id="btn-download-logs" class="btn btn-secondary btn-sm" title="Download Selected Log File">
                     <svg class="btn-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
                       <polyline points="7 10 12 15 17 10"></polyline>
@@ -791,6 +855,7 @@
               </div>
               <div class="logs-footer">
                 <span id="logs-file-path" class="logs-filepath">Loading log path...</span>
+                <span id="logs-storage-info" style="color: var(--text-secondary); font-size: 0.76rem;"></span>
                 <span id="logs-entry-count" class="logs-counter">0 events</span>
               </div>
             </div>

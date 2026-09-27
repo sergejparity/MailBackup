@@ -109,6 +109,8 @@ pub struct GlobalSettings {
     pub autostart: bool,
     #[serde(default)]
     pub run_as_service: bool,
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: Option<u32>,
 }
 
 fn default_schedule() -> String {
@@ -116,6 +118,9 @@ fn default_schedule() -> String {
 }
 fn default_server_port() -> u16 {
     8765
+}
+fn default_log_retention_days() -> Option<u32> {
+    Some(30) // Default 30 days log retention
 }
 
 impl Default for GlobalSettings {
@@ -130,6 +135,7 @@ impl Default for GlobalSettings {
             close_to_tray: true,
             autostart: false,
             run_as_service: false,
+            log_retention_days: default_log_retention_days(),
         }
     }
 }
