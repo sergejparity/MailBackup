@@ -27,12 +27,16 @@ async fn main() -> Result<()> {
                     config_path = Some(PathBuf::from(val));
                 }
             }
+            "--service" | "--headless" => {
+                // Already headless
+            }
             "--help" | "-h" => {
                 println!("MailBackup Studio Headless Server");
                 println!();
                 println!("Usage: mailbackup-server [OPTIONS]");
                 println!();
                 println!("Options:");
+                println!("  --service, --headless    Run in headless background service mode");
                 println!("  -p, --port <PORT>        Override HTTP/REST API web port (default: 8765)");
                 println!("  -c, --config <PATH>      Path to config.yaml configuration file");
                 println!("  -h, --help               Display this help message");

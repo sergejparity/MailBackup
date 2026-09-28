@@ -108,7 +108,14 @@ pub async fn start_server_with_options(
     let config = AppConfig::load_or_create(Some(&config_path))?;
     let db = Database::open(&config.db_path)?;
     let storage = StorageEngine::new(&config.data_dir);
-    let credentials = Arc::new(CredentialStore::new());
+    let credentials = if let Some(parent) = config_path.parent() {
+        Arc::new(CredentialStore::with_paths(
+            parent.join(".credentials_store.json"),
+            parent.join(".credentials_key"),
+        ))
+    } else {
+        Arc::new(CredentialStore::new())
+    };
     let port = port_override.unwrap_or(config.settings.web_port);
 
     let config_arc = Arc::new(RwLock::new(config.clone()));

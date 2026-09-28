@@ -84,7 +84,7 @@ pub fn get_manual_install_command(server_exe: &Path, config_path: &Path) -> Stri
     #[cfg(target_os = "windows")]
     {
         format!(
-            "schtasks /Create /TN \"{}\" /TR \"\\\"{}\\\" --config \\\"{}\\\"\" /SC ONSTART /RU SYSTEM /RL HIGHEST /F\nschtasks /Run /TN \"{}\"",
+            "schtasks /Create /TN \"{}\" /TR \"\\\"{}\\\" --service --config \\\"{}\\\"\" /SC ONSTART /RU SYSTEM /RL HIGHEST /F\nschtasks /Run /TN \"{}\"",
             SERVICE_TASK_NAME,
             server_exe.display(),
             config_path.display(),
@@ -105,7 +105,7 @@ pub fn get_manual_install_command(server_exe: &Path, config_path: &Path) -> Stri
 
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
-        format!("{} --config {}", server_exe.display(), config_path.display())
+        format!("{} --service --config {}", server_exe.display(), config_path.display())
     }
 }
 
@@ -279,6 +279,7 @@ pub fn generate_macos_plist(server_exe: &Path, config_path: &Path) -> String {
     <key>ProgramArguments</key>
     <array>
         <string>{}</string>
+        <string>--service</string>
         <string>--config</string>
         <string>{}</string>
     </array>
@@ -313,7 +314,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart="{}" --config "{}"
+ExecStart="{}" --service --config "{}"
 Restart=always
 RestartSec=10
 StandardOutput=append:{}
@@ -426,7 +427,7 @@ pub fn set_service_enabled(enabled: bool) -> Result<()> {
     {
         if enabled {
             // Attempt to create scheduled task
-            let tr_arg = format!("\"{}\" --config \"{}\"", server_exe.display(), config_path.display());
+            let tr_arg = format!("\"{}\" --service --config \"{}\"", server_exe.display(), config_path.display());
             let status = Command::new("schtasks")
                 .args([
                     "/Create",
@@ -448,7 +449,7 @@ pub fn set_service_enabled(enabled: bool) -> Result<()> {
             if !success {
                 // Attempt elevation via PowerShell Start-Process
                 let ps_cmd = format!(
-                    "Start-Process schtasks -ArgumentList '/Create /TN \"{}\" /TR \"\\\"{}\\\" --config \\\"{}\\\"\" /SC ONSTART /RU SYSTEM /RL HIGHEST /F' -Verb RunAs -Wait",
+                    "Start-Process schtasks -ArgumentList '/Create /TN \"{}\" /TR \"\\\"{}\\\" --service --config \\\"{}\\\"\" /SC ONSTART /RU SYSTEM /RL HIGHEST /F' -Verb RunAs -Wait",
                     SERVICE_TASK_NAME,
                     server_exe.display(),
                     config_path.display()

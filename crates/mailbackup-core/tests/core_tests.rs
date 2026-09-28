@@ -587,6 +587,7 @@ fn test_service_status_and_config() {
     let exe = find_server_executable();
     let cmd = get_manual_install_command(&exe, Path::new("/custom/config.yaml"));
     assert!(cmd.contains("config.yaml"));
+    assert!(cmd.contains("--service"));
 
     let uninst = get_manual_uninstall_command();
     assert!(!uninst.is_empty());
