@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 #[allow(dead_code)]
 const APP_NAME: &str = "MailBackup Studio";
+#[allow(dead_code)]
 const APP_IDENTIFIER: &str = "com.mailbackup.studio";
 
 pub fn is_autostart_supported() -> bool {

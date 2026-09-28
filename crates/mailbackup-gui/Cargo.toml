@@ -18,6 +18,7 @@ tokio.workspace = true
 anyhow.workspace = true
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+dirs = { workspace = true }
 
 [features]
 # this feature is used for production builds or when `distDir` points to the filesystem
