@@ -902,3 +902,43 @@ fn test_log_rotation_and_retention_policy() {
 
 
 
+
+#[test]
+fn test_search_snippet_escapes_html_from_email() {
+    let db = Database::open_in_memory().unwrap();
+    db.upsert_account("acc1", "Alice", "alice@example.com", "generic_imap").unwrap();
+    let folder = db.get_or_create_folder("acc1", "INBOX", "inbox", Some(1)).unwrap();
+
+    db.insert_message(
+        "acc1",
+        &folder.id,
+        1,
+        None,
+        Some("Invoice <img src=x onerror=alert(1)>"),
+        Some("attacker@example.com"),
+        Some("alice@example.com"),
+        None,
+        Some(Utc::now()),
+        100,
+        "acc1/inbox/2026/10/1_hash.eml",
+        "hash",
+        Some("Please pay the invoice <script>fetch('/api/accounts')</script> & \"thanks\""),
+        &[("<svg onload=alert(1)>.pdf", "application/pdf", 10)],
+    )
+    .unwrap();
+
+    for query in ["invoice", "svg", "script"] {
+        let results = db.search_fts(query, 10).unwrap();
+        assert_eq!(results.len(), 1, "query {query}");
+        let snippet = &results[0].snippet;
+        assert!(snippet.contains("<b>"), "highlight kept for {query}: {snippet}");
+        let without_highlight = snippet.replace("<b>", "").replace("</b>", "");
+        assert!(!without_highlight.contains('<'), "unescaped markup for {query}: {snippet}");
+        assert!(!without_highlight.contains('>'), "unescaped markup for {query}: {snippet}");
+    }
+
+    assert_eq!(
+        mailbackup_core::db::snippet_to_html("a \u{2}<b>&\u{3} \"q\" 'x'\u{1b}[31m"),
+        "a <b>&lt;b&gt;&amp;</b> &quot;q&quot; &#39;x&#39;[31m"
+    );
+}

@@ -83,6 +83,30 @@ cargo run -p mailbackup-server
 
 Open your browser at `http://127.0.0.1:8765` to access the full offline email browser, attachment previewer, and account manager.
 
+**API access:** the server listens on `127.0.0.1` only. Every `/api/*` request must carry a random per-process token, which the server embeds in the page it serves, so other websites and DNS-rebinding attacks can't call the API. The token changes whenever the server restarts, so reload open browser tabs after a restart.
+
+Network settings in `config.yaml`:
+
+```yaml
+settings:
+  web_port: 8765
+  # Interface to listen on. Default: 127.0.0.1 (this computer only).
+  # Use 0.0.0.0 to reach the Web Studio from other devices or from outside a
+  # container. Anyone who can reach the port still needs the token, which they
+  # can only get by loading the page, so only do this on networks you trust.
+  bind_address: 127.0.0.1
+  # Host names (besides IP addresses and localhost) the UI may be opened by,
+  # e.g. the domain of a reverse proxy in front of the server. Only list
+  # names you control.
+  allowed_hosts: []
+```
+
+**Upgrading from 0.2.4 or earlier:** older versions listened on all interfaces (`0.0.0.0`) and accepted API calls from anywhere without a token.
+- The desktop app, the Windows/macOS/Linux background service and local browser access are unaffected, because they all use `127.0.0.1`.
+- If you opened the Web Studio from another device, or run it in a container with a published port, set `bind_address: 0.0.0.0`.
+- If you use a reverse proxy with its own domain name, add that name to `allowed_hosts`. The proxy must pass the `X-MailBackup-Token` header through.
+- Scripts that called `/api/*` directly now need the token. It's printed nowhere and changes on every start, so the API is meant to be used through the web UI only.
+
 ### 4. Running the Desktop GUI
 
 ```bash

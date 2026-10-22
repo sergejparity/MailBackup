@@ -606,7 +606,17 @@ fn handle_search(db: &Database, args: SearchArgs) -> Result<()> {
         println!("{}. [{}] {}", idx + 1, style(&date_str).dim(), style(&item.subject).bold());
         println!("   From:   {}", item.from_addr);
         println!("   Folder: {} (Account: {})", item.folder_name, item.account_id);
-        println!("   Match:  {}", item.snippet.replace("<b>", "\x1b[1;33m").replace("</b>", "\x1b[0m"));
+        // The snippet is safe HTML (escaped text + <b> highlights); render it for the terminal.
+        let snippet = item
+            .snippet
+            .replace("<b>", "\x1b[1;33m")
+            .replace("</b>", "\x1b[0m")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&");
+        println!("   Match:  {}", snippet);
         println!("   File:   {}", item.relative_path);
         println!();
     }

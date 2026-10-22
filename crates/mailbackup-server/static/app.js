@@ -1,4 +1,38 @@
 // MailBackup Studio Web Application
+
+// API authentication: the server injects a per-process token into index.html.
+// Every same-origin /api/ request must present it; plain links carry it as ?token=.
+const API_TOKEN = document.querySelector('meta[name="mailbackup-api-token"]')?.content || '';
+
+function isApiUrl(url) {
+  try {
+    const u = new URL(url, window.location.origin);
+    return u.origin === window.location.origin && u.pathname.startsWith('/api/');
+  } catch (e) {
+    return false;
+  }
+}
+
+function withApiToken(url) {
+  if (!isApiUrl(url)) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}token=${encodeURIComponent(API_TOKEN)}`;
+}
+
+const nativeFetch = window.fetch.bind(window);
+window.fetch = (input, init = {}) => {
+  const url = typeof input === 'string' ? input : input.url;
+  if (!isApiUrl(url)) return nativeFetch(input, init);
+  const headers = new Headers(init.headers || (typeof input === 'string' ? undefined : input.headers));
+  headers.set('X-MailBackup-Token', API_TOKEN);
+  return nativeFetch(input, { ...init, headers });
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('a[data-api-link]').forEach(a => {
+    a.href = withApiToken(a.getAttribute('href'));
+  });
+});
 let state = {
   accounts: [],
   expandedAccounts: new Set(),
@@ -814,7 +848,7 @@ function initEventListeners() {
   // Download raw .eml button
   el.btnDownloadRawEml.addEventListener('click', () => {
     if (state.selectedMessageId) {
-      window.open(`/api/messages/${state.selectedMessageId}/download`, '_blank');
+      window.open(withApiToken(`/api/messages/${state.selectedMessageId}/download`), '_blank');
     }
   });
 
@@ -1016,10 +1050,13 @@ function renderModalAccounts() {
         </div>
       </div>
       <div style="display: flex; gap: 8px;">
-        <button class="btn btn-sm btn-secondary" onclick="openEditAccount('${acc.id}')">Edit</button>
-        <button class="btn btn-sm btn-ghost" style="color: var(--accent-rose);" onclick="deleteAccount('${acc.id}')">Remove</button>
+        <button class="btn btn-sm btn-secondary" data-action="edit">Edit</button>
+        <button class="btn btn-sm btn-ghost" style="color: var(--accent-rose);" data-action="remove">Remove</button>
       </div>
     `;
+    // Bound here rather than via inline onclick attributes, which the Content-Security-Policy blocks.
+    row.querySelector('[data-action="edit"]').addEventListener('click', () => openEditAccount(acc.id));
+    row.querySelector('[data-action="remove"]').addEventListener('click', () => deleteAccount(acc.id));
     el.modalAccountsList.appendChild(row);
   });
 }
@@ -1991,7 +2028,7 @@ function handleDownloadMboxBrowser() {
   const folderId = el.exportFolderSelect.value;
   showToast('Preparing .mbox archive download in browser... 📦');
   const a = document.createElement('a');
-  a.href = `/api/export/mbox/download?account_id=${encodeURIComponent(accountId)}&folder_id=${encodeURIComponent(folderId)}`;
+  a.href = withApiToken(`/api/export/mbox/download?account_id=${encodeURIComponent(accountId)}&folder_id=${encodeURIComponent(folderId)}`);
   a.download = '';
   document.body.appendChild(a);
   a.click();
@@ -2582,9 +2619,9 @@ function renderLogs(logs) {
 function handleDownloadLogs() {
   const selected = el.logsFileSelect ? el.logsFileSelect.value : '';
   if (selected) {
-    window.open(`/api/logs/download?file=${encodeURIComponent(selected)}`, '_blank');
+    window.open(withApiToken(`/api/logs/download?file=${encodeURIComponent(selected)}`), '_blank');
   } else {
-    window.open('/api/logs/download', '_blank');
+    window.open(withApiToken('/api/logs/download'), '_blank');
   }
 }
 
