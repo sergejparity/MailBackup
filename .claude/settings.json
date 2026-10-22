@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Google_Drive__create_file"
+    ]
+  }
+}
