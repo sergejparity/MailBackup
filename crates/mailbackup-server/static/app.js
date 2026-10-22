@@ -2236,7 +2236,12 @@ function updateServiceBadge(status, configured) {
       : status.manual_install_cmd;
   }
 
-  if (status.installed && status.running) {
+  if (status.installed && status.needs_reinstall) {
+    // Installed by an older version with administrator rights; toggling off/on reinstalls it as the user.
+    el.serviceSettingStatus.textContent = 'Admin rights: reinstall';
+    el.serviceSettingStatus.style.background = 'rgba(239, 68, 68, 0.15)';
+    el.serviceSettingStatus.style.color = '#f87171';
+  } else if (status.installed && status.running) {
     el.serviceSettingStatus.textContent = 'Active (Running)';
     el.serviceSettingStatus.style.background = 'rgba(34, 197, 94, 0.15)';
     el.serviceSettingStatus.style.color = '#4ade80';
