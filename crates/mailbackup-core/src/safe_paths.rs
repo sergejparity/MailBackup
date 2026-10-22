@@ -12,6 +12,13 @@ use std::path::{Component, Path, PathBuf};
 
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
+/// OS metadata files that don't make a folder "non-empty".
+const IGNORABLE_FILES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
+
+/// Bounds for recognising an existing archive folder (`<account>/<folder>/<yyyy>/<mm>/*.eml`).
+const ARCHIVE_SCAN_DEPTH: usize = 5;
+const ARCHIVE_SCAN_MAX_ENTRIES: usize = 10_000;
+
 /// A set of canonicalized folders that API-supplied paths must stay inside.
 #[derive(Debug, Clone)]
 pub struct PathPolicy {
@@ -27,13 +34,11 @@ pub struct ExportTarget {
 }
 
 impl PathPolicy {
-    /// Builds a policy from candidate roots; roots that don't exist are skipped.
+    /// Builds a policy from candidate roots. Roots that don't exist yet (e.g. a
+    /// removed `~/.mailbackup`) are kept, resolved through their nearest existing
+    /// ancestor, so paths below them stay allowed.
     pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> Self {
-        let mut canonical: Vec<PathBuf> = roots
-            .into_iter()
-            .filter_map(|r| canonicalize(&r).ok())
-            .filter(|r| r.is_dir())
-            .collect();
+        let mut canonical: Vec<PathBuf> = roots.into_iter().filter_map(|r| normalize_dir(&r)).collect();
         canonical.sort();
         canonical.dedup();
         Self { roots: canonical }
@@ -111,9 +116,10 @@ impl PathPolicy {
         Ok(ExportTarget { path: target, exists })
     }
 
-    /// Validates a new archive data folder. It must be the current folder, or not
-    /// exist yet, or be an empty folder.
-    pub fn validate_data_dir(&self, path: &Path, current: &Path) -> Result<PathBuf> {
+    /// Validates a new archive data folder. It must be the current folder, not
+    /// exist yet, or be empty (ignoring OS metadata files). An existing MailBackup
+    /// archive is also accepted when it is used in place (`move_existing == false`).
+    pub fn validate_data_dir(&self, path: &Path, current: &Path, move_existing: bool) -> Result<PathBuf> {
         require_absolute(path)?;
         if same_location(path, current) {
             return Ok(current.to_path_buf());
@@ -123,11 +129,14 @@ impl PathPolicy {
             Ok(meta) if !meta.is_dir() => {
                 Err(invalid(format!("'{}' exists and is not a folder.", dir.display())))
             }
-            Ok(_) if std::fs::read_dir(&dir)?.next().is_some() => Err(invalid(format!(
-                "'{}' is not empty. Choose a new or empty folder.",
+            Ok(_) if is_effectively_empty(&dir)? => Ok(dir),
+            Ok(_) if !move_existing && looks_like_archive(&dir) => Ok(dir),
+            Ok(_) => Err(invalid(format!(
+                "'{}' is not empty. Choose a new or empty folder, or an existing MailBackup \
+                 archive with \"Move existing backup files\" unticked.",
                 dir.display()
             ))),
-            _ => Ok(dir),
+            Err(_) => Ok(dir),
         }
     }
 
@@ -157,6 +166,68 @@ impl PathPolicy {
         }
         Ok(target)
     }
+}
+
+/// Resolves a folder path to canonical form, including folders that don't exist
+/// yet (via their nearest existing ancestor). Also strips trailing separators, so
+/// `/Users/me/Downloads/` and `/Users/me/Downloads` compare equal.
+pub fn normalize_dir(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
+        return None;
+    }
+    let (existing, rest) = split_existing_ancestor(path).ok()?;
+    let canonical = canonicalize(&existing).ok()?;
+    if !canonical.is_dir() {
+        return None;
+    }
+    Some(canonical.join(rest))
+}
+
+fn is_ignorable(name: &std::ffi::OsStr) -> bool {
+    name.to_str().map(|n| IGNORABLE_FILES.contains(&n)).unwrap_or(false)
+}
+
+fn is_effectively_empty(dir: &Path) -> Result<bool> {
+    for entry in std::fs::read_dir(dir)? {
+        if !is_ignorable(&entry?.file_name()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// True if `dir` has the layout of a MailBackup data folder: only sub-folders at
+/// the top (plus OS metadata files) and at least one `.eml` file within the
+/// expected depth. The scan is bounded so a huge unrelated folder stays cheap.
+fn looks_like_archive(dir: &Path) -> bool {
+    let Ok(top) = std::fs::read_dir(dir) else { return false };
+    for entry in top.flatten() {
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir && !is_ignorable(&entry.file_name()) {
+            return false;
+        }
+    }
+
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((current, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else { continue };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > ARCHIVE_SCAN_MAX_ENTRIES {
+                return false;
+            }
+            let Ok(file_type) = entry.file_type() else { continue };
+            let path = entry.path();
+            if file_type.is_file() && has_extension(&entry.file_name().to_string_lossy(), "eml") {
+                return true;
+            }
+            if file_type.is_dir() && depth + 1 < ARCHIVE_SCAN_DEPTH {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    false
 }
 
 fn invalid(msg: String) -> Error {
@@ -332,17 +403,57 @@ mod tests {
     fn data_dir_rules() {
         let (tmp, policy, root) = setup();
         let current = root.join("current");
-        assert_eq!(policy.validate_data_dir(&current, &current).unwrap(), current);
-        assert_eq!(policy.validate_data_dir(&root.join("new"), &current).unwrap(), root.join("new"));
+        assert_eq!(policy.validate_data_dir(&current, &current, true).unwrap(), current);
+        assert_eq!(policy.validate_data_dir(&root.join("new"), &current, true).unwrap(), root.join("new"));
 
         std::fs::create_dir(root.join("empty")).unwrap();
-        assert!(policy.validate_data_dir(&root.join("empty"), &current).is_ok());
+        std::fs::write(root.join("empty/.DS_Store"), b"x").unwrap();
+        assert!(policy.validate_data_dir(&root.join("empty"), &current, true).is_ok());
 
         std::fs::create_dir(root.join("full")).unwrap();
         std::fs::write(root.join("full/file"), b"x").unwrap();
-        rejected(policy.validate_data_dir(&root.join("full"), &current));
-        rejected(policy.validate_data_dir(&tmp.path().join("outside/new"), &current));
-        rejected(policy.validate_data_dir(Path::new("relative/dir"), &current));
+        rejected(policy.validate_data_dir(&root.join("full"), &current, true));
+        rejected(policy.validate_data_dir(&root.join("full"), &current, false));
+        rejected(policy.validate_data_dir(&tmp.path().join("outside/new"), &current, true));
+        rejected(policy.validate_data_dir(Path::new("relative/dir"), &current, true));
+    }
+
+    #[test]
+    fn existing_archive_is_accepted_only_in_place() {
+        let (_tmp, policy, root) = setup();
+        let current = root.join("current");
+        let archive = root.join("archive");
+        std::fs::create_dir_all(archive.join("acc/inbox/2026/10")).unwrap();
+        std::fs::write(archive.join("acc/inbox/2026/10/1_abc.eml"), b"Subject: x").unwrap();
+        std::fs::write(archive.join(".DS_Store"), b"x").unwrap();
+
+        assert_eq!(policy.validate_data_dir(&archive, &current, false).unwrap(), archive);
+        rejected(policy.validate_data_dir(&archive, &current, true));
+
+        // Folders without any .eml files are not an archive
+        std::fs::create_dir_all(root.join("photos/2026")).unwrap();
+        std::fs::write(root.join("photos/2026/a.jpg"), b"x").unwrap();
+        rejected(policy.validate_data_dir(&root.join("photos"), &current, false));
+    }
+
+    #[test]
+    fn missing_roots_are_kept() {
+        let (tmp, _policy, root) = setup();
+        let base = root.join(".mailbackup"); // does not exist
+        let policy = PathPolicy::new([root.clone(), base.clone()]);
+        let current = tmp.path().join("elsewhere/data");
+        assert_eq!(policy.validate_data_dir(&base.join("data"), &current, true).unwrap(), base.join("data"));
+        assert!(policy.validate_db_path(&base.join("mailbackup.db"), &current, true).is_ok());
+        // ...while other hidden folders below Home stay blocked
+        rejected(policy.validate_data_dir(&root.join(".ssh/data"), &current, true));
+    }
+
+    #[test]
+    fn normalize_dir_strips_trailing_separator() {
+        let (_tmp, _policy, root) = setup();
+        let with_slash = PathBuf::from(format!("{}/", root.display()));
+        assert_eq!(normalize_dir(&with_slash).unwrap(), root);
+        assert!(normalize_dir(Path::new("relative")).is_none());
     }
 
     #[test]

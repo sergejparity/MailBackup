@@ -15,7 +15,8 @@ use mailbackup_core::imap::ImapSyncEngine;
 use mailbackup_core::keyring::CredentialStore;
 use mailbackup_core::mbox::MboxExporter;
 use mailbackup_core::retention::RetentionManager;
-use mailbackup_core::safe_paths::PathPolicy;
+use mailbackup_core::config::system_export_locations;
+use mailbackup_core::safe_paths::{normalize_dir, PathPolicy};
 use mailbackup_core::scheduler::BackupScheduler;
 use mailbackup_core::storage::StorageEngine;
 use rust_embed::RustEmbed;
@@ -1203,8 +1204,18 @@ async fn api_export_locations(State(state): State<AppState>) -> impl IntoRespons
     let default_dir = mailbackup_core::config::default_export_dir()
         .to_string_lossy()
         .to_string();
-    let approved = state.config.read().await.settings.approved_dirs.clone();
-    let locs = mailbackup_core::config::system_export_locations();
+    let locs = system_export_locations();
+    let system: Vec<PathBuf> = locs.iter().filter_map(|(_, p)| normalize_dir(p)).collect();
+    let approved: Vec<PathBuf> = state
+        .config
+        .read()
+        .await
+        .settings
+        .approved_dirs
+        .iter()
+        .filter(|p| normalize_dir(p).map(|n| !system.contains(&n)).unwrap_or(true))
+        .cloned()
+        .collect();
     let locations = locs
         .into_iter()
         .map(|(name, path)| ExportLocationItem {
@@ -1279,9 +1290,16 @@ async fn api_pick_directory(State(state): State<AppState>) -> impl IntoResponse 
         .await
         .unwrap_or(None);
 
+    // Canonical form drops the trailing slash osascript adds and resolves symlinks.
+    let res = res.map(|p| normalize_dir(&p).unwrap_or(p));
     if let Some(ref path) = res {
         let mut cfg = state.config.write().await;
-        if !cfg.settings.approved_dirs.contains(path) {
+        let already_allowed = system_export_locations()
+            .into_iter()
+            .map(|(_, p)| p)
+            .chain(cfg.settings.approved_dirs.iter().cloned())
+            .any(|p| normalize_dir(&p).as_ref() == Some(path));
+        if !already_allowed {
             cfg.settings.approved_dirs.push(path.clone());
             if let Err(e) = cfg.save(&state.config_path) {
                 error!("Failed to save approved folder {}: {}", path.display(), e);
@@ -1496,7 +1514,8 @@ async fn api_update_settings(
     let (requested_dir, requested_db) = {
         let cfg = state.config.read().await;
         let policy = PathPolicy::for_storage(&cfg);
-        let dir = non_empty(&payload.data_dir).map(|p| policy.validate_data_dir(&p, &cfg.data_dir));
+        let move_existing = payload.move_existing.unwrap_or(true);
+        let dir = non_empty(&payload.data_dir).map(|p| policy.validate_data_dir(&p, &cfg.data_dir, move_existing));
         let db = non_empty(&payload.db_path).map(|p| policy.validate_db_path(&p, &current_db, move_db));
         (dir.transpose(), db.transpose())
     };
@@ -1857,6 +1876,10 @@ mod tests {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     async fn test_router(dir: &std::path::Path) -> Router {
+        test_router_with(dir, Vec::new()).await
+    }
+
+    async fn test_router_with(dir: &std::path::Path, extra_approved: Vec<PathBuf>) -> Router {
         std::fs::create_dir_all(dir.join("exports")).unwrap();
         let mut config = AppConfig {
             data_dir: dir.join("state/data"),
@@ -1864,6 +1887,7 @@ mod tests {
             ..AppConfig::default()
         };
         config.settings.approved_dirs = vec![dir.join("exports")];
+        config.settings.approved_dirs.extend(extra_approved);
         let db = Database::open_in_memory().unwrap();
         let storage = StorageEngine::new(&config.data_dir);
         let credentials = Arc::new(CredentialStore::with_paths(
@@ -2068,6 +2092,35 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(status(&router, outside).await, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn export_locations_skip_duplicate_approved_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = system_export_locations().into_iter().find(|(n, _)| *n == "Home").unwrap().1;
+        // Home is a system location; osascript reports picked folders with a trailing slash
+        let router = test_router_with(dir.path(), vec![PathBuf::from(format!("{}/", home.display()))]).await;
+
+        let res = router
+            .clone()
+            .oneshot(
+                get("/api/export/locations", "127.0.0.1:8765")
+                    .header(API_TOKEN_HEADER, TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let home_canonical = normalize_dir(&home).unwrap();
+        let home_entries = json["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|l| normalize_dir(std::path::Path::new(l["path"].as_str().unwrap())).as_ref() == Some(&home_canonical))
+            .count();
+        assert_eq!(home_entries, 1, "{json}");
     }
 
     #[tokio::test]

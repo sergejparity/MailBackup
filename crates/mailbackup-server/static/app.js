@@ -1799,8 +1799,9 @@ async function handleBrowseExportDir() {
         if (el.exportDirInput) {
           el.exportDirInput.value = data.path;
           updateExportFullPreview();
-          renderExportLocationPills();
         }
+        // The picked folder is now approved server-side; refresh the quick picks.
+        await loadExportLocations();
       }
     }
   } catch (err) {
@@ -1909,7 +1910,10 @@ async function browseIntoInput(button, apply) {
     const res = await fetch('/api/dialog/pick-directory', { method: 'POST' });
     if (res.ok) {
       const data = await res.json();
-      if (data.selected && data.path) apply(data.path);
+      if (data.selected && data.path) {
+        apply(data.path);
+        await loadExportLocations();
+      }
     }
   } catch (err) {
     showToast(`Directory picker error: ${err.message || err}`);
