@@ -199,7 +199,7 @@ fn is_effectively_empty(dir: &Path) -> Result<bool> {
 /// True if `dir` has the layout of a MailBackup data folder: only sub-folders at
 /// the top (plus OS metadata files) and at least one `.eml` file within the
 /// expected depth. The scan is bounded so a huge unrelated folder stays cheap.
-fn looks_like_archive(dir: &Path) -> bool {
+pub fn looks_like_archive(dir: &Path) -> bool {
     let Ok(top) = std::fs::read_dir(dir) else { return false };
     for entry in top.flatten() {
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);

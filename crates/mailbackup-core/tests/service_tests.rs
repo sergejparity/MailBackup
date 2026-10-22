@@ -1,9 +1,11 @@
 //! Install/uninstall flow of the Linux background service, run against fake
-//! `pkexec`, `install`, `systemctl` and `rm` programs that record their argument
-//! vectors and can be told to fail at a given step.
+//! `pkexec`, `install`, `systemctl`, `rm` and `chown` programs that record their
+//! argument vectors and can be told to fail at a given step.
 #![cfg(target_os = "linux")]
 
-use mailbackup_core::service::{linux_status, set_service_enabled_in, ServiceEnv};
+use mailbackup_core::service::{
+    linux_status, ownership_candidates, set_service_enabled_in, trusted_program, ServiceEnv,
+};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -25,9 +27,10 @@ enum Fault {
 }
 
 struct Fixture {
-    _dir: TempDir,
+    dir: TempDir,
     env: ServiceEnv,
     log: PathBuf,
+    user: String,
 }
 
 fn script(path: &Path, body: &str) {
@@ -35,7 +38,33 @@ fn script(path: &Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn current_user() -> String {
+    let out = std::process::Command::new(trusted_program("id").unwrap()).arg("-un").output().unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// Service installed for an account that owns every fixture file, so no
+/// ownership repair is needed: the account running the tests, or `nobody` (with
+/// the files handed to it) when the tests run as root, which can't be a service
+/// account.
 fn fixture(fault: Fault) -> Fixture {
+    let me = current_user();
+    if me != "root" {
+        return fixture_as(fault, &me);
+    }
+    let f = fixture_as(fault, "nobody");
+    let status = std::process::Command::new(trusted_program("chown").unwrap())
+        .args(["-R", "nobody"])
+        .arg(f.dir.path().join("home"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    f
+}
+
+/// Service installed for `user`. With another account (e.g. `nobody`) the
+/// fixture's files count as left behind by someone else and need repair.
+fn fixture_as(fault: Fault, user: &str) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -76,25 +105,40 @@ fn fixture(fault: Fault) -> Fixture {
 
     let chown_body = if fault == Fault::Chown { "exit 1\n" } else { "exit 0\n" };
     script(&bin.join("chown"), &format!("echo \"chown $*\" >> '{log_s}'\n{chown_body}"));
-    let data = dir.path().join("home/.mailbackup");
-    let archive = dir.path().join("archive");
-    std::fs::create_dir_all(&data).unwrap();
-    std::fs::create_dir_all(&archive).unwrap();
+
+    // A realistic MailBackup folder: config, credentials, catalog, archive
+    let base = dir.path().join("home/.mailbackup");
+    let data = base.join("data");
+    std::fs::create_dir_all(data.join("acc/inbox/2026/10")).unwrap();
+    std::fs::write(data.join("acc/inbox/2026/10/1_abc.eml"), "Subject: x").unwrap();
+    std::fs::write(base.join("mailbackup.db"), "db").unwrap();
+    std::fs::write(base.join(".credentials_store.json"), "{}").unwrap();
+    std::fs::write(base.join(".credentials_key"), "k").unwrap();
+    let config = base.join("config.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "data_dir: {}\ndb_path: {}\nsettings: {{}}\naccounts: []\n",
+            data.display(),
+            base.join("mailbackup.db").display()
+        ),
+    )
+    .unwrap();
 
     let env = ServiceEnv {
         server_exe: PathBuf::from("/opt/mailbackup/mailbackup-server"),
-        config_path: PathBuf::from("/home/alice/.mailbackup/config.yaml"),
-        user: Ok("alice".to_string()),
-        staging_dir: dir.path().join("home/.mailbackup/staging"),
+        config_path: config,
+        user: Ok(user.to_string()),
+        staging_dir: base.join("staging"),
         definition_path: dir.path().join("etc/mailbackup.service"),
         pkexec: bin.join("pkexec"),
         systemctl: bin.join("systemctl"),
         install: bin.join("install"),
         rm: bin.join("rm"),
         chown: bin.join("chown"),
-        owned_dirs: vec![data, archive, dir.path().join("missing-folder")],
+        id: trusted_program("id").unwrap(),
     };
-    Fixture { _dir: dir, env, log }
+    Fixture { dir, env, log, user: user.to_string() }
 }
 
 fn calls(f: &Fixture) -> Vec<String> {
@@ -105,8 +149,22 @@ fn calls(f: &Fixture) -> Vec<String> {
         .collect()
 }
 
-fn install_fixture_unit(f: &Fixture) {
-    std::fs::write(&f.env.definition_path, "[Service]\nUser=alice\n").unwrap();
+/// A real account other than the one running the tests (and not root), so the
+/// fixture's files count as left behind by someone else.
+fn other_account() -> &'static str {
+    if current_user() == "nobody" {
+        "daemon"
+    } else {
+        "nobody"
+    }
+}
+
+fn install_user_unit(f: &Fixture) {
+    std::fs::write(&f.env.definition_path, format!("[Service]\nUser={}\n", f.user)).unwrap();
+}
+
+fn install_legacy_root_unit(f: &Fixture) {
+    std::fs::write(&f.env.definition_path, "[Service]\nExecStart=/opt/x --service\n").unwrap();
 }
 
 #[test]
@@ -115,13 +173,13 @@ fn enable_installs_user_unit_with_checked_commands() {
     set_service_enabled_in(&f.env, true).unwrap();
 
     let unit = std::fs::read_to_string(&f.env.definition_path).unwrap();
-    assert!(unit.contains("\nUser=alice\n"), "{unit}");
+    assert!(unit.contains(&format!("\nUser={}\n", f.user)), "{unit}");
 
     let c = calls(&f);
     let unit_path = f.env.definition_path.display().to_string();
     assert!(c[0].starts_with(&format!("pkexec {} -m 0644 -o root -g root ", f.env.install.display())), "{c:?}");
     assert!(c[0].ends_with(&unit_path), "{c:?}");
-    // The staged file lived in the private staging folder, never in a temp dir
+    // The staged file lived in the private staging folder and is gone
     let staged = c[0].split_whitespace().nth(8).unwrap().to_string();
     assert_eq!(Path::new(&staged).parent(), Some(f.env.staging_dir.as_path()), "{staged}");
     assert!(!Path::new(&staged).exists(), "staged file must be removed");
@@ -152,15 +210,15 @@ fn enable_reports_each_failing_step() {
         assert!(err.contains(expected), "{err}");
         assert!(!calls(&f).iter().any(|l| l.starts_with(must_not_run)), "{:?}", calls(&f));
         // No staged files are left behind on failure either
-        let leftovers = std::fs::read_dir(&f.env.staging_dir).map(|d| d.count()).unwrap_or(0);
-        assert_eq!(leftovers, 0);
+        let staged = std::fs::read_dir(&f.env.staging_dir).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(staged, 0);
     }
 }
 
 #[test]
 fn disable_removes_unit_with_checked_commands() {
     let f = fixture(Fault::None);
-    install_fixture_unit(&f);
+    install_user_unit(&f);
     set_service_enabled_in(&f.env, false).unwrap();
     assert!(!f.env.definition_path.exists());
 
@@ -177,7 +235,7 @@ fn disable_reports_each_failing_step() {
         (Fault::RmNoop, "still present after removal"),
     ] {
         let f = fixture(fault);
-        install_fixture_unit(&f);
+        install_user_unit(&f);
         let err = set_service_enabled_in(&f.env, false).unwrap_err().to_string();
         assert!(err.contains(expected), "{err}");
         if fault == Fault::SystemctlDisable {
@@ -194,69 +252,11 @@ fn disable_without_unit_is_a_no_op() {
 }
 
 #[test]
-fn status_flags_root_units_for_reinstall() {
-    let f = fixture(Fault::None);
-
-    let missing = linux_status(&f.env.definition_path, &f.env.systemctl);
-    assert!(!missing.installed && !missing.needs_reinstall);
-
-    std::fs::write(&f.env.definition_path, "[Service]\nExecStart=/opt/x --service\n").unwrap();
-    let legacy = linux_status(&f.env.definition_path, &f.env.systemctl);
-    assert!(legacy.installed && legacy.needs_reinstall && legacy.runs_as.is_none());
-    assert!(legacy.details.unwrap().contains("administrator rights"));
-
-    install_fixture_unit(&f);
-    let current = linux_status(&f.env.definition_path, &f.env.systemctl);
-    assert!(current.installed && current.running && !current.needs_reinstall);
-    assert_eq!(current.runs_as.as_deref(), Some("alice"));
-}
-
-fn install_legacy_root_unit(f: &Fixture) {
-    std::fs::write(&f.env.definition_path, "[Service]\nExecStart=/opt/x --service\n").unwrap();
-}
-
-#[test]
-fn fresh_install_does_not_touch_ownership() {
-    let f = fixture(Fault::None);
-    set_service_enabled_in(&f.env, true).unwrap();
-    assert!(!calls(&f).iter().any(|l| l.contains("chown")), "{:?}", calls(&f));
-}
-
-#[test]
-fn migrating_from_root_gives_files_back_to_the_user() {
-    let f = fixture(Fault::None);
-    install_legacy_root_unit(&f);
-    set_service_enabled_in(&f.env, true).unwrap();
-
-    let c = calls(&f);
-    let expected = format!(
-        "pkexec {} -R -h alice {} {}",
-        f.env.chown.display(),
-        f.env.owned_dirs[0].display(),
-        f.env.owned_dirs[1].display()
-    );
-    let chown_at = c.iter().position(|l| l == &expected).unwrap_or_else(|| panic!("{c:?}"));
-    // Ownership is fixed before the service is started as the user
-    let restart_at = c.iter().position(|l| l.ends_with("systemctl restart mailbackup.service")).unwrap();
-    assert!(chown_at < restart_at, "{c:?}");
-    assert!(std::fs::read_to_string(&f.env.definition_path).unwrap().contains("User=alice"));
-}
-
-#[test]
-fn failed_ownership_fix_stops_the_migration() {
-    let f = fixture(Fault::Chown);
-    install_legacy_root_unit(&f);
-    let err = set_service_enabled_in(&f.env, true).unwrap_err().to_string();
-    assert!(err.contains("ownership"), "{err}");
-    assert!(!calls(&f).iter().any(|l| l.contains("systemctl")), "{:?}", calls(&f));
-}
-
-#[test]
 fn removal_works_without_a_service_user() {
     // e.g. the old root service serving the UI couldn't determine an account
     let mut f = fixture(Fault::None);
     f.env.user = Err("can't tell which user".to_string());
-    install_fixture_unit(&f);
+    install_user_unit(&f);
     set_service_enabled_in(&f.env, false).unwrap();
     assert!(!f.env.definition_path.exists());
 
@@ -264,6 +264,111 @@ fn removal_works_without_a_service_user() {
     let err = set_service_enabled_in(&f.env, true).unwrap_err().to_string();
     assert!(err.contains("can't tell which user"), "{err}");
     assert!(!calls(&f).iter().any(|l| l.starts_with("pkexec") && l.contains("install")));
+}
+
+#[test]
+fn status_flags_root_units_for_reinstall() {
+    let f = fixture(Fault::None);
+
+    let missing = linux_status(&f.env.definition_path, &f.env.systemctl);
+    assert!(!missing.installed && !missing.needs_reinstall);
+
+    install_legacy_root_unit(&f);
+    let legacy = linux_status(&f.env.definition_path, &f.env.systemctl);
+    assert!(legacy.installed && legacy.needs_reinstall && legacy.runs_as.is_none());
+    assert!(legacy.details.unwrap().contains("administrator rights"));
+
+    install_user_unit(&f);
+    let current = linux_status(&f.env.definition_path, &f.env.systemctl);
+    assert!(current.installed && current.running && !current.needs_reinstall);
+    assert_eq!(current.runs_as.as_deref(), Some(f.user.as_str()));
+}
+
+// --- Ownership repair after an old root service -------------------------------
+
+fn chown_call(f: &Fixture) -> Option<String> {
+    calls(f).into_iter().find(|l| l.starts_with(&format!("pkexec {}", f.env.chown.display())))
+}
+
+#[test]
+fn files_already_owned_by_the_user_are_left_alone() {
+    let f = fixture(Fault::None);
+    install_legacy_root_unit(&f);
+    set_service_enabled_in(&f.env, true).unwrap();
+    assert_eq!(chown_call(&f), None, "{:?}", calls(&f));
+}
+
+#[test]
+fn foreign_owned_files_are_given_to_the_service_user_before_start() {
+    let f = fixture_as(Fault::None, other_account());
+    install_legacy_root_unit(&f);
+    set_service_enabled_in(&f.env, true).unwrap();
+
+    let call = chown_call(&f).unwrap_or_else(|| panic!("{:?}", calls(&f)));
+    let args: Vec<&str> = call.split_whitespace().skip(2).collect();
+    assert_eq!(&args[..3], ["-R", "-h", f.user.as_str()]);
+    let base = f.dir.path().join("home/.mailbackup");
+    let targets: Vec<PathBuf> = args[3..].iter().map(PathBuf::from).collect();
+    for expected in [
+        base.join("config.yaml"),
+        base.join(".credentials_store.json"),
+        base.join(".credentials_key"),
+        base.join("mailbackup.db"),
+        base.join("data"),
+    ] {
+        assert!(targets.contains(&expected), "missing {} in {call}", expected.display());
+    }
+    // Only MailBackup's own files and archive: never the folders around them
+    for not_expected in [base.clone(), f.dir.path().join("home"), f.dir.path().to_path_buf()] {
+        assert!(!targets.contains(&not_expected), "{} in {call}", not_expected.display());
+    }
+    // Missing files (WAL/SHM, logs) aren't passed
+    assert!(targets.iter().all(|t| t.exists()), "{call}");
+
+    let c = calls(&f);
+    let chown_at = c.iter().position(|l| l == &call).unwrap();
+    let restart_at = c.iter().position(|l| l.ends_with("systemctl restart mailbackup.service")).unwrap();
+    assert!(chown_at < restart_at, "ownership must be fixed before the service starts: {c:?}");
+}
+
+#[test]
+fn off_then_on_still_repairs_ownership() {
+    // The documented migration: turn the old service off (removing its
+    // definition), then on again
+    let f = fixture_as(Fault::None, other_account());
+    install_legacy_root_unit(&f);
+    set_service_enabled_in(&f.env, false).unwrap();
+    assert!(!f.env.definition_path.exists());
+    set_service_enabled_in(&f.env, true).unwrap();
+    assert!(chown_call(&f).is_some(), "{:?}", calls(&f));
+}
+
+#[test]
+fn failed_ownership_fix_stops_the_migration() {
+    let f = fixture_as(Fault::Chown, other_account());
+    install_legacy_root_unit(&f);
+    let err = set_service_enabled_in(&f.env, true).unwrap_err().to_string();
+    assert!(err.contains("ownership"), "{err}");
+    assert!(!calls(&f).iter().any(|l| l.contains("systemctl")), "{:?}", calls(&f));
+}
+
+#[test]
+fn ownership_repair_never_targets_system_folders() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.yaml");
+    // Custom catalog in /var/lib and a data folder pointing at a system folder
+    std::fs::write(
+        &config,
+        "data_dir: /var/lib\ndb_path: /var/lib/mailbackup-test.db\nsettings: {}\naccounts: []\n",
+    )
+    .unwrap();
+    let candidates = ownership_candidates(&config);
+    for forbidden in ["/var/lib", "/var", "/", "/etc"] {
+        assert!(!candidates.contains(&PathBuf::from(forbidden)), "{forbidden} in {candidates:?}");
+    }
+    assert!(candidates.contains(&PathBuf::from("/var/lib/mailbackup-test.db")));
+    assert!(candidates.contains(&PathBuf::from("/var/lib/mailbackup-test.db-wal")));
+    assert!(!candidates.contains(&dir.path().to_path_buf()), "the config's folder itself is never included");
 }
 
 #[test]
@@ -286,6 +391,5 @@ fn privileged_process_installs_for_the_config_owner() {
     // A config that only root owns gives no safe account to install for
     let root_only = dir.path().join("root.yaml");
     std::fs::write(&root_only, "x").unwrap();
-    // (the temp dir and its parent are root-owned too)
     assert!(mailbackup_core::service::service_user(&root_only).is_err());
 }

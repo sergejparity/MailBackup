@@ -398,9 +398,7 @@ pub struct ServiceEnv {
     pub install: PathBuf,
     pub rm: PathBuf,
     pub chown: PathBuf,
-    /// Folders the service writes to (`~/.mailbackup`, data folder, database
-    /// folder). After migrating from a root service their ownership is fixed.
-    pub owned_dirs: Vec<PathBuf>,
+    pub id: PathBuf,
 }
 
 impl ServiceEnv {
@@ -417,7 +415,6 @@ impl ServiceEnv {
             }
         };
         Ok(Self {
-            owned_dirs: service_owned_dirs(&config_path),
             server_exe: find_server_executable(),
             user: service_user(&config_path).map_err(|e| e.to_string()),
             config_path,
@@ -428,6 +425,7 @@ impl ServiceEnv {
             install: tool("install")?,
             rm: tool("rm")?,
             chown: tool("chown")?,
+            id: tool("id")?,
         })
     }
 
@@ -436,21 +434,75 @@ impl ServiceEnv {
     }
 }
 
-/// The config's folder plus the data and database folders named in it.
-fn service_owned_dirs(config_path: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = config_path.parent().map(Path::to_path_buf).into_iter().collect();
+/// Paths MailBackup itself creates for the configuration at `config_path`, whose
+/// ownership may need repair after an old root service wrote them:
+/// - specific files: the config, the credential store and its key, the service
+///   logs, and the catalog database with its `-wal`/`-shm`/`-journal` files;
+/// - the data folder, only when it is a dedicated MailBackup archive
+///   ([`is_dedicated_archive_dir`]); it is the only entry repaired recursively.
+///
+/// Parent folders are never included: a custom `db_path` such as
+/// `/var/lib/mailbackup.db` must not hand `/var/lib` to the user.
+pub fn ownership_candidates(config_path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![config_path.to_path_buf()];
+    if let Some(dir) = config_path.parent() {
+        for name in [".credentials_store.json", "credentials_store.json", ".credentials_key"] {
+            paths.push(dir.join(name));
+        }
+    }
+    let (out_log, err_log) = service_log_paths(config_path);
+    paths.push(out_log);
+    paths.push(err_log);
+
     if let Some(cfg) = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|text| serde_yaml::from_str::<crate::config::AppConfig>(&text).ok())
     {
-        dirs.push(cfg.data_dir.clone());
-        if let Some(parent) = cfg.db_path.parent() {
-            dirs.push(parent.to_path_buf());
+        let db = cfg.db_path.to_string_lossy().to_string();
+        paths.push(cfg.db_path.clone());
+        for suffix in ["-wal", "-shm", "-journal"] {
+            paths.push(PathBuf::from(format!("{}{}", db, suffix)));
+        }
+        if is_dedicated_archive_dir(&cfg.data_dir) {
+            paths.push(cfg.data_dir.clone());
         }
     }
-    dirs.sort();
-    dirs.dedup();
-    dirs
+    paths.dedup();
+    paths
+}
+
+/// A folder that is safe to repair recursively: at least three levels below the
+/// filesystem root (so never `/var/lib`, `/home/<user>` or a volume root) and laid
+/// out like a MailBackup archive (only sub-folders at the top, `.eml` files inside).
+pub fn is_dedicated_archive_dir(dir: &Path) -> bool {
+    let Ok(real) = std::fs::canonicalize(dir) else { return false };
+    let depth = real.components().filter(|c| matches!(c, std::path::Component::Normal(_))).count();
+    depth >= 3 && crate::safe_paths::looks_like_archive(&real)
+}
+
+/// The candidates (see [`ownership_candidates`]) that exist and contain anything
+/// not owned by `uid`. Symlinks are never followed.
+#[cfg(unix)]
+pub fn paths_needing_owner(candidates: &[PathBuf], uid: u32) -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    fn foreign(path: &Path, uid: u32) -> bool {
+        let Ok(meta) = std::fs::symlink_metadata(path) else { return false };
+        if meta.uid() != uid {
+            return true;
+        }
+        meta.is_dir()
+            && std::fs::read_dir(path)
+                .map(|entries| entries.flatten().any(|e| foreign(&e.path(), uid)))
+                .unwrap_or(false)
+    }
+    candidates.iter().filter(|p| foreign(p, uid)).cloned().collect()
+}
+
+#[cfg(unix)]
+fn user_uid(id: &Path, user: &str) -> Result<u32> {
+    command_output(id, &["-u", user])?
+        .parse()
+        .map_err(|_| Error::Config(format!("Couldn't look up the account {:?}.", user)))
 }
 
 /// Fixed system folders that elevated helpers are taken from. The caller's PATH
@@ -786,12 +838,6 @@ pub fn set_service_enabled(enabled: bool, config_path: &Path) -> Result<()> {
 pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
     let unit = env.definition_path.to_string_lossy().to_string();
     if enabled {
-        // An older version installed the service as root; files it created must
-        // become the user's, or the new service can't write to them.
-        let migrating_from_root = std::fs::read_to_string(&env.definition_path)
-            .map(|old| unit_runs_as(&old).is_none())
-            .unwrap_or(false);
-
         let user = env.require_user()?;
         let content = generate_linux_systemd(&env.server_exe, &env.config_path, user);
         let staged = StagedFile::write(&env.staging_dir, "service", content.as_bytes())?;
@@ -812,15 +858,15 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
             return Err(Error::Config("The installed service definition doesn't run as your user.".into()));
         }
 
-        let existing_dirs: Vec<&PathBuf> = env.owned_dirs.iter().filter(|d| d.exists()).collect();
-        if migrating_from_root && !existing_dirs.is_empty() {
-            // -h with -R (and chown's default -P) never follows symlinks, so a link
-            // inside these folders can't redirect the ownership change.
+        // An older version ran the service as root; files it created must become
+        // the user's, or the new service can't use them. Decided from the files
+        // themselves, so it also happens after the documented off/on reinstall.
+        let repair = paths_needing_owner(&ownership_candidates(&env.config_path), user_uid(&env.id, user)?);
+        if !repair.is_empty() {
+            // -h with -R (and chown's default -P) never follows symlinks; only the
+            // dedicated archive folder is a directory here
             run_checked(
-                Command::new(&env.pkexec)
-                    .arg(&env.chown)
-                    .args(["-R", "-h", user])
-                    .args(&existing_dirs),
+                Command::new(&env.pkexec).arg(&env.chown).args(["-R", "-h", user]).args(&repair),
                 "Giving your user ownership of files created by the old root service",
             )?;
         }
@@ -861,11 +907,11 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
     // environment and is shell-quoted by AppleScript's `quoted form of`.
     const INSTALL_SCRIPT: &str = r#"set staged to system attribute "MB_STAGED_PLIST"
 set fixOwner to ""
-if (system attribute "MB_CHOWN") is "1" then
+set pathCount to (system attribute "MB_PATH_COUNT") as integer
+if pathCount > 0 then
     set fixOwner to "/usr/sbin/chown -R -h " & quoted form of (system attribute "MB_USER")
-    repeat with i from 0 to 2
-        set d to system attribute ("MB_DIR_" & i)
-        if d is not "" then set fixOwner to fixOwner & " " & quoted form of d
+    repeat with i from 0 to (pathCount - 1)
+        set fixOwner to fixOwner & " " & quoted form of (system attribute ("MB_PATH_" & i))
     end repeat
     set fixOwner to fixOwner & " && "
 end if
@@ -873,20 +919,19 @@ do shell script fixOwner & "/usr/bin/install -m 644 -o root -g wheel " & quoted 
     const UNINSTALL_SCRIPT: &str = r#"do shell script "(/bin/launchctl bootout system/com.mailbackup.service 2>/dev/null; true) && /bin/rm -f /Library/LaunchDaemons/com.mailbackup.service.plist" with administrator privileges"#;
 
     if enabled {
-        // Files created by an older root LaunchDaemon must become the user's
-        let migrating_from_root = std::fs::read_to_string(LAUNCHD_PLIST_PATH)
-            .map(|old| plist_runs_as(&old).is_none())
-            .unwrap_or(false);
         let user = env.require_user()?;
+        // Files created by an older root LaunchDaemon must become the user's;
+        // decided from the files themselves (see the Linux branch)
+        let repair = paths_needing_owner(&ownership_candidates(&env.config_path), user_uid(&env.id, user)?);
         let content = generate_macos_plist(&env.server_exe, &env.config_path, user);
         let staged = StagedFile::write(&env.staging_dir, "plist", content.as_bytes())?;
         let mut cmd = Command::new(OSASCRIPT);
         cmd.args(["-e", INSTALL_SCRIPT])
             .env("MB_STAGED_PLIST", &staged.0)
             .env("MB_USER", user)
-            .env("MB_CHOWN", if migrating_from_root { "1" } else { "0" });
-        for (i, dir) in env.owned_dirs.iter().filter(|d| d.exists()).take(3).enumerate() {
-            cmd.env(format!("MB_DIR_{}", i), dir);
+            .env("MB_PATH_COUNT", repair.len().to_string());
+        for (i, path) in repair.iter().enumerate() {
+            cmd.env(format!("MB_PATH_{}", i), path);
         }
         run_checked(&mut cmd, "Installing the LaunchDaemon")?;
         drop(staged);
