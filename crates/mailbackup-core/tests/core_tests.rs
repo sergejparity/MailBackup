@@ -902,3 +902,14 @@ fn test_log_rotation_and_retention_policy() {
 
 
 
+
+#[test]
+fn test_db_open_creates_missing_parent_dir() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("missing").join("nested").join("mailbackup.db");
+    assert!(!db_path.parent().unwrap().exists());
+
+    let db = Database::open(&db_path).expect("open should create missing parent folders");
+    assert!(db_path.exists());
+    assert_eq!(db.path(), db_path);
+}

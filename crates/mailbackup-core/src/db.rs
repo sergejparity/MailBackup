@@ -108,6 +108,9 @@ pub struct Database {
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let p = path.as_ref().to_path_buf();
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let conn = Connection::open(&p)?;
         let _ = conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()));
         conn.pragma_update(None, "synchronous", "NORMAL")?;
