@@ -789,11 +789,11 @@ async fn api_test_direct(Json(payload): Json<TestDirectPayload>) -> impl IntoRes
         name: "Test".to_string(),
         email: payload.email,
         provider: ProviderType::GenericImap,
-        imap_server: payload.server,
+        imap_server: payload.server.trim().to_string(),
         imap_port: payload.port,
         use_tls: true,
         auth_type: AuthType::Password,
-        username: payload.username,
+        username: payload.username.trim().to_string(),
         schedule: None,
         retention_days: None,
         folder_filter: FolderFilter::default(),
@@ -2306,7 +2306,7 @@ mod tests {
             .oneshot(json_request(
                 "POST",
                 "/api/accounts/test-direct",
-                serde_json::json!({ "email": "a@b.c", "server": "127.0.0.1", "port": port, "username": "u", "password": "p" }),
+                serde_json::json!({ "email": "a@b.c", "server": " 127.0.0.1 ", "port": port, "username": " u ", "password": "p" }),
             ))
             .await
             .unwrap();
