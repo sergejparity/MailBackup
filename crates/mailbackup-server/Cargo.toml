@@ -28,7 +28,7 @@ anyhow.workspace = true
 futures-util.workspace = true
 mail-parser.workspace = true
 chrono.workspace = true
-uuid.workspace = true
+getrandom = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

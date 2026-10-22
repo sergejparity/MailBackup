@@ -77,11 +77,9 @@ const API_TOKEN_PLACEHOLDER: &str = "__MAILBACKUP_API_TOKEN__";
 
 /// Generates a random 256-bit API token (hex encoded) from the OS CSPRNG.
 pub fn generate_api_token() -> String {
-    format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("OS random number generator unavailable");
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -126,20 +124,32 @@ pub fn create_router(state: AppState) -> Router {
 }
 
 /// Rejects requests that could come from another web origin or from the network:
-/// - `Host` must be an IP literal or `localhost`, which defeats DNS rebinding.
-/// - `Origin`, when sent, must match `Host` (no cross-origin callers; CORS is not enabled).
+/// - `Host` must be an IP literal, `localhost` or a configured `allowed_hosts` entry,
+///   which defeats DNS rebinding.
+/// - `Origin`, when sent, must be `http(s)://<Host>` (no cross-origin callers; CORS is
+///   not enabled). `https` covers a TLS-terminating reverse proxy.
 /// - `/api/*` requests must carry the per-process API token.
 async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let headers = req.headers();
 
-    let host = match headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
-        Some(h) if is_allowed_host(h) => h.to_string(),
-        _ => return (StatusCode::FORBIDDEN, "Forbidden host").into_response(),
+    let allowed = {
+        let cfg = state.config.read().await;
+        match headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
+            Some(h) if is_allowed_host(h, &cfg.settings.allowed_hosts) => Some(h.to_string()),
+            _ => None,
+        }
+    };
+    let host = match allowed {
+        Some(h) => h,
+        None => return (StatusCode::FORBIDDEN, "Forbidden host").into_response(),
     };
 
     if let Some(origin) = headers.get(header::ORIGIN) {
-        let expected = format!("http://{}", host);
-        if origin.to_str().map(|o| o != expected).unwrap_or(true) {
+        let same_origin = origin
+            .to_str()
+            .map(|o| o == format!("http://{}", host) || o == format!("https://{}", host))
+            .unwrap_or(false);
+        if !same_origin {
             return (StatusCode::FORBIDDEN, "Cross-origin request rejected").into_response();
         }
     }
@@ -172,7 +182,7 @@ fn request_token<'a>(headers: &'a HeaderMap, query: Option<&'a str>) -> Option<&
         .find_map(|pair| pair.strip_prefix("token="))
 }
 
-fn is_allowed_host(host: &str) -> bool {
+fn is_allowed_host(host: &str, extra_hosts: &[String]) -> bool {
     // Strip the port: "[::1]:8765" -> "[::1]", "127.0.0.1:8765" -> "127.0.0.1"
     let name = if host.starts_with('[') {
         match host.find(']') {
@@ -182,7 +192,9 @@ fn is_allowed_host(host: &str) -> bool {
     } else {
         host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
     };
-    name.eq_ignore_ascii_case("localhost") || name.parse::<IpAddr>().is_ok()
+    name.eq_ignore_ascii_case("localhost")
+        || name.parse::<IpAddr>().is_ok()
+        || extra_hosts.iter().any(|h| h.trim().eq_ignore_ascii_case(name))
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -1871,12 +1883,14 @@ mod tests {
             .unwrap();
         assert_eq!(status(&router, foreign).await, StatusCode::FORBIDDEN);
 
-        let same_origin = get("/api/version", "127.0.0.1:8765")
-            .header(header::ORIGIN, "http://127.0.0.1:8765")
-            .header(API_TOKEN_HEADER, TOKEN)
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(status(&router, same_origin).await, StatusCode::OK);
+        for origin in ["http://127.0.0.1:8765", "https://127.0.0.1:8765"] {
+            let same_origin = get("/api/version", "127.0.0.1:8765")
+                .header(header::ORIGIN, origin)
+                .header(API_TOKEN_HEADER, TOKEN)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(status(&router, same_origin).await, StatusCode::OK, "{origin}");
+        }
     }
 
     #[tokio::test]
@@ -1930,13 +1944,26 @@ mod tests {
 
     #[test]
     fn host_allowlist() {
-        assert!(is_allowed_host("127.0.0.1:8765"));
-        assert!(is_allowed_host("localhost:8765"));
-        assert!(is_allowed_host("[::1]:8765"));
-        assert!(is_allowed_host("192.168.1.20:8765"));
-        assert!(!is_allowed_host("evil.example:8765"));
-        assert!(!is_allowed_host("localhost.evil.example"));
-        assert!(!is_allowed_host("[::1"));
+        assert!(is_allowed_host("127.0.0.1:8765", &[]));
+        assert!(is_allowed_host("localhost:8765", &[]));
+        assert!(is_allowed_host("[::1]:8765", &[]));
+        assert!(is_allowed_host("192.168.1.20:8765", &[]));
+        assert!(!is_allowed_host("evil.example:8765", &[]));
+        assert!(!is_allowed_host("localhost.evil.example", &[]));
+        assert!(!is_allowed_host("[::1", &[]));
+
+        let proxy = vec!["mail.example.org".to_string()];
+        assert!(is_allowed_host("mail.example.org", &proxy));
+        assert!(is_allowed_host("MAIL.example.org:443", &proxy));
+        assert!(!is_allowed_host("evil.example", &proxy));
+    }
+
+    #[test]
+    fn api_token_is_256_bit_hex() {
+        let a = generate_api_token();
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, generate_api_token());
     }
 
     #[test]

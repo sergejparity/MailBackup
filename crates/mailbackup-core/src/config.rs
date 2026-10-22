@@ -107,6 +107,11 @@ pub struct GlobalSettings {
     /// "0.0.0.0" only to deliberately expose the API on the local network.
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
+    /// Extra host names (besides IP literals and `localhost`) the web UI may be
+    /// reached by, e.g. a reverse proxy's domain. Each entry re-allows that name
+    /// past the DNS-rebinding check, so list only names you control.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
     #[serde(default)]
@@ -140,6 +145,7 @@ impl Default for GlobalSettings {
             notifications_enabled: true,
             web_port: default_server_port(),
             bind_address: default_bind_address(),
+            allowed_hosts: Vec::new(),
             close_to_tray: true,
             autostart: false,
             run_as_service: false,
