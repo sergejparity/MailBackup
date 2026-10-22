@@ -147,7 +147,11 @@ async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> R
     if let Some(origin) = headers.get(header::ORIGIN) {
         let same_origin = origin
             .to_str()
-            .map(|o| o == format!("http://{}", host) || o == format!("https://{}", host))
+            .map(|o| {
+                // Browsers send a lowercase Origin; a client or proxy may send a mixed-case Host.
+                o.eq_ignore_ascii_case(&format!("http://{}", host))
+                    || o.eq_ignore_ascii_case(&format!("https://{}", host))
+            })
             .unwrap_or(false);
         if !same_origin {
             return (StatusCode::FORBIDDEN, "Cross-origin request rejected").into_response();
@@ -1882,6 +1886,13 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(status(&router, foreign).await, StatusCode::FORBIDDEN);
+
+        let mixed_case = get("/api/version", "LocalHost:8765")
+            .header(header::ORIGIN, "http://localhost:8765")
+            .header(API_TOKEN_HEADER, TOKEN)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status(&router, mixed_case).await, StatusCode::OK);
 
         for origin in ["http://127.0.0.1:8765", "https://127.0.0.1:8765"] {
             let same_origin = get("/api/version", "127.0.0.1:8765")
