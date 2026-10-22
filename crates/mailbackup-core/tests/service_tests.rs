@@ -480,3 +480,89 @@ fn empty_or_unexpected_folders_are_never_archive_entries() {
     let entries = mailbackup_core::service::archive_entries(&data);
     assert_eq!(entries, vec![data.join("acc/inbox/2026/10/7_00000000abcd.eml")]);
 }
+
+fn archive_with_one_message(data: &Path) {
+    std::fs::create_dir_all(data.join("acc/inbox/2026/10")).unwrap();
+    std::fs::write(data.join("acc/inbox/2026/10/1_012345abcdef.eml"), "Subject: x").unwrap();
+}
+
+#[test]
+fn empty_staging_and_retention_emptied_folders_are_repaired_within_a_valid_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    archive_with_one_message(&data);
+    std::fs::create_dir_all(data.join(".staging")).unwrap(); // its normal, empty state
+    std::fs::create_dir_all(data.join("acc/inbox/2025/03")).unwrap(); // emptied by retention
+
+    let entries = mailbackup_core::service::archive_entries(&data);
+    for expected in [
+        data.join(".staging"),
+        data.join("acc/inbox/2025/03"),
+        data.join("acc/inbox/2025"),
+        data.join("acc/inbox/2026/10/1_012345abcdef.eml"),
+        data.join("acc"),
+        data.clone(),
+    ] {
+        assert!(entries.contains(&expected), "missing {} in {entries:?}", expected.display());
+    }
+}
+
+#[test]
+fn empty_folders_next_to_unrelated_content_stay_excluded() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    archive_with_one_message(&data);
+    std::fs::create_dir_all(data.join(".staging")).unwrap();
+    std::fs::create_dir_all(data.join("other")).unwrap(); // valid name, empty
+    std::fs::write(data.join("notes.txt"), "unrelated").unwrap();
+
+    let entries = mailbackup_core::service::archive_entries(&data);
+    // The verified account subtree is still repaired...
+    assert!(entries.contains(&data.join("acc")), "{entries:?}");
+    // ...but empty folders whose parent can't be verified are not, nor the root
+    for excluded in [data.join(".staging"), data.join("other"), data.clone()] {
+        assert!(!entries.contains(&excluded), "{} in {entries:?}", excluded.display());
+    }
+}
+
+#[test]
+fn migration_lets_the_new_service_user_store_messages() {
+    use std::os::unix::fs::MetadataExt;
+    // End to end with the real chown: needs root (to own files and switch users)
+    if std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(1) != 0 {
+        return;
+    }
+    let Some(runuser) = ["/usr/sbin/runuser", "/sbin/runuser"].iter().map(PathBuf::from).find(|p| p.exists()) else {
+        return;
+    };
+    let mut f = fixture_as(Fault::None, "nobody");
+    f.env.chown = trusted_program("chown").unwrap();
+    std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let data = f.dir.path().join("home/.mailbackup/data");
+    // Root-created leftovers: the usual empty staging folder
+    std::fs::remove_dir_all(data.join(".staging")).unwrap();
+    std::fs::create_dir_all(data.join(".staging")).unwrap();
+    std::fs::set_permissions(data.join(".staging"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let touch_as_nobody = |path: &Path| {
+        std::process::Command::new(&runuser)
+            .args(["-u", "nobody", "--", "/usr/bin/touch"])
+            .arg(path)
+            .status()
+            .unwrap()
+            .success()
+    };
+    let staged = data.join(".staging/0f8fad5b-d9cb-469f-a165-70867728950e.tmp");
+    let new_message = data.join("acc/inbox/2026/10/2_00000000beef.eml");
+    assert!(!touch_as_nobody(&staged), "precondition: root-owned staging isn't writable");
+
+    install_legacy_root_unit(&f);
+    set_service_enabled_in(&f.env, true).unwrap();
+
+    // The replacement service user can stage and store another message
+    assert!(touch_as_nobody(&staged), "staging folder must be writable after migration");
+    assert!(touch_as_nobody(&new_message), "archive folder must be writable after migration");
+    let out = std::process::Command::new(trusted_program("id").unwrap()).args(["-u", "nobody"]).output().unwrap();
+    let nobody_uid: u32 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+    assert_eq!(std::fs::metadata(data.join(".staging")).unwrap().uid(), nobody_uid);
+}

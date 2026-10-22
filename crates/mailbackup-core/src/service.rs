@@ -477,49 +477,69 @@ pub fn ownership_candidates(config_path: &Path) -> Vec<PathBuf> {
 /// the exact layout `StorageEngine` writes:
 /// `<account>/<folder>/<YYYY>/<MM>/<uid>_<12 hex>.eml` and `.staging/<uuid>.tmp`.
 ///
-/// Fail-closed: matching regular files are included; a folder is included only if
-/// its name fits its level *and* its whole subtree matches (OS metadata files like
-/// `.DS_Store` are neutral); the data folder itself only if the entire tree
-/// matches. Symlinks and anything unexpected are skipped, and so are the folders
-/// containing them, so unrelated content next to an archive is never handed over.
+/// Fail-closed:
+/// - matching regular files are included;
+/// - a folder is included when its name fits its level, everything in it matches
+///   (OS metadata files like `.DS_Store` are neutral) and it holds archive
+///   content;
+/// - empty folders with valid names (the usually-empty `.staging`, a month
+///   emptied by retention) are included only when an ancestor folder is verified;
+/// - the data folder itself only if the whole tree matches and holds archive
+///   content or MailBackup's `.staging`.
+///
+/// Symlinks and unexpected content are skipped, and so are the folders containing
+/// them, so unrelated content next to an archive is never handed over.
 pub fn archive_entries(data_dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(meta) = std::fs::symlink_metadata(data_dir) else { return out };
+    let Ok(meta) = std::fs::symlink_metadata(data_dir) else { return Vec::new() };
     if !meta.is_dir() {
-        return out;
+        return Vec::new();
     }
-    if collect_archive_level(data_dir, 0, &mut out) {
+    let root = scan_archive_level(data_dir, 0);
+    let mut out = root.accepted;
+    if root.all_conform && root.has_content {
+        out.extend(root.pending);
         out.push(data_dir.to_path_buf());
     }
     out
 }
 
-/// Collects conforming entries below `dir` (at layout `level`); returns whether
-/// `dir` is a verified archive folder: it holds at least one conforming entry and
-/// nothing else. Empty folders don't qualify, so an empty `/var/lib/<x>` can never
-/// be mistaken for an archive account.
-fn collect_archive_level(dir: &Path, level: usize, out: &mut Vec<PathBuf>) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+/// Result of scanning one folder of a data folder against the archive layout.
+#[derive(Default)]
+struct ArchiveScan {
+    /// Every entry below conforms (OS metadata files are neutral).
+    all_conform: bool,
+    /// Holds real archive content (directly or below).
+    has_content: bool,
+    /// Entries that are certainly MailBackup's.
+    accepted: Vec<PathBuf>,
+    /// Empty folders with valid names (e.g. the usually-empty `.staging`, or a
+    /// month emptied by retention). Repaired only if an ancestor folder is
+    /// verified, so an empty `/var/lib/<x>` on its own never qualifies.
+    pending: Vec<PathBuf>,
+}
+
+fn scan_archive_level(dir: &Path, level: usize) -> ArchiveScan {
+    let mut scan = ArchiveScan { all_conform: true, ..Default::default() };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        scan.all_conform = false;
+        return scan;
+    };
     let staging = level == 1 && dir.file_name().map(|n| n == ".staging").unwrap_or(false);
-    let mut all_conform = true;
-    let mut has_content = false;
     for entry in entries {
         let Ok(entry) = entry else {
-            all_conform = false;
+            scan.all_conform = false;
             continue;
         };
         let name = entry.file_name().to_string_lossy().to_string();
         let Ok(file_type) = entry.file_type() else {
-            all_conform = false;
+            scan.all_conform = false;
             continue;
         };
         let path = entry.path();
         if IGNORABLE_METADATA.contains(&name.as_str()) && file_type.is_file() {
             continue;
         }
-        let conforms = if file_type.is_symlink() {
-            false
-        } else if file_type.is_dir() {
+        if file_type.is_dir() && !file_type.is_symlink() {
             let name_ok = match level {
                 0 => name == ".staging" || is_slug(&name),
                 1 if !staging => is_slug(&name),
@@ -527,27 +547,38 @@ fn collect_archive_level(dir: &Path, level: usize, out: &mut Vec<PathBuf>) -> bo
                 3 => name.len() == 2 && name.bytes().all(|b| b.is_ascii_digit()),
                 _ => false,
             };
-            // Folders with unexpected names are unknown content: not entered at all
-            name_ok && {
-                let below = collect_archive_level(&path, level + 1, out);
-                if below {
-                    out.push(path.clone());
+            if !name_ok {
+                // Folders with unexpected names are unknown content: not entered
+                scan.all_conform = false;
+                continue;
+            }
+            let below = scan_archive_level(&path, level + 1);
+            // Fully conforming subtrees with content stand on their own
+            scan.accepted.extend(below.accepted);
+            if below.all_conform && below.has_content {
+                scan.accepted.extend(below.pending);
+                scan.accepted.push(path);
+                scan.has_content = true;
+            } else if below.all_conform {
+                // Valid but empty. At the data root, `.staging` is MailBackup's
+                // own folder and counts as content.
+                scan.pending.extend(below.pending);
+                scan.pending.push(path);
+                if level == 0 && name == ".staging" {
+                    scan.has_content = true;
                 }
-                below
+            } else {
+                scan.all_conform = false;
             }
-        } else if file_type.is_file() {
-            let name_ok = (level == 4 && is_eml_name(&name)) || (staging && is_staging_name(&name));
-            if name_ok {
-                out.push(path.clone());
-            }
-            name_ok
+        } else if file_type.is_file() && ((level == 4 && is_eml_name(&name)) || (staging && is_staging_name(&name))) {
+            scan.accepted.push(path);
+            scan.has_content = true;
         } else {
-            false
-        };
-        all_conform &= conforms;
-        has_content |= conforms;
+            // Symlinks, sockets, unexpected file names
+            scan.all_conform = false;
+        }
     }
-    all_conform && has_content
+    scan
 }
 
 /// OS metadata files that neither belong to nor disqualify an archive folder.
