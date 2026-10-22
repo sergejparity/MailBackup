@@ -1,8 +1,9 @@
 use anyhow::Result;
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    extract::{Path, Query, Request, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -19,11 +20,10 @@ use mailbackup_core::storage::StorageEngine;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::{Mutex, RwLock};
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
@@ -53,6 +53,21 @@ pub struct AppState {
     pub credentials: Arc<CredentialStore>,
     pub scheduler: Arc<Mutex<BackupScheduler>>,
     pub active_syncs: Arc<StdRwLock<HashMap<String, SyncStatus>>>,
+    /// Per-process secret that every `/api/*` request must present, either in the
+    /// `X-MailBackup-Token` header or (for plain downloads) the `token` query parameter.
+    pub api_token: Arc<str>,
+}
+
+pub const API_TOKEN_HEADER: &str = "x-mailbackup-token";
+const API_TOKEN_PLACEHOLDER: &str = "__MAILBACKUP_API_TOKEN__";
+
+/// Generates a random 256-bit API token (hex encoded) from the OS CSPRNG.
+pub fn generate_api_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -91,9 +106,81 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/logs/rotate", post(api_rotate_logs))
         .route("/api/logs/files", get(api_list_log_files))
         .route("/*file", get(serve_static))
-        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn_with_state(state.clone(), api_guard))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Rejects requests that could come from another web origin or from the network:
+/// - `Host` must be an IP literal or `localhost`, which defeats DNS rebinding.
+/// - `Origin`, when sent, must match `Host` (no cross-origin callers; CORS is not enabled).
+/// - `/api/*` requests must carry the per-process API token.
+async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let headers = req.headers();
+
+    let host = match headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
+        Some(h) if is_allowed_host(h) => h.to_string(),
+        _ => return (StatusCode::FORBIDDEN, "Forbidden host").into_response(),
+    };
+
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let expected = format!("http://{}", host);
+        if origin.to_str().map(|o| o != expected).unwrap_or(true) {
+            return (StatusCode::FORBIDDEN, "Cross-origin request rejected").into_response();
+        }
+    }
+
+    if req.uri().path().starts_with("/api/") {
+        let presented = request_token(headers, req.uri().query());
+        let valid = presented
+            .map(|t| constant_time_eq(t.as_bytes(), state.api_token.as_bytes()))
+            .unwrap_or(false);
+        if !valid {
+            return (StatusCode::UNAUTHORIZED, "Missing or invalid API token").into_response();
+        }
+    }
+
+    next.run(req).await
+}
+
+fn request_token<'a>(headers: &'a HeaderMap, query: Option<&'a str>) -> Option<&'a str> {
+    if let Some(t) = headers.get(API_TOKEN_HEADER).and_then(|v| v.to_str().ok()) {
+        return Some(t);
+    }
+    // Tokens are hex, so no percent-decoding is needed.
+    query?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("token="))
+}
+
+fn is_allowed_host(host: &str) -> bool {
+    // Strip the port: "[::1]:8765" -> "[::1]", "127.0.0.1:8765" -> "127.0.0.1"
+    let name = if host.starts_with('[') {
+        match host.find(']') {
+            Some(end) => &host[1..end],
+            None => return false,
+        }
+    } else {
+        host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
+    };
+    name.eq_ignore_ascii_case("localhost") || name.parse::<IpAddr>().is_ok()
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn resolve_bind_ip(raw: &str) -> IpAddr {
+    match raw.trim().parse::<IpAddr>() {
+        Ok(ip) => ip,
+        Err(_) => {
+            tracing::warn!("Invalid bind_address '{}', falling back to 127.0.0.1", raw);
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        }
+    }
 }
 
 pub async fn start_server(port_override: Option<u16>) -> Result<()> {
@@ -117,6 +204,7 @@ pub async fn start_server_with_options(
         Arc::new(CredentialStore::new())
     };
     let port = port_override.unwrap_or(config.settings.web_port);
+    let bind_ip = resolve_bind_ip(&config.settings.bind_address);
 
     let config_arc = Arc::new(RwLock::new(config.clone()));
     let active_syncs = Arc::new(StdRwLock::new(HashMap::new()));
@@ -225,11 +313,18 @@ pub async fn start_server_with_options(
         credentials,
         scheduler: scheduler_arc,
         active_syncs,
+        api_token: Arc::from(generate_api_token()),
     };
 
     let app = create_router(state);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("🚀 MailBackup Studio running on http://127.0.0.1:{}", port);
+    let addr = SocketAddr::new(bind_ip, port);
+    if !bind_ip.is_loopback() {
+        tracing::warn!(
+            "Web UI / REST API is exposed on {} (bind_address). It is reachable from other machines on the network.",
+            addr
+        );
+    }
+    info!("🚀 MailBackup Studio running on http://127.0.0.1:{} (listening on {})", port, addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -237,24 +332,35 @@ pub async fn start_server_with_options(
 }
 
 // Static Assets Handler
-async fn serve_index() -> impl IntoResponse {
-    serve_file("index.html")
+async fn serve_index(State(state): State<AppState>) -> impl IntoResponse {
+    serve_file("index.html", &state.api_token)
 }
 
-async fn serve_static(Path(path): Path<String>) -> impl IntoResponse {
-    serve_file(&path)
+async fn serve_static(State(state): State<AppState>, Path(path): Path<String>) -> impl IntoResponse {
+    serve_file(&path, &state.api_token)
 }
 
-fn serve_file(path: &str) -> Response {
+fn serve_file(path: &str, api_token: &str) -> Response {
     let clean_path = path.trim_start_matches('/');
     match Assets::get(clean_path) {
         Some(content) => {
             let mime = mime_guess::from_path(clean_path).first_or_octet_stream();
-            let mut res = Response::new(Body::from(content.data));
+            let body = if clean_path == "index.html" {
+                // Hand the API token to the UI. Only same-origin pages can read this
+                // response: CORS is off and the Host check blocks DNS rebinding.
+                let html = String::from_utf8_lossy(&content.data).replace(API_TOKEN_PLACEHOLDER, api_token);
+                Body::from(html)
+            } else {
+                Body::from(content.data)
+            };
+            let mut res = Response::new(body);
             res.headers_mut().insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_str(mime.as_ref()).unwrap(),
             );
+            if clean_path == "index.html" {
+                res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            }
             res
         }
         None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
@@ -1655,3 +1761,144 @@ async fn api_clear_logs() -> impl IntoResponse {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    async fn test_router(dir: &std::path::Path) -> Router {
+        let config = AppConfig {
+            data_dir: dir.join("data"),
+            db_path: dir.join("catalog.db"),
+            ..AppConfig::default()
+        };
+        let db = Database::open_in_memory().unwrap();
+        let storage = StorageEngine::new(&config.data_dir);
+        let credentials = Arc::new(CredentialStore::with_paths(
+            dir.join(".credentials_store.json"),
+            dir.join(".credentials_key"),
+        ));
+        let scheduler = BackupScheduler::new(
+            Arc::new(config.clone()),
+            db.clone(),
+            storage.clone(),
+            credentials.clone(),
+        )
+        .await
+        .unwrap();
+        create_router(AppState {
+            config: Arc::new(RwLock::new(config)),
+            config_path: dir.join("config.yaml"),
+            db,
+            storage,
+            credentials,
+            scheduler: Arc::new(Mutex::new(scheduler)),
+            active_syncs: Arc::new(StdRwLock::new(HashMap::new())),
+            api_token: Arc::from(TOKEN),
+        })
+    }
+
+    async fn status(router: &Router, req: HttpRequest<Body>) -> StatusCode {
+        router.clone().oneshot(req).await.unwrap().status()
+    }
+
+    fn get(uri: &str, host: &str) -> axum::http::request::Builder {
+        HttpRequest::builder().uri(uri).header(header::HOST, host)
+    }
+
+    #[tokio::test]
+    async fn api_requires_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+
+        let no_token = get("/api/version", "127.0.0.1:8765").body(Body::empty()).unwrap();
+        assert_eq!(status(&router, no_token).await, StatusCode::UNAUTHORIZED);
+
+        let wrong = get("/api/version", "127.0.0.1:8765")
+            .header(API_TOKEN_HEADER, "nope")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status(&router, wrong).await, StatusCode::UNAUTHORIZED);
+
+        let header_ok = get("/api/version", "127.0.0.1:8765")
+            .header(API_TOKEN_HEADER, TOKEN)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status(&router, header_ok).await, StatusCode::OK);
+
+        let query_ok = get(&format!("/api/version?token={}", TOKEN), "localhost:8765")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status(&router, query_ok).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rejects_rebound_host_and_foreign_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+
+        // DNS rebinding: attacker domain resolving to 127.0.0.1
+        let rebound = get("/", "evil.example:8765").body(Body::empty()).unwrap();
+        assert_eq!(status(&router, rebound).await, StatusCode::FORBIDDEN);
+
+        let foreign = get("/api/version", "127.0.0.1:8765")
+            .header(header::ORIGIN, "https://evil.example")
+            .header(API_TOKEN_HEADER, TOKEN)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status(&router, foreign).await, StatusCode::FORBIDDEN);
+
+        let same_origin = get("/api/version", "127.0.0.1:8765")
+            .header(header::ORIGIN, "http://127.0.0.1:8765")
+            .header(API_TOKEN_HEADER, TOKEN)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status(&router, same_origin).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn no_cors_headers_and_index_carries_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+
+        let preflight = HttpRequest::builder()
+            .method("OPTIONS")
+            .uri("/api/accounts")
+            .header(header::HOST, "127.0.0.1:8765")
+            .header(header::ORIGIN, "https://evil.example")
+            .header("access-control-request-method", "PUT")
+            .body(Body::empty())
+            .unwrap();
+        let res = router.clone().oneshot(preflight).await.unwrap();
+        assert!(res.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+
+        let index = get("/", "127.0.0.1:8765").body(Body::empty()).unwrap();
+        let res = router.clone().oneshot(index).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains(TOKEN));
+        assert!(!html.contains(API_TOKEN_PLACEHOLDER));
+    }
+
+    #[test]
+    fn host_allowlist() {
+        assert!(is_allowed_host("127.0.0.1:8765"));
+        assert!(is_allowed_host("localhost:8765"));
+        assert!(is_allowed_host("[::1]:8765"));
+        assert!(is_allowed_host("192.168.1.20:8765"));
+        assert!(!is_allowed_host("evil.example:8765"));
+        assert!(!is_allowed_host("localhost.evil.example"));
+        assert!(!is_allowed_host("[::1"));
+    }
+
+    #[test]
+    fn bind_address_defaults_to_loopback() {
+        assert!(resolve_bind_ip(&AppConfig::default().settings.bind_address).is_loopback());
+        assert!(resolve_bind_ip("not-an-ip").is_loopback());
+    }
+}

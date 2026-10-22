@@ -103,6 +103,10 @@ pub struct GlobalSettings {
     pub notifications_enabled: bool,
     #[serde(default = "default_server_port")]
     pub web_port: u16,
+    /// Interface the web UI / REST API listens on. Loopback by default; set to
+    /// "0.0.0.0" only to deliberately expose the API on the local network.
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
     #[serde(default)]
@@ -119,6 +123,9 @@ fn default_schedule() -> String {
 fn default_server_port() -> u16 {
     8765
 }
+fn default_bind_address() -> String {
+    "127.0.0.1".to_string()
+}
 fn default_log_retention_days() -> Option<u32> {
     Some(30) // Default 30 days log retention
 }
@@ -132,6 +139,7 @@ impl Default for GlobalSettings {
             rate_limit_kbps: None,
             notifications_enabled: true,
             web_port: default_server_port(),
+            bind_address: default_bind_address(),
             close_to_tray: true,
             autostart: false,
             run_as_service: false,

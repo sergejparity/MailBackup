@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-cli"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2532,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2564,7 +2564,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-gui"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2581,7 +2581,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-server"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -2593,10 +2593,13 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

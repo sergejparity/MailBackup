@@ -83,6 +83,8 @@ cargo run -p mailbackup-server
 
 Open your browser at `http://127.0.0.1:8765` to access the full offline email browser, attachment previewer, and account manager.
 
+**API access:** the server listens on `127.0.0.1` only. Every `/api/*` request must carry a random per-process token, which the server embeds in the page it serves, so other websites and DNS-rebinding attacks can't call the API. To deliberately expose the Web Studio on your local network, set `settings.bind_address: 0.0.0.0` in `config.yaml`. The token is still required.
+
 ### 4. Running the Desktop GUI
 
 ```bash
