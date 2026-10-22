@@ -6,19 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <meta name="mailbackup-api-token" content="__MAILBACKUP_API_TOKEN__">
   <title>MailBackup Studio</title>
-  <script>
-    (function() {
-      try {
-        const savedTheme = localStorage.getItem('mailbackup_theme') || 'system';
-        let effective = savedTheme;
-        if (savedTheme === 'system') {
-          effective = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-        }
-        document.documentElement.setAttribute('data-theme', effective);
-        document.documentElement.setAttribute('data-theme-preference', savedTheme);
-      } catch (e) {}
-    })();
-  </script>
+  <script src="/theme-init.js"></script>
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon.png">
   <link rel="icon" type="image/png" sizes="64x64" href="/favicon-64.png">
   <link rel="icon" type="image/x-icon" href="/favicon.ico">

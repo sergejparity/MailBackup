@@ -46,6 +46,32 @@ pub struct AttachmentRecord {
     pub size_bytes: u64,
 }
 
+/// Start/end highlight markers passed to FTS5 `snippet()`. Control characters
+/// cannot be spoofed by HTML in the indexed text, unlike literal `<b>` tags.
+const SNIPPET_MARK_START: char = '\u{2}';
+const SNIPPET_MARK_END: char = '\u{3}';
+
+/// Converts a raw FTS5 snippet into safe HTML: the (sender-controlled) text is
+/// HTML-escaped, other control characters are dropped, and only the match
+/// markers become `<b>`/`</b>`.
+pub fn snippet_to_html(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 16);
+    for c in raw.chars() {
+        match c {
+            SNIPPET_MARK_START => out.push_str("<b>"),
+            SNIPPET_MARK_END => out.push_str("</b>"),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c if c.is_control() && c != '\n' && c != '\t' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub message_id: String,
@@ -734,7 +760,7 @@ impl Database {
                 r#"
                 SELECT 
                     m.id, m.account_id, f.remote_name, m.subject, m.from_addr, m.to_addrs, m.date, m.relative_path,
-                    snippet(messages_fts, -1, '<b>', '</b>', '...', 15) as snip
+                    snippet(messages_fts, -1, char(2), char(3), '...', 15) as snip
                 FROM messages_fts
                 JOIN messages m ON m.id = messages_fts.message_id
                 JOIN folders f ON f.id = m.folder_id
@@ -774,7 +800,7 @@ impl Database {
                 to_addrs: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                 date,
                 relative_path: row.get(7)?,
-                snippet: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                snippet: snippet_to_html(&row.get::<_, Option<String>>(8)?.unwrap_or_default()),
             })
         })?;
 

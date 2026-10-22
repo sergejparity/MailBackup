@@ -1050,10 +1050,13 @@ function renderModalAccounts() {
         </div>
       </div>
       <div style="display: flex; gap: 8px;">
-        <button class="btn btn-sm btn-secondary" onclick="openEditAccount('${acc.id}')">Edit</button>
-        <button class="btn btn-sm btn-ghost" style="color: var(--accent-rose);" onclick="deleteAccount('${acc.id}')">Remove</button>
+        <button class="btn btn-sm btn-secondary" data-action="edit">Edit</button>
+        <button class="btn btn-sm btn-ghost" style="color: var(--accent-rose);" data-action="remove">Remove</button>
       </div>
     `;
+    // Bound here rather than via inline onclick attributes, which the Content-Security-Policy blocks.
+    row.querySelector('[data-action="edit"]').addEventListener('click', () => openEditAccount(acc.id));
+    row.querySelector('[data-action="remove"]').addEventListener('click', () => deleteAccount(acc.id));
     el.modalAccountsList.appendChild(row);
   });
 }

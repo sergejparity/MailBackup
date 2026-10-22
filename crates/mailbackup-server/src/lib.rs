@@ -59,6 +59,20 @@ pub struct AppState {
 }
 
 pub const API_TOKEN_HEADER: &str = "x-mailbackup-token";
+
+/// Scripts may only come from this server's own files: no inline or injected
+/// scripts. Styles/fonts/images stay permissive so archived HTML mail (rendered
+/// in a srcdoc iframe, which inherits this policy) keeps its look.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+    script-src 'self'; \
+    style-src 'self' 'unsafe-inline' https:; \
+    font-src 'self' data: https:; \
+    img-src 'self' data: blob: cid: https: http:; \
+    connect-src 'self'; \
+    object-src 'none'; \
+    base-uri 'none'; \
+    form-action 'self'; \
+    frame-ancestors 'self'";
 const API_TOKEN_PLACEHOLDER: &str = "__MAILBACKUP_API_TOKEN__";
 
 /// Generates a random 256-bit API token (hex encoded) from the OS CSPRNG.
@@ -140,7 +154,12 @@ async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> R
         }
     }
 
-    next.run(req).await
+    let mut res = next.run(req).await;
+    let headers = res.headers_mut();
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CONTENT_SECURITY_POLICY));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    res
 }
 
 fn request_token<'a>(headers: &'a HeaderMap, query: Option<&'a str>) -> Option<&'a str> {
@@ -1883,6 +1902,30 @@ mod tests {
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains(TOKEN));
         assert!(!html.contains(API_TOKEN_PLACEHOLDER));
+    }
+
+    #[tokio::test]
+    async fn responses_carry_csp_without_inline_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+
+        let res = router
+            .clone()
+            .oneshot(get("/", "127.0.0.1:8765").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let csp = res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap().to_str().unwrap().to_string();
+        let script_src = csp.split(';').map(str::trim).find(|d| d.starts_with("script-src")).unwrap();
+        assert_eq!(script_src, "script-src 'self'");
+        assert_eq!(res.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+
+        // The served UI must not rely on inline scripts or inline event handlers.
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(!html.contains("<script>"), "inline <script> would be blocked by the CSP");
+        assert!(!html.contains(" onclick="));
+        let app_js = Assets::get("app.js").unwrap();
+        assert!(!String::from_utf8_lossy(&app_js.data).contains(" onclick="));
     }
 
     #[test]
