@@ -286,9 +286,6 @@ fn handle_account_add(
 
     let schedule = args.schedule.or_else(|| Some("0 0 * * *".to_string()));
 
-    // Store password securely
-    credentials.set_password(&id, &password)?;
-
     let account = AccountConfig {
         id: id.clone(),
         name,
@@ -305,6 +302,9 @@ fn handle_account_add(
         gmail_smart_labels: true,
         enabled: true,
     };
+
+    // Store password securely, bound to this server/port/username
+    credentials.set_account_password(&account, &password)?;
 
     config.accounts.retain(|a| a.id != id);
     config.accounts.push(account);
@@ -363,7 +363,7 @@ async fn handle_account_test(
         .get_account(account_id)
         .context(format!("Account '{}' not found", account_id))?;
 
-    let password = credentials.get_password(&acc.id)?;
+    let password = credentials.get_account_password(acc)?;
     println!("Connecting to {} ({}:{})...", acc.email, acc.imap_server, acc.imap_port);
 
     let mut session = ImapSyncEngine::connect(acc, &password).await?;
@@ -461,8 +461,8 @@ fn handle_account_import_csv(
     let save_path = config_path.unwrap_or_else(|| mailbackup_core::config::default_config_path().leak());
 
     for acc in &report.valid_accounts {
-        credentials.set_password(&acc.id, &acc.password)?;
         let cfg_acc = acc.to_account_config();
+        credentials.set_account_password(&cfg_acc, &acc.password)?;
         let acc_id = cfg_acc.id.clone();
         config.accounts.retain(|a| a.id != acc_id);
         config.accounts.push(cfg_acc);
@@ -502,7 +502,7 @@ async fn handle_sync(
 
     for acc in accounts_to_sync {
         println!("\nSyncing account: {} ({})", style(&acc.id).bold().cyan(), acc.email);
-        let password = match credentials.get_password(&acc.id) {
+        let password = match credentials.get_account_password(acc) {
             Ok(p) => p,
             Err(e) => {
                 println!("{} Skipping {}: Cannot retrieve password ({})", WARN_EMOJI, acc.id, e);

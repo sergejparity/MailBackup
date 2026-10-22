@@ -652,6 +652,9 @@ function initEventListeners() {
   if (el.btnCloseEditModal) el.btnCloseEditModal.addEventListener('click', () => closeModal(el.editAccountModal));
   if (el.btnCancelEdit) el.btnCancelEdit.addEventListener('click', () => closeModal(el.editAccountModal));
   if (el.editAccountForm) el.editAccountForm.addEventListener('submit', handleSaveAccountEdit);
+  [el.editServer, el.editPort, el.editUsername].forEach(input => {
+    if (input) input.addEventListener('input', updateEditPasswordRequirement);
+  });
 
   // Bulk Import Actions
   if (el.btnTabAddSingle) el.btnTabAddSingle.addEventListener('click', () => switchTab('tab-add'));
@@ -1091,6 +1094,8 @@ window.openEditAccount = function(accountId) {
   el.editPort.value = acc.imap_port;
   el.editUsername.value = acc.username;
   el.editPassword.value = '';
+  state.editOriginalConnection = connectionKey(acc.imap_server, acc.imap_port, acc.username);
+  updateEditPasswordRequirement();
   el.editRetention.value = acc.retention_days || 0;
   el.editSchedule.value = acc.schedule || '0 0 * * *';
   el.editEnabled.checked = acc.enabled !== false;
@@ -1098,9 +1103,37 @@ window.openEditAccount = function(accountId) {
   openModal(el.editAccountModal);
 };
 
+// Same comparison as the server: server (trimmed, case-insensitive), port, username (trimmed).
+function connectionKey(server, port, username) {
+  return `${String(server || '').trim().toLowerCase()}\u0000${parseInt(port)}\u0000${String(username || '').trim()}`;
+}
+
+function editConnectionChanged() {
+  return connectionKey(el.editServer.value, el.editPort.value, el.editUsername.value) !== state.editOriginalConnection;
+}
+
+// The stored password belongs to the current server, so changing the server,
+// port or username requires entering it again.
+function updateEditPasswordRequirement() {
+  const required = editConnectionChanged();
+  el.editPassword.required = required;
+  el.editPassword.placeholder = required ? 'Required: enter the password for the new connection' : '(Leave blank to keep current password)';
+  const hint = document.getElementById('edit-password-hint');
+  if (hint) {
+    hint.textContent = required
+      ? 'Required when changing server, port or username.'
+      : 'Only fill this if you want to update your stored password.';
+  }
+}
+
 async function handleSaveAccountEdit(e) {
   e.preventDefault();
   const accountId = el.editAccountId.value;
+  if (editConnectionChanged() && !el.editPassword.value) {
+    showToast('Enter the account password to change the server, port or username.');
+    el.editPassword.focus();
+    return;
+  }
   const payload = {
     name: el.editName.value.trim(),
     server: el.editServer.value.trim(),

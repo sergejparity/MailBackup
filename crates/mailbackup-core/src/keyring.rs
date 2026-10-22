@@ -1,3 +1,4 @@
+use crate::config::AccountConfig;
 use crate::error::{Error, Result};
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -41,39 +42,73 @@ impl CredentialStore {
     }
 
     pub fn set_password(&self, account_id: &str, secret: &str) -> Result<()> {
-        let key = format!("account:{}", account_id);
+        self.set_secret(&format!("account:{}", account_id), secret)
+    }
 
+    pub fn get_password(&self, account_id: &str) -> Result<String> {
+        self.get_secret(&format!("account:{}", account_id))
+    }
+
+    pub fn delete_password(&self, account_id: &str) -> Result<()> {
+        self.delete_secret(&format!("account:{}", account_id));
+        self.delete_secret(&binding_key(account_id));
+        Ok(())
+    }
+
+    /// Stores an account's password together with a fingerprint of the
+    /// server/port/username it was entered for (see [`connection_binding`]).
+    pub fn set_account_password(&self, account: &AccountConfig, secret: &str) -> Result<()> {
+        self.set_password(&account.id, secret)?;
+        self.set_secret(&binding_key(&account.id), &connection_binding(account))
+    }
+
+    /// Returns an account's password only if it was entered for the account's
+    /// current server/port/username, so a changed config (through the API or an
+    /// edit on disk) never sends the old password to a different server.
+    ///
+    /// Passwords saved before bindings existed are bound to the current settings
+    /// on first use (trust on first use), so existing scheduled backups keep working.
+    pub fn get_account_password(&self, account: &AccountConfig) -> Result<String> {
+        let secret = self.get_password(&account.id)?;
+        let expected = connection_binding(account);
+        match self.get_secret(&binding_key(&account.id)) {
+            Ok(stored) if stored == expected => Ok(secret),
+            Ok(_) => Err(Error::CredentialMismatch(account.id.clone())),
+            Err(_) => {
+                self.set_secret(&binding_key(&account.id), &expected)?;
+                Ok(secret)
+            }
+        }
+    }
+
+    fn set_secret(&self, key: &str, secret: &str) -> Result<()> {
         // Persist to encrypted local fallback store
-        self.set_fallback(&key, secret)?;
+        self.set_fallback(key, secret)?;
 
         // Also persist to OS Keyring if available
-        if let Ok(entry) = keyring::Entry::new(SERVICE_NAME, &key) {
+        if let Ok(entry) = keyring::Entry::new(SERVICE_NAME, key) {
             let _ = entry.set_password(secret);
         }
         Ok(())
     }
 
-    pub fn get_password(&self, account_id: &str) -> Result<String> {
-        let key = format!("account:{}", account_id);
-
+    fn get_secret(&self, key: &str) -> Result<String> {
         // Try OS Keyring first
-        if let Ok(entry) = keyring::Entry::new(SERVICE_NAME, &key) {
+        if let Ok(entry) = keyring::Entry::new(SERVICE_NAME, key) {
             if let Ok(secret) = entry.get_password() {
                 return Ok(secret);
             }
         }
 
         // Try encrypted fallback store
-        self.get_fallback(&key)
+        self.get_fallback(key)
     }
 
-    pub fn delete_password(&self, account_id: &str) -> Result<()> {
-        let key = format!("account:{}", account_id);
-        if let Ok(entry) = keyring::Entry::new(SERVICE_NAME, &key) {
+    fn delete_secret(&self, key: &str) {
+        if let Ok(entry) = keyring::Entry::new(SERVICE_NAME, key) {
             let _ = entry.delete_credential();
         }
-        let _ = self.delete_fallback(&key);
-        Ok(())
+        let _ = self.delete_fallback(key);
     }
 
     pub fn get_master_key(&self) -> [u8; 32] {
@@ -210,6 +245,23 @@ impl Default for CredentialStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn binding_key(account_id: &str) -> String {
+    format!("account:{}:binding", account_id)
+}
+
+/// Fingerprint of the connection a password belongs to: SHA-256 over the
+/// server (trimmed, lowercase), port and username (trimmed).
+pub fn connection_binding(account: &AccountConfig) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(account.imap_server.trim().to_lowercase().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(account.imap_port.to_string().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(account.username.trim().as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn encrypt_secret(secret: &str, master_key: &[u8; 32]) -> Result<String> {

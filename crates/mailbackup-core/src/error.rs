@@ -38,6 +38,9 @@ pub enum Error {
     #[error("{0}")]
     InvalidPath(String),
 
+    #[error("The saved password for account '{0}' belongs to a different server, port or username. Enter the password again.")]
+    CredentialMismatch(String),
+
     #[error("Parsing error: {0}")]
     Parse(String),
 
