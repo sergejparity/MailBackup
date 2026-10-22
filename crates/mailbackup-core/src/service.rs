@@ -99,38 +99,88 @@ pub fn is_valid_user_name(name: &str) -> bool {
     }
 }
 
-/// The account the service will run as: the user running MailBackup.
-pub fn current_user() -> Result<String> {
+pub fn is_privileged_account(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    name == "root" || upper == "SYSTEM" || upper.ends_with("\\SYSTEM") || upper == "S-1-5-18"
+}
+
+/// Name of the account this process runs as.
+fn process_user() -> Result<String> {
     #[cfg(windows)]
     let name = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
         (Ok(d), Ok(u)) if !d.is_empty() => format!("{}\\{}", d, u),
         (_, Ok(u)) => u,
-        _ => command_output("whoami", &[])?,
+        _ => command_output(&system_tool("whoami"), &[])?,
     };
     #[cfg(not(windows))]
     let name = match std::env::var("USER").or_else(|_| std::env::var("LOGNAME")) {
         Ok(u) if !u.is_empty() => u,
-        _ => command_output("whoami", &[])?,
+        _ => command_output(&trusted_program("whoami")?, &[])?,
     };
-
-    if !is_valid_user_name(&name) {
-        return Err(Error::Config(format!("Unsupported account name for the background service: {:?}", name)));
-    }
-    if name == "root" || name.eq_ignore_ascii_case("SYSTEM") || name.to_ascii_uppercase().ends_with("\\SYSTEM") {
-        return Err(Error::Config(
-            "Run MailBackup as your normal user to install the background service; it must not run as root/SYSTEM.".into(),
-        ));
-    }
     Ok(name)
 }
 
-fn command_output(program: &str, args: &[&str]) -> Result<String> {
+/// Picks the account the service should run as. Normally that's the user running
+/// MailBackup. When MailBackup itself runs privileged (an old root/SYSTEM service
+/// serving the UI), it's the first non-root owner of the config file or its
+/// parent folders, i.e. the person whose configuration this is.
+pub fn choose_service_user(process_user: &str, path_owners: &[Option<String>]) -> Result<String> {
+    let candidate = if is_privileged_account(process_user) {
+        path_owners
+            .iter()
+            .flatten()
+            .find(|owner| !is_privileged_account(owner))
+            .cloned()
+            .ok_or_else(|| {
+                Error::Config(
+                    "MailBackup is running with administrator rights and can't tell which user the service \
+                     should run as. Install the service from your own user session instead."
+                        .into(),
+                )
+            })?
+    } else {
+        process_user.to_string()
+    };
+    if !is_valid_user_name(&candidate) {
+        return Err(Error::Config(format!("Unsupported account name for the background service: {:?}", candidate)));
+    }
+    Ok(candidate)
+}
+
+/// The account the service will run as, for the configuration at `config_path`.
+pub fn service_user(config_path: &Path) -> Result<String> {
+    let user = process_user()?;
+    #[cfg(unix)]
+    let owners: Vec<Option<String>> = if is_privileged_account(&user) {
+        config_path.ancestors().take(3).map(owner_name).collect()
+    } else {
+        Vec::new()
+    };
+    // Windows: resolving file owners needs Win32 APIs; installing from a SYSTEM
+    // process is refused by choose_service_user instead.
+    #[cfg(not(unix))]
+    let owners: Vec<Option<String>> = {
+        let _ = config_path;
+        Vec::new()
+    };
+    choose_service_user(&user, &owners)
+}
+
+#[cfg(unix)]
+fn owner_name(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata(path).ok()?.uid();
+    let id = trusted_program("id").ok()?;
+    command_output(&id, &["-nu", &uid.to_string()]).ok()
+}
+
+fn command_output(program: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new(program)
         .args(args)
         .output()
-        .map_err(|e| Error::Config(format!("Failed to run {}: {}", program, e)))?;
+        .map_err(|e| Error::Config(format!("Failed to run {}: {}", program.display(), e)))?;
     if !out.status.success() {
-        return Err(Error::Config(format!("{} exited with {}", program, out.status)));
+        return Err(Error::Config(format!("{} exited with {}", program.display(), out.status)));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -176,14 +226,17 @@ pub fn xml_escape(value: &str) -> String {
     out
 }
 
-fn service_log_paths() -> (PathBuf, PathBuf) {
-    let log_dir = crate::config::default_base_dir().join("logs");
+/// Service logs live next to the config (not in the installing process's home,
+/// which is root's when an old root service performs the migration).
+fn service_log_paths(config_path: &Path) -> (PathBuf, PathBuf) {
+    let base = config_path.parent().map(Path::to_path_buf).unwrap_or_else(crate::config::default_base_dir);
+    let log_dir = base.join("logs");
     (log_dir.join("service.log"), log_dir.join("service_err.log"))
 }
 
 /// systemd system unit that runs the server as `user`.
 pub fn generate_linux_systemd(server_exe: &Path, config_path: &Path, user: &str) -> String {
-    let (out_log, err_log) = service_log_paths();
+    let (out_log, err_log) = service_log_paths(config_path);
     format!(
         r#"[Unit]
 Description=MailBackup Studio Headless Service
@@ -212,7 +265,7 @@ WantedBy=multi-user.target
 
 /// LaunchDaemon (starts at boot) that runs the server as `user`.
 pub fn generate_macos_plist(server_exe: &Path, config_path: &Path, user: &str) -> String {
-    let (out_log, err_log) = service_log_paths();
+    let (out_log, err_log) = service_log_paths(config_path);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -333,7 +386,9 @@ pub fn task_runs_as(xml: &str) -> Option<String> {
 pub struct ServiceEnv {
     pub server_exe: PathBuf,
     pub config_path: PathBuf,
-    pub user: String,
+    /// Account to run the service as. Only installing needs it, so removal still
+    /// works when it can't be determined (e.g. an old root service).
+    pub user: std::result::Result<String, String>,
     /// Private folder (0700) where definitions are staged before installing.
     pub staging_dir: PathBuf,
     /// Where the definition is installed (systemd unit / LaunchDaemon plist).
@@ -349,27 +404,41 @@ pub struct ServiceEnv {
 }
 
 impl ServiceEnv {
-    pub fn detect() -> Result<Self> {
-        let config_path = crate::config::default_config_path();
+    /// Environment for the configuration at `config_path` (the one the running
+    /// server uses, which may differ from the process's default).
+    pub fn detect(config_path: &Path) -> Result<Self> {
+        let config_path = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+        // Elevated helpers come from fixed system locations only (never PATH)
+        let tool = |name: &str| -> Result<PathBuf> {
+            if cfg!(target_os = "linux") {
+                trusted_program(name)
+            } else {
+                Ok(PathBuf::from(name))
+            }
+        };
         Ok(Self {
             owned_dirs: service_owned_dirs(&config_path),
             server_exe: find_server_executable(),
+            user: service_user(&config_path).map_err(|e| e.to_string()),
             config_path,
-            user: current_user()?,
             staging_dir: crate::config::default_base_dir().join("staging"),
             definition_path: PathBuf::from(if cfg!(target_os = "macos") { LAUNCHD_PLIST_PATH } else { SYSTEMD_UNIT_PATH }),
-            pkexec: find_program("pkexec"),
-            systemctl: find_program("systemctl"),
-            install: find_program("install"),
-            rm: find_program("rm"),
-            chown: find_program("chown"),
+            pkexec: tool("pkexec")?,
+            systemctl: tool("systemctl")?,
+            install: tool("install")?,
+            rm: tool("rm")?,
+            chown: tool("chown")?,
         })
+    }
+
+    fn require_user(&self) -> Result<&str> {
+        self.user.as_deref().map_err(|e| Error::Config(e.clone()))
     }
 }
 
-/// `~/.mailbackup` plus the data and database folders named in the config.
+/// The config's folder plus the data and database folders named in it.
 fn service_owned_dirs(config_path: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![crate::config::default_base_dir()];
+    let mut dirs: Vec<PathBuf> = config_path.parent().map(Path::to_path_buf).into_iter().collect();
     if let Some(cfg) = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|text| serde_yaml::from_str::<crate::config::AppConfig>(&text).ok())
@@ -384,16 +453,52 @@ fn service_owned_dirs(config_path: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Absolute path of `name` from PATH (pkexec resets PATH, so root commands get
-/// absolute paths); falls back to the bare name.
-fn find_program(name: &str) -> PathBuf {
-    std::env::var_os("PATH")
-        .and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|dir| dir.join(name))
-                .find(|candidate| candidate.is_file())
-        })
-        .unwrap_or_else(|| PathBuf::from(name))
+/// Fixed system folders that elevated helpers are taken from. The caller's PATH
+/// is never consulted: a writable folder early in PATH could otherwise plant a
+/// helper that pkexec would run as root.
+#[cfg_attr(not(unix), allow(dead_code))]
+const TRUSTED_BIN_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+/// Absolute path of a system program that is safe to run elevated: found in a
+/// fixed system folder, and (after resolving symlinks) owned by root and not
+/// writable by group/others, with the same holding for every parent folder.
+#[cfg(unix)]
+pub fn trusted_program(name: &str) -> Result<PathBuf> {
+    TRUSTED_BIN_DIRS
+        .iter()
+        .map(|dir| Path::new(dir).join(name))
+        .find(|candidate| candidate.is_file() && is_trusted_executable(candidate))
+        .ok_or_else(|| Error::Config(format!("Couldn't find a trusted system copy of `{}`.", name)))
+}
+
+#[cfg(not(unix))]
+pub fn trusted_program(name: &str) -> Result<PathBuf> {
+    Ok(system_tool(name))
+}
+
+/// True if `path` and all its parent folders are owned by root and not writable
+/// by group or others.
+#[cfg(unix)]
+pub fn is_trusted_executable(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(real) = std::fs::canonicalize(path) else { return false };
+    real.ancestors().all(|p| {
+        std::fs::metadata(p)
+            .map(|m| m.uid() == 0 && m.mode() & 0o022 == 0)
+            .unwrap_or(false)
+    })
+}
+
+/// `%SystemRoot%\System32\<name>.exe` on Windows (never resolved through PATH).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn system_tool(name: &str) -> PathBuf {
+    let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let exe = if name.ends_with(".exe") { name.to_string() } else { format!("{}.exe", name) };
+    if name.eq_ignore_ascii_case("powershell") {
+        root.join("System32").join("WindowsPowerShell").join("v1.0").join(exe)
+    } else {
+        root.join("System32").join(exe)
+    }
 }
 
 /// A definition written to the private staging folder; removed on drop.
@@ -451,7 +556,7 @@ fn run_checked(cmd: &mut Command, what: &str) -> Result<()> {
 
 /// Returns the manual installation shell command for display in the UI or CLI
 pub fn get_manual_install_command(server_exe: &Path, config_path: &Path) -> String {
-    let user = current_user().unwrap_or_else(|_| "<your-user>".to_string());
+    let user = service_user(config_path).unwrap_or_else(|_| "<your-user>".to_string());
 
     #[cfg(target_os = "macos")]
     {
@@ -545,7 +650,7 @@ pub fn get_service_status() -> ServiceStatus {
         let installed = content.is_some();
         let runs_as = content.as_deref().and_then(plist_runs_as);
         let running = installed
-            && Command::new("launchctl")
+            && Command::new("/bin/launchctl")
                 .args(["print", &format!("system/{}", SERVICE_IDENTIFIER)])
                 .output()
                 .map(|o| o.status.success())
@@ -565,7 +670,7 @@ pub fn get_service_status() -> ServiceStatus {
 
     #[cfg(target_os = "windows")]
     {
-        let xml = Command::new("schtasks")
+        let xml = Command::new(system_tool("schtasks"))
             .args(["/Query", "/TN", SERVICE_TASK_NAME, "/XML"])
             .output()
             .ok()
@@ -574,7 +679,7 @@ pub fn get_service_status() -> ServiceStatus {
         let installed = xml.is_some();
         let runs_as = xml.as_deref().and_then(task_runs_as);
         let running = installed
-            && Command::new("schtasks")
+            && Command::new(system_tool("schtasks"))
                 .args(["/Query", "/TN", SERVICE_TASK_NAME, "/FO", "CSV", "/NH"])
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).contains("Running"))
@@ -668,8 +773,10 @@ fn decode_task_query(bytes: &[u8]) -> String {
 
 /// Installs (or removes) the background service. Installing replaces any older
 /// definition, including one that ran as root/SYSTEM.
-pub fn set_service_enabled(enabled: bool) -> Result<()> {
-    let env = ServiceEnv::detect()?;
+/// `config_path` is the configuration the running server uses; the service is
+/// installed for that configuration and its owner.
+pub fn set_service_enabled(enabled: bool, config_path: &Path) -> Result<()> {
+    let env = ServiceEnv::detect(config_path)?;
     let log_dir = crate::config::default_base_dir().join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
     set_service_enabled_in(&env, enabled)
@@ -685,7 +792,8 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
             .map(|old| unit_runs_as(&old).is_none())
             .unwrap_or(false);
 
-        let content = generate_linux_systemd(&env.server_exe, &env.config_path, &env.user);
+        let user = env.require_user()?;
+        let content = generate_linux_systemd(&env.server_exe, &env.config_path, user);
         let staged = StagedFile::write(&env.staging_dir, "service", content.as_bytes())?;
         let staged_path = staged.0.to_string_lossy().to_string();
 
@@ -700,7 +808,7 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
         // The new file must be the one in place (runs as the user, not root)
         let installed = std::fs::read_to_string(&env.definition_path)
             .map_err(|e| Error::Config(format!("Service definition missing after install: {}", e)))?;
-        if unit_runs_as(&installed).as_deref() != Some(env.user.as_str()) {
+        if unit_runs_as(&installed).as_deref() != Some(user) {
             return Err(Error::Config("The installed service definition doesn't run as your user.".into()));
         }
 
@@ -711,7 +819,7 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
             run_checked(
                 Command::new(&env.pkexec)
                     .arg(&env.chown)
-                    .args(["-R", "-h", env.user.as_str()])
+                    .args(["-R", "-h", user])
                     .args(&existing_dirs),
                 "Giving your user ownership of files created by the old root service",
             )?;
@@ -745,6 +853,9 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+const OSASCRIPT: &str = "/usr/bin/osascript";
+
+#[cfg(target_os = "macos")]
 pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
     // Constant scripts: the only variable (the staged file) arrives via the
     // environment and is shell-quoted by AppleScript's `quoted form of`.
@@ -766,12 +877,13 @@ do shell script fixOwner & "/usr/bin/install -m 644 -o root -g wheel " & quoted 
         let migrating_from_root = std::fs::read_to_string(LAUNCHD_PLIST_PATH)
             .map(|old| plist_runs_as(&old).is_none())
             .unwrap_or(false);
-        let content = generate_macos_plist(&env.server_exe, &env.config_path, &env.user);
+        let user = env.require_user()?;
+        let content = generate_macos_plist(&env.server_exe, &env.config_path, user);
         let staged = StagedFile::write(&env.staging_dir, "plist", content.as_bytes())?;
-        let mut cmd = Command::new("osascript");
+        let mut cmd = Command::new(OSASCRIPT);
         cmd.args(["-e", INSTALL_SCRIPT])
             .env("MB_STAGED_PLIST", &staged.0)
-            .env("MB_USER", &env.user)
+            .env("MB_USER", user)
             .env("MB_CHOWN", if migrating_from_root { "1" } else { "0" });
         for (i, dir) in env.owned_dirs.iter().filter(|d| d.exists()).take(3).enumerate() {
             cmd.env(format!("MB_DIR_{}", i), dir);
@@ -780,11 +892,11 @@ do shell script fixOwner & "/usr/bin/install -m 644 -o root -g wheel " & quoted 
         drop(staged);
         let installed = std::fs::read_to_string(LAUNCHD_PLIST_PATH)
             .map_err(|e| Error::Config(format!("LaunchDaemon missing after install: {}", e)))?;
-        if plist_runs_as(&installed).as_deref() != Some(env.user.as_str()) {
+        if plist_runs_as(&installed).as_deref() != Some(user) {
             return Err(Error::Config("The installed LaunchDaemon doesn't run as your user.".into()));
         }
     } else if Path::new(LAUNCHD_PLIST_PATH).exists() {
-        run_checked(Command::new("osascript").args(["-e", UNINSTALL_SCRIPT]), "Removing the LaunchDaemon")?;
+        run_checked(Command::new(OSASCRIPT).args(["-e", UNINSTALL_SCRIPT]), "Removing the LaunchDaemon")?;
         if Path::new(LAUNCHD_PLIST_PATH).exists() {
             return Err(Error::Config(format!("{} is still present after removal.", LAUNCHD_PLIST_PATH)));
         }
@@ -795,12 +907,12 @@ do shell script fixOwner & "/usr/bin/install -m 644 -o root -g wheel " & quoted 
 #[cfg(target_os = "windows")]
 pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
     // Constant commands: the staged XML path is read from the environment.
-    const CREATE_PS: &str = "$p = Start-Process -FilePath schtasks.exe -ArgumentList @('/Create','/TN','MailBackupService','/XML',('\"' + $env:MB_TASK_XML + '\"'),'/F') -Verb RunAs -Wait -PassThru; exit $p.ExitCode";
-    const DELETE_PS: &str = "$e = Start-Process -FilePath schtasks.exe -ArgumentList @('/End','/TN','MailBackupService') -Verb RunAs -Wait -PassThru; $p = Start-Process -FilePath schtasks.exe -ArgumentList @('/Delete','/TN','MailBackupService','/F') -Verb RunAs -Wait -PassThru; exit $p.ExitCode";
-    const RUN_PS: &str = "$p = Start-Process -FilePath schtasks.exe -ArgumentList @('/Run','/TN','MailBackupService') -Verb RunAs -Wait -PassThru; exit $p.ExitCode";
+    const CREATE_PS: &str = "$p = Start-Process -FilePath \"$env:SystemRoot\\System32\\schtasks.exe\" -ArgumentList @('/Create','/TN','MailBackupService','/XML',('\"' + $env:MB_TASK_XML + '\"'),'/F') -Verb RunAs -Wait -PassThru; exit $p.ExitCode";
+    const DELETE_PS: &str = "$e = Start-Process -FilePath \"$env:SystemRoot\\System32\\schtasks.exe\" -ArgumentList @('/End','/TN','MailBackupService') -Verb RunAs -Wait -PassThru; $p = Start-Process -FilePath \"$env:SystemRoot\\System32\\schtasks.exe\" -ArgumentList @('/Delete','/TN','MailBackupService','/F') -Verb RunAs -Wait -PassThru; exit $p.ExitCode";
+    const RUN_PS: &str = "$p = Start-Process -FilePath \"$env:SystemRoot\\System32\\schtasks.exe\" -ArgumentList @('/Run','/TN','MailBackupService') -Verb RunAs -Wait -PassThru; exit $p.ExitCode";
 
     let task_exists = || {
-        Command::new("schtasks")
+        Command::new(system_tool("schtasks"))
             .args(["/Query", "/TN", SERVICE_TASK_NAME])
             .output()
             .map(|o| o.status.success())
@@ -808,13 +920,14 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
     };
 
     if enabled {
-        let xml = generate_windows_task_xml(&env.server_exe, &env.config_path, &env.user);
+        let user = env.require_user()?;
+        let xml = generate_windows_task_xml(&env.server_exe, &env.config_path, user);
         // Task Scheduler expects UTF-16 with a BOM for an encoding="UTF-16" document
         let mut bytes = vec![0xFF, 0xFE];
         bytes.extend(xml.encode_utf16().flat_map(|u| u.to_le_bytes()));
         let staged = StagedFile::write(&env.staging_dir, "xml", &bytes)?;
         run_checked(
-            Command::new("powershell")
+            Command::new(system_tool("powershell"))
                 .args(["-NoProfile", "-NonInteractive", "-Command", CREATE_PS])
                 .env("MB_TASK_XML", &staged.0),
             "Registering the background task",
@@ -827,14 +940,14 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
         // Start it now. The task was registered elevated, so an un-elevated /Run
         // can be denied under a UAC split token; retry elevated. If that's
         // declined too, the task still starts at the next boot.
-        let started = Command::new("schtasks")
+        let started = Command::new(system_tool("schtasks"))
             .args(["/Run", "/TN", SERVICE_TASK_NAME])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
         if !started {
             if let Err(e) = run_checked(
-                Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", RUN_PS]),
+                Command::new(system_tool("powershell")).args(["-NoProfile", "-NonInteractive", "-Command", RUN_PS]),
                 "Starting the background task",
             ) {
                 tracing::warn!("{} It will start at the next boot.", e);
@@ -842,15 +955,15 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
         }
     } else if task_exists() {
         // Un-elevated first; DELETE_PS ends and deletes it elevated if denied
-        let _ = Command::new("schtasks").args(["/End", "/TN", SERVICE_TASK_NAME]).status();
-        let deleted = Command::new("schtasks")
+        let _ = Command::new(system_tool("schtasks")).args(["/End", "/TN", SERVICE_TASK_NAME]).status();
+        let deleted = Command::new(system_tool("schtasks"))
             .args(["/Delete", "/TN", SERVICE_TASK_NAME, "/F"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
         if !deleted {
             run_checked(
-                Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", DELETE_PS]),
+                Command::new(system_tool("powershell")).args(["-NoProfile", "-NonInteractive", "-Command", DELETE_PS]),
                 "Removing the background task",
             )?;
         }
@@ -911,6 +1024,46 @@ mod tests {
         assert_eq!(task_runs_as(&xml).as_deref(), Some(r"PC\alice"));
         assert_eq!(task_runs_as("<UserId>S-1-5-18</UserId>"), None);
         assert_eq!(task_runs_as("<UserId>NT AUTHORITY\\SYSTEM</UserId>"), None);
+    }
+
+    #[test]
+    fn service_user_when_running_privileged() {
+        // Normal case: the user running MailBackup
+        assert_eq!(choose_service_user("alice", &[]).unwrap(), "alice");
+        // Old root service: the owner of the config (or its folders), never root
+        let owners = [Some("root".to_string()), None, Some("alice".to_string())];
+        assert_eq!(choose_service_user("root", &owners).unwrap(), "alice");
+        assert!(choose_service_user("root", &[Some("root".to_string())]).is_err());
+        assert!(choose_service_user("NT AUTHORITY\\SYSTEM", &[]).is_err());
+        // Owner names are validated like any other account name
+        assert!(choose_service_user("root", &[Some("a\nUser=root".to_string())]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn elevated_helpers_come_from_trusted_system_folders() {
+        // Real system tools resolve to root-owned files in fixed folders
+        let install = trusted_program("install").unwrap();
+        assert!(TRUSTED_BIN_DIRS.iter().any(|d| install.starts_with(d)), "{}", install.display());
+        assert!(is_trusted_executable(&install));
+
+        // A copy in a user/tmp folder is never trusted, whatever PATH says
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("install");
+        std::fs::write(&fake, "#!/bin/sh\n").unwrap();
+        assert!(!is_trusted_executable(&fake));
+        assert!(trusted_program("definitely-not-a-real-tool-xyz").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_system_binary_is_not_trusted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, "x").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!is_trusted_executable(&tool));
     }
 
     #[test]

@@ -84,7 +84,7 @@ fn fixture(fault: Fault) -> Fixture {
     let env = ServiceEnv {
         server_exe: PathBuf::from("/opt/mailbackup/mailbackup-server"),
         config_path: PathBuf::from("/home/alice/.mailbackup/config.yaml"),
-        user: "alice".to_string(),
+        user: Ok("alice".to_string()),
         staging_dir: dir.path().join("home/.mailbackup/staging"),
         definition_path: dir.path().join("etc/mailbackup.service"),
         pkexec: bin.join("pkexec"),
@@ -249,4 +249,43 @@ fn failed_ownership_fix_stops_the_migration() {
     let err = set_service_enabled_in(&f.env, true).unwrap_err().to_string();
     assert!(err.contains("ownership"), "{err}");
     assert!(!calls(&f).iter().any(|l| l.contains("systemctl")), "{:?}", calls(&f));
+}
+
+#[test]
+fn removal_works_without_a_service_user() {
+    // e.g. the old root service serving the UI couldn't determine an account
+    let mut f = fixture(Fault::None);
+    f.env.user = Err("can't tell which user".to_string());
+    install_fixture_unit(&f);
+    set_service_enabled_in(&f.env, false).unwrap();
+    assert!(!f.env.definition_path.exists());
+
+    // ...while installing reports why it can't proceed, before running anything
+    let err = set_service_enabled_in(&f.env, true).unwrap_err().to_string();
+    assert!(err.contains("can't tell which user"), "{err}");
+    assert!(!calls(&f).iter().any(|l| l.starts_with("pkexec") && l.contains("install")));
+}
+
+#[test]
+fn privileged_process_installs_for_the_config_owner() {
+    use std::os::unix::fs::MetadataExt;
+    // Needs root to hand a file to another account; skipped otherwise
+    if std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(1) != 0 {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.yaml");
+    std::fs::write(&config, "x").unwrap();
+    let status = std::process::Command::new("/bin/chown").args(["nobody", config.to_str().unwrap()]).status().unwrap();
+    assert!(status.success());
+
+    // The old root service: USER=root, but the config belongs to `nobody`
+    std::env::set_var("USER", "root");
+    assert_eq!(mailbackup_core::service::service_user(&config).unwrap(), "nobody");
+
+    // A config that only root owns gives no safe account to install for
+    let root_only = dir.path().join("root.yaml");
+    std::fs::write(&root_only, "x").unwrap();
+    // (the temp dir and its parent are root-owned too)
+    assert!(mailbackup_core::service::service_user(&root_only).is_err());
 }
