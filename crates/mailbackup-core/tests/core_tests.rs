@@ -942,3 +942,81 @@ fn test_search_snippet_escapes_html_from_email() {
         "a <b>&lt;b&gt;&amp;</b> &quot;q&quot; &#39;x&#39;[31m"
     );
 }
+
+fn binding_test_account(id: &str) -> AccountConfig {
+    AccountConfig {
+        id: id.to_string(),
+        name: "Bound".to_string(),
+        email: "bound@example.com".to_string(),
+        provider: ProviderType::GenericImap,
+        imap_server: "imap.example.com".to_string(),
+        imap_port: 993,
+        use_tls: true,
+        auth_type: AuthType::Password,
+        username: "bound@example.com".to_string(),
+        schedule: None,
+        retention_days: None,
+        folder_filter: FolderFilter::default(),
+        gmail_smart_labels: true,
+        enabled: true,
+    }
+}
+
+#[test]
+fn test_password_is_bound_to_connection() {
+    let dir = tempdir().unwrap();
+    let store = CredentialStore::with_fallback_path(dir.path().join("secrets.json"));
+    // Unique id so a real OS keyring on a developer machine can't interfere
+    let id = format!("binding-{}", uuid::Uuid::new_v4().simple());
+    let acc = binding_test_account(&id);
+
+    store.set_account_password(&acc, "pw1").unwrap();
+    assert_eq!(store.get_account_password(&acc).unwrap(), "pw1");
+
+    // Case / whitespace differences in the server name are the same connection
+    let mut same = acc.clone();
+    same.imap_server = "  IMAP.Example.com ".to_string();
+    assert_eq!(store.get_account_password(&same).unwrap(), "pw1");
+
+    // Any real change to server, port or username withholds the password
+    let mut other_server = acc.clone();
+    other_server.imap_server = "imap.attacker.example".to_string();
+    let mut other_port = acc.clone();
+    other_port.imap_port = 1993;
+    let mut other_user = acc.clone();
+    other_user.username = "someone-else".to_string();
+    for changed in [&other_server, &other_port, &other_user] {
+        assert!(matches!(
+            store.get_account_password(changed),
+            Err(mailbackup_core::Error::CredentialMismatch(_))
+        ));
+    }
+
+    // Entering the password again for the new server rebinds it
+    store.set_account_password(&other_server, "pw2").unwrap();
+    assert_eq!(store.get_account_password(&other_server).unwrap(), "pw2");
+    assert!(store.get_account_password(&acc).is_err());
+
+    store.delete_password(&id).unwrap();
+    assert!(store.get_account_password(&other_server).is_err());
+}
+
+#[test]
+fn test_legacy_password_is_bound_on_first_use() {
+    let dir = tempdir().unwrap();
+    let store = CredentialStore::with_fallback_path(dir.path().join("secrets.json"));
+    let id = format!("legacy-{}", uuid::Uuid::new_v4().simple());
+    let acc = binding_test_account(&id);
+
+    // Saved by an older version: no binding yet
+    store.set_password(&id, "legacy-pw").unwrap();
+    assert_eq!(store.get_account_password(&acc).unwrap(), "legacy-pw");
+
+    // From then on it is tied to that connection
+    let mut moved = acc.clone();
+    moved.imap_server = "imap.other.example".to_string();
+    assert!(store.get_account_password(&moved).is_err());
+    assert_eq!(store.get_account_password(&acc).unwrap(), "legacy-pw");
+
+    store.delete_password(&id).unwrap();
+}

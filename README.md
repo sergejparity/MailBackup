@@ -113,6 +113,11 @@ settings:
 - A new archive folder must be new or empty (macOS/Windows metadata files such as `.DS_Store` are ignored). An existing MailBackup archive, for example on an external drive, can be used in place with "Move existing backup files" unticked. A new database path must end in `.db`.
 - The CLI (`export-mbox`) is not restricted.
 
+**Account passwords are tied to their server:** each saved password is bound to the account's server, port and username.
+- Changing any of these in the web UI requires entering the password again.
+- If `config.yaml` is edited to point an account somewhere else, sync refuses to send the old password ("The saved password … belongs to a different server …") until it is re-entered.
+- Passwords saved by older versions are bound to the current settings the first time they're used.
+
 ### 4. Running the Desktop GUI
 
 ```bash

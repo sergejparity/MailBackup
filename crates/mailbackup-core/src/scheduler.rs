@@ -119,7 +119,7 @@ impl BackupScheduler {
                         l(&acc.id, &acc.name, "started", None, None);
                     }
 
-                    let password = match creds.get_password(&acc.id) {
+                    let password = match creds.get_account_password(&acc) {
                         Ok(p) => p,
                         Err(e) => {
                             let err_msg = format!("Scheduled backup failed for account '{}': cannot retrieve password ({})", acc.name, e);

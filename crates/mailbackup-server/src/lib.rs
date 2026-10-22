@@ -459,11 +459,11 @@ async fn api_add_account(
         name: payload.name,
         email: payload.email.clone(),
         provider,
-        imap_server: payload.server,
+        imap_server: payload.server.trim().to_string(),
         imap_port: payload.port,
         use_tls: true,
         auth_type: AuthType::Password,
-        username: payload.username,
+        username: payload.username.trim().to_string(),
         schedule: payload.schedule,
         retention_days: payload.retention_days,
         folder_filter: FolderFilter::default(),
@@ -471,7 +471,7 @@ async fn api_add_account(
         enabled: true,
     };
 
-    if let Err(e) = state.credentials.set_password(&id, &payload.password) {
+    if let Err(e) = state.credentials.set_account_password(&account, &payload.password) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save secret: {}", e)).into_response();
     }
 
@@ -606,7 +606,8 @@ async fn api_import_accounts_csv(
     // Save credentials and update config
     let mut saved_accounts = Vec::new();
     for acc in &report.valid_accounts {
-        if let Err(e) = state.credentials.set_password(&acc.id, &acc.password) {
+        let cfg_acc = acc.to_account_config();
+        if let Err(e) = state.credentials.set_account_password(&cfg_acc, &acc.password) {
             error!("Failed to save secret for account '{}': {}", acc.email, e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -614,7 +615,7 @@ async fn api_import_accounts_csv(
             )
                 .into_response();
         }
-        saved_accounts.push(acc.to_account_config());
+        saved_accounts.push(cfg_acc);
     }
 
     let mut cfg = state.config.write().await;
@@ -681,18 +682,38 @@ async fn api_update_account(
         None => return (StatusCode::NOT_FOUND, "Account not found").into_response(),
     };
 
+    // The UI always sends server/port/username, so compare values rather than
+    // presence. A change of connection needs the password again: the stored one
+    // was entered for the old server and must not be sent to a new one.
+    let new_server = payload
+        .server
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| acc.imap_server.clone());
+    let new_port = payload.port.unwrap_or(acc.imap_port);
+    let new_username = payload
+        .username
+        .as_deref()
+        .map(|u| u.trim().to_string())
+        .unwrap_or_else(|| acc.username.clone());
+    let connection_changed = !new_server.eq_ignore_ascii_case(acc.imap_server.trim())
+        || new_port != acc.imap_port
+        || new_username != acc.username.trim();
+    let new_password = payload.password.filter(|pw| !pw.is_empty());
+    if connection_changed && new_password.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Enter the account password to change the server, port or username.",
+        )
+            .into_response();
+    }
+
     if let Some(n) = payload.name {
         acc.name = n;
     }
-    if let Some(s) = payload.server {
-        acc.imap_server = s;
-    }
-    if let Some(p) = payload.port {
-        acc.imap_port = p;
-    }
-    if let Some(u) = payload.username {
-        acc.username = u;
-    }
+    acc.imap_server = new_server;
+    acc.imap_port = new_port;
+    acc.username = new_username;
     acc.retention_days = payload.retention_days;
     if let Some(sch) = payload.schedule {
         acc.schedule = Some(sch);
@@ -701,11 +722,9 @@ async fn api_update_account(
         acc.enabled = e;
     }
 
-    if let Some(pw) = payload.password {
-        if !pw.is_empty() {
-            if let Err(e) = state.credentials.set_password(&account_id, &pw) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update secret: {}", e)).into_response();
-            }
+    if let Some(pw) = new_password {
+        if let Err(e) = state.credentials.set_account_password(acc, &pw) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update secret: {}", e)).into_response();
         }
     }
 
@@ -721,7 +740,14 @@ async fn api_update_account(
 
     mailbackup_core::event_log::log_event(
         "ACCOUNT_MODIFIED",
-        &format!("Account '{}' ({}) configuration updated", updated_name, updated_email),
+        &if connection_changed {
+            format!(
+                "Account '{}' ({}) configuration updated; connection changed and password re-entered",
+                updated_name, updated_email
+            )
+        } else {
+            format!("Account '{}' ({}) configuration updated", updated_name, updated_email)
+        },
     );
 
     (StatusCode::OK, "Account updated").into_response()
@@ -775,12 +801,41 @@ async fn api_test_direct(Json(payload): Json<TestDirectPayload>) -> impl IntoRes
         enabled: true,
     };
 
-    match ImapSyncEngine::connect(&dummy_acc, &payload.password).await {
-        Ok(mut session) => {
+    let connect = ImapSyncEngine::connect(&dummy_acc, &payload.password);
+    match tokio::time::timeout(TEST_CONNECTION_TIMEOUT, connect).await {
+        Ok(Ok(mut session)) => {
             let _ = session.logout().await;
             (StatusCode::OK, "Success").into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Ok(Err(e)) => {
+            info!("Test connection to {}:{} failed: {}", dummy_acc.imap_server, dummy_acc.imap_port, e);
+            (StatusCode::BAD_REQUEST, test_connection_message(Some(&e), &dummy_acc)).into_response()
+        }
+        Err(_) => {
+            info!("Test connection to {}:{} timed out", dummy_acc.imap_server, dummy_acc.imap_port);
+            (StatusCode::BAD_REQUEST, test_connection_message(None, &dummy_acc)).into_response()
+        }
+    }
+}
+
+const TEST_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// User-facing result of a failed connection test. Raw errors (connection
+/// refused vs. TLS failure vs. timeout) would show whether a port is open, so
+/// they are folded into one "could not connect" message and only logged.
+/// `None` means the attempt timed out.
+fn test_connection_message(err: Option<&mailbackup_core::Error>, acc: &AccountConfig) -> String {
+    match err {
+        Some(mailbackup_core::Error::AuthFailed(..)) => {
+            "Login failed. Check the username and password.".to_string()
+        }
+        Some(mailbackup_core::Error::Tls(msg)) if msg.to_lowercase().contains("certificate") => {
+            format!("The TLS certificate of {} isn't valid for this host.", acc.imap_server)
+        }
+        _ => format!(
+            "Could not connect to {}:{}. Check the host and port, and that the server accepts TLS (IMAPS).",
+            acc.imap_server, acc.imap_port
+        ),
     }
 }
 
@@ -967,7 +1022,7 @@ async fn api_sync_account(
         None => return (StatusCode::NOT_FOUND, "Account not found").into_response(),
     };
 
-    let password = match state.credentials.get_password(&acc.id) {
+    let password = match state.credentials.get_account_password(&acc) {
         Ok(p) => p,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("No credentials: {}", e)).into_response(),
     };
@@ -2152,6 +2207,141 @@ mod tests {
             StatusCode::OK
         );
         assert!(new_data.is_dir());
+    }
+
+    async fn get_account_json(router: &Router, id: &str) -> serde_json::Value {
+        let res = router
+            .clone()
+            .oneshot(
+                get(&format!("/api/accounts/{}", id), "127.0.0.1:8765")
+                    .header(API_TOKEN_HEADER, TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn connection_changes_require_the_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+        let creds = CredentialStore::with_paths(dir.path().join(".credentials_store.json"), dir.path().join(".credentials_key"));
+        // Unique address so a real OS keyring on a developer machine isn't touched by a fixed key
+        let email = format!("reauth-{}@example.com", getrandom_suffix());
+        let id = StorageEngine::sanitize_slug(&email);
+
+        let add = json_request(
+            "POST",
+            "/api/accounts",
+            serde_json::json!({ "provider": "generic", "name": "A", "email": email, "server": " imap.example.com ",
+                                "port": 993, "username": " user ", "password": "old-pw" }),
+        );
+        assert_eq!(status(&router, add).await, StatusCode::OK);
+        let acc = get_account_json(&router, &id).await;
+        assert_eq!(acc["imap_server"], "imap.example.com");
+        assert_eq!(acc["username"], "user");
+
+        let put = |body: serde_json::Value| json_request("PUT", &format!("/api/accounts/{}", id), body);
+        let base = serde_json::json!({ "name": "A", "server": "imap.example.com", "port": 993, "username": "user" });
+        let with = |patch: serde_json::Value| {
+            let mut b = base.clone();
+            b.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+            b
+        };
+
+        // Server, port or username change without a password: rejected, nothing saved
+        for patch in [
+            serde_json::json!({ "server": "imap.attacker.example" }),
+            serde_json::json!({ "port": 1993 }),
+            serde_json::json!({ "username": "other" }),
+            serde_json::json!({ "server": "imap.attacker.example", "password": "" }),
+        ] {
+            assert_eq!(status(&router, put(with(patch.clone()))).await, StatusCode::BAD_REQUEST, "{patch}");
+        }
+        let acc = get_account_json(&router, &id).await;
+        assert_eq!(acc["imap_server"], "imap.example.com");
+        assert_eq!(acc["imap_port"], 993);
+        let acc_cfg: AccountConfig = serde_json::from_value(acc).unwrap();
+        assert_eq!(creds.get_account_password(&acc_cfg).unwrap(), "old-pw");
+
+        // Case/whitespace-only server change and other fields: no password needed
+        assert_eq!(
+            status(&router, put(with(serde_json::json!({ "server": "  IMAP.Example.com ", "name": "Renamed", "enabled": false })))).await,
+            StatusCode::OK
+        );
+        let acc = get_account_json(&router, &id).await;
+        assert_eq!(acc["name"], "Renamed");
+        assert_eq!(acc["imap_server"], "IMAP.Example.com");
+
+        // With the password: accepted, and the secret is rebound to the new server
+        assert_eq!(
+            status(&router, put(with(serde_json::json!({ "server": " imap.new.example ", "password": "new-pw" })))).await,
+            StatusCode::OK
+        );
+        let acc_cfg: AccountConfig = serde_json::from_value(get_account_json(&router, &id).await).unwrap();
+        assert_eq!(acc_cfg.imap_server, "imap.new.example");
+        assert_eq!(creds.get_account_password(&acc_cfg).unwrap(), "new-pw");
+
+        let _ = creds.delete_password(&id);
+    }
+
+    fn getrandom_suffix() -> String {
+        generate_api_token()[..12].to_string()
+    }
+
+    #[tokio::test]
+    async fn test_connection_hides_raw_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+        // A port with nothing listening
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let res = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/accounts/test-direct",
+                serde_json::json!({ "email": "a@b.c", "server": "127.0.0.1", "port": port, "username": "u", "password": "p" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.starts_with("Could not connect to 127.0.0.1:"), "{text}");
+        assert!(!text.to_lowercase().contains("refused"), "{text}");
+    }
+
+    #[test]
+    fn test_connection_messages() {
+        let acc = AccountConfig {
+            id: "t".into(),
+            name: "t".into(),
+            email: "t@example.com".into(),
+            provider: ProviderType::GenericImap,
+            imap_server: "imap.example.com".into(),
+            imap_port: 993,
+            use_tls: true,
+            auth_type: AuthType::Password,
+            username: "t".into(),
+            schedule: None,
+            retention_days: None,
+            folder_filter: FolderFilter::default(),
+            gmail_smart_labels: true,
+            enabled: true,
+        };
+        use mailbackup_core::Error as E;
+        let generic = "Could not connect to imap.example.com:993. Check the host and port, and that the server accepts TLS (IMAPS).";
+        assert_eq!(test_connection_message(Some(&E::Imap("Failed to connect to TCP: refused".into())), &acc), generic);
+        assert_eq!(test_connection_message(Some(&E::Tls("TLS handshake failed: received corrupt message".into())), &acc), generic);
+        assert_eq!(test_connection_message(None, &acc), generic);
+        assert!(test_connection_message(Some(&E::Tls("invalid peer certificate: NotValidForName".into())), &acc).contains("certificate"));
+        assert!(test_connection_message(Some(&E::AuthFailed("t".into(), "NO".into())), &acc).starts_with("Login failed"));
     }
 
     #[test]
