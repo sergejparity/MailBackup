@@ -35,6 +35,9 @@ pub enum Error {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[error("{0}")]
+    InvalidPath(String),
+
     #[error("Parsing error: {0}")]
     Parse(String),
 

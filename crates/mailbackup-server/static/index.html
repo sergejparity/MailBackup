@@ -775,7 +775,15 @@
               <form id="settings-storage-form" class="form-grid" style="margin-top: 14px;">
                 <div class="form-group">
                   <label for="settings-db-path-input">SQLite Database Catalog Path</label>
-                  <input type="text" id="settings-db-path-input" class="form-input" placeholder="e.g. ~/.mailbackup/mailbackup.db or D:\MailBackup\mailbackup.db" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off" required>
+                  <div class="input-with-button">
+                    <input type="text" id="settings-db-path-input" class="form-input" placeholder="e.g. ~/.mailbackup/mailbackup.db or D:\MailBackup\mailbackup.db" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off" required>
+                    <button type="button" id="btn-browse-db-dir" class="btn btn-secondary" title="Choose the folder for the database file">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 4px;">
+                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                    Browse...
+                    </button>
+                  </div>
                   <small class="form-hint">Path to the SQLite database file storing account metadata, folders, and FTS5 search index.</small>
                 </div>
 
@@ -793,8 +801,16 @@
 
                 <div class="form-group" style="margin-top: 8px;">
                   <label for="settings-data-dir">Raw Archive Data Directory Path</label>
-                  <input type="text" id="settings-data-dir" class="form-input" placeholder="e.g. ~/.mailbackup/data or D:\MailBackup\data" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off" required>
-                  <small class="form-hint">Directory storing raw <code>.eml</code> message files and folder archives.</small>
+                  <div class="input-with-button">
+                    <input type="text" id="settings-data-dir" class="form-input" placeholder="e.g. ~/.mailbackup/data or D:\MailBackup\data" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off" required>
+                    <button type="button" id="btn-browse-data-dir" class="btn btn-secondary" title="Choose the archive data folder">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 4px;">
+                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                    Browse...
+                    </button>
+                  </div>
+                  <small class="form-hint">Directory storing raw <code>.eml</code> message files and folder archives. Must be inside Downloads, Documents, Desktop, your home folder, or a folder chosen with Browse…, and new or empty, or an existing MailBackup archive with "Move existing backup files" unticked.</small>
                 </div>
 
                 <div class="form-group" style="flex-direction: row; align-items: flex-start; gap: 10px; margin-top: 2px;">
@@ -1128,6 +1144,7 @@
             <div id="export-preview-container" class="export-path-preview-card">
               <div class="preview-label">Full Target Destination:</div>
               <div id="export-full-dest-path" class="preview-path">/Users/SP/Downloads/backup.mbox</div>
+              <div id="export-path-error" class="export-error-alert" role="alert" style="display: none;"></div>
               <div id="export-overwrite-warning" class="export-warning-alert" style="display: none;">
                 <div class="warning-text">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

@@ -13,5 +13,6 @@ pub mod service;
 pub mod event_log;
 pub mod error;
 pub mod csv_import;
+pub mod safe_paths;
 
 pub use error::{Error, Result};

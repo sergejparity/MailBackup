@@ -46,6 +46,7 @@ let state = {
   csvImportMode: 'file',
   exportLocations: [],
   exportTargetExists: false,
+  exportPathInvalid: false,
   suggestedExportFilename: '',
 };
 
@@ -74,6 +75,9 @@ const el = {
   exportFilenameInput: document.getElementById('export-filename-input'),
   exportFullDestPath: document.getElementById('export-full-dest-path'),
   exportOverwriteWarning: document.getElementById('export-overwrite-warning'),
+  exportPathError: document.getElementById('export-path-error'),
+  btnBrowseDataDir: document.getElementById('btn-browse-data-dir'),
+  btnBrowseDbDir: document.getElementById('btn-browse-db-dir'),
   btnAutoRenameExport: document.getElementById('btn-auto-rename-export'),
   exportOutputPath: document.getElementById('export-output-path'),
   exportForm: document.getElementById('export-form'),
@@ -821,6 +825,20 @@ function initEventListeners() {
   }
   if (el.btnBrowseExportDir) {
     el.btnBrowseExportDir.addEventListener('click', handleBrowseExportDir);
+  }
+  if (el.btnBrowseDataDir) {
+    el.btnBrowseDataDir.addEventListener('click', () => browseIntoInput(el.btnBrowseDataDir, dir => {
+      if (el.settingsDataDir) el.settingsDataDir.value = dir;
+    }));
+  }
+  if (el.btnBrowseDbDir) {
+    el.btnBrowseDbDir.addEventListener('click', () => browseIntoInput(el.btnBrowseDbDir, dir => {
+      if (!el.settingsDbPathInput) return;
+      const current = el.settingsDbPathInput.value.trim();
+      const fileName = current.split(/[/\\]/).pop() || 'mailbackup.db';
+      const sep = dir.includes('\\') ? '\\' : '/';
+      el.settingsDbPathInput.value = dir.endsWith(sep) ? `${dir}${fileName}` : `${dir}${sep}${fileName}`;
+    }));
   }
   if (el.btnAutoRenameExport) {
     el.btnAutoRenameExport.addEventListener('click', handleAutoRenameExport);
@@ -1781,8 +1799,9 @@ async function handleBrowseExportDir() {
         if (el.exportDirInput) {
           el.exportDirInput.value = data.path;
           updateExportFullPreview();
-          renderExportLocationPills();
         }
+        // The picked folder is now approved server-side; refresh the quick picks.
+        await loadExportLocations();
       }
     }
   } catch (err) {
@@ -1843,7 +1862,13 @@ async function checkExportPathCollision(fullPath) {
   if (!fullPath) return;
   try {
     const res = await fetch(`/api/export/check-path?path=${encodeURIComponent(fullPath)}`);
+    if (res.status === 400) {
+      // Destination outside the allowed folders, wrong extension, hidden folder, ...
+      setExportPathError(await res.text());
+      return;
+    }
     if (!res.ok) return;
+    setExportPathError('');
     const data = await res.json();
     state.exportTargetExists = data.exists;
 
@@ -1861,6 +1886,40 @@ async function checkExportPathCollision(fullPath) {
     }
   } catch (err) {
     console.error('Error checking export path:', err);
+  }
+}
+
+function setExportPathError(message) {
+  state.exportPathInvalid = Boolean(message);
+  if (el.exportPathError) {
+    el.exportPathError.textContent = message;
+    el.exportPathError.style.display = message ? 'block' : 'none';
+  }
+  if (message && el.exportOverwriteWarning) el.exportOverwriteWarning.style.display = 'none';
+  const btn = document.getElementById('btn-export-submit');
+  if (btn) btn.disabled = Boolean(message);
+}
+
+// Opens the native folder picker (which also approves the folder server-side)
+// and hands the chosen path to `apply`.
+async function browseIntoInput(button, apply) {
+  const originalHtml = button.innerHTML;
+  button.disabled = true;
+  button.innerHTML = 'Selecting...';
+  try {
+    const res = await fetch('/api/dialog/pick-directory', { method: 'POST' });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.selected && data.path) {
+        apply(data.path);
+        await loadExportLocations();
+      }
+    }
+  } catch (err) {
+    showToast(`Directory picker error: ${err.message || err}`);
+  } finally {
+    button.disabled = false;
+    button.innerHTML = originalHtml;
   }
 }
 
@@ -1954,6 +2013,10 @@ async function updateExportFoldersForSelectedAccount() {
 async function handleExportMbox(e, forceOverwrite = false) {
   if (e && e.preventDefault) e.preventDefault();
   updateExportFullPreview();
+  if (state.exportPathInvalid) {
+    showToast(el.exportPathError ? el.exportPathError.textContent : 'Choose an allowed export destination');
+    return;
+  }
   const rawPath = el.exportOutputPath ? el.exportOutputPath.value.trim() : (document.getElementById('export-output-path')?.value.trim() || '');
   if (!rawPath) {
     showToast('Please specify a destination directory and filename');
