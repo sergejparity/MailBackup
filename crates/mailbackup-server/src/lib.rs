@@ -15,6 +15,7 @@ use mailbackup_core::imap::ImapSyncEngine;
 use mailbackup_core::keyring::CredentialStore;
 use mailbackup_core::mbox::MboxExporter;
 use mailbackup_core::retention::RetentionManager;
+use mailbackup_core::safe_paths::PathPolicy;
 use mailbackup_core::scheduler::BackupScheduler;
 use mailbackup_core::storage::StorageEngine;
 use rust_embed::RustEmbed;
@@ -1113,6 +1114,16 @@ async fn api_export_mbox(
     State(state): State<AppState>,
     Json(payload): Json<ExportMboxPayload>,
 ) -> impl IntoResponse {
+    let requested = mailbackup_core::config::resolve_export_path(&payload.output_path);
+    let target = {
+        let cfg = state.config.read().await;
+        PathPolicy::for_exports(&cfg).validate_export_target(&requested)
+    };
+    let target = match target {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+
     let folders = match state.db.get_folders(&payload.account_id) {
         Ok(f) => f,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1137,9 +1148,9 @@ async fn api_export_mbox(
         }
     }
 
-    let final_output_path = mailbackup_core::config::resolve_export_path(&payload.output_path);
+    let final_output_path = target.path;
 
-    if !payload.overwrite && final_output_path.exists() {
+    if !payload.overwrite && target.exists {
         let suggested = mailbackup_core::config::find_available_path(&final_output_path);
         let path_str = final_output_path.to_string_lossy().to_string();
         return (
@@ -1155,7 +1166,7 @@ async fn api_export_mbox(
     }
 
     let exporter = MboxExporter::new(&state.storage);
-    match exporter.export_to_mbox(&paths, &final_output_path) {
+    match exporter.export_to_mbox_with(&paths, &final_output_path, payload.overwrite) {
         Ok(count) => {
             let path_str = final_output_path.to_string_lossy().to_string();
             mailbackup_core::event_log::log_event(
@@ -1188,10 +1199,11 @@ struct ExportLocationsResponse {
     locations: Vec<ExportLocationItem>,
 }
 
-async fn api_export_locations() -> impl IntoResponse {
+async fn api_export_locations(State(state): State<AppState>) -> impl IntoResponse {
     let default_dir = mailbackup_core::config::default_export_dir()
         .to_string_lossy()
         .to_string();
+    let approved = state.config.read().await.settings.approved_dirs.clone();
     let locs = mailbackup_core::config::system_export_locations();
     let locations = locs
         .into_iter()
@@ -1199,6 +1211,13 @@ async fn api_export_locations() -> impl IntoResponse {
             name: name.to_string(),
             path: path.to_string_lossy().to_string(),
         })
+        .chain(approved.into_iter().map(|path| ExportLocationItem {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string()),
+            path: path.to_string_lossy().to_string(),
+        }))
         .collect();
 
     Json(ExportLocationsResponse {
@@ -1220,21 +1239,30 @@ struct CheckPathResponse {
 }
 
 async fn api_export_check_path(
+    State(state): State<AppState>,
     Query(query): Query<CheckPathQuery>,
 ) -> impl IntoResponse {
-    let resolved = mailbackup_core::config::resolve_export_path(&query.path);
-    let exists = resolved.exists();
-    let suggested = if exists {
-        mailbackup_core::config::find_available_path(&resolved)
+    let requested = mailbackup_core::config::resolve_export_path(&query.path);
+    let target = {
+        let cfg = state.config.read().await;
+        PathPolicy::for_exports(&cfg).validate_export_target(&requested)
+    };
+    let target = match target {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    let suggested = if target.exists {
+        mailbackup_core::config::find_available_path(&target.path)
     } else {
-        resolved.clone()
+        target.path.clone()
     };
 
     Json(CheckPathResponse {
-        exists,
-        resolved_path: resolved.to_string_lossy().to_string(),
+        exists: target.exists,
+        resolved_path: target.path.to_string_lossy().to_string(),
         suggested_path: suggested.to_string_lossy().to_string(),
     })
+    .into_response()
 }
 
 #[derive(Serialize)]
@@ -1243,10 +1271,23 @@ struct PickDirectoryResponse {
     path: Option<String>,
 }
 
-async fn api_pick_directory() -> impl IntoResponse {
+/// Opens the native folder dialog. A folder the user picks there becomes an
+/// approved location for exports and storage (`settings.approved_dirs`): only a
+/// person clicking in the OS dialog can add one, not an API caller.
+async fn api_pick_directory(State(state): State<AppState>) -> impl IntoResponse {
     let res = tokio::task::spawn_blocking(pick_directory_native)
         .await
         .unwrap_or(None);
+
+    if let Some(ref path) = res {
+        let mut cfg = state.config.write().await;
+        if !cfg.settings.approved_dirs.contains(path) {
+            cfg.settings.approved_dirs.push(path.clone());
+            if let Err(e) = cfg.save(&state.config_path) {
+                error!("Failed to save approved folder {}: {}", path.display(), e);
+            }
+        }
+    }
 
     match res {
         Some(path) => Json(PickDirectoryResponse {
@@ -1443,74 +1484,84 @@ async fn api_update_settings(
     let mut resolved_storage_path = None;
     let mut resolved_db_path = None;
 
-    // 1. Check if new data directory is requested
-    if let Some(ref raw_dir) = payload.data_dir {
-        let trimmed = raw_dir.trim();
-        if !trimmed.is_empty() {
-            let target_path = mailbackup_core::config::resolve_path(trimmed);
-            let current_dir = {
-                let cfg = state.config.read().await;
-                cfg.data_dir.clone()
-            };
+    // 0. Validate requested locations before changing anything
+    let non_empty = |raw: &Option<String>| {
+        raw.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(mailbackup_core::config::resolve_path)
+    };
+    let current_db = state.db.path();
+    let move_db = payload.move_db_existing.unwrap_or(true);
+    let (requested_dir, requested_db) = {
+        let cfg = state.config.read().await;
+        let policy = PathPolicy::for_storage(&cfg);
+        let dir = non_empty(&payload.data_dir).map(|p| policy.validate_data_dir(&p, &cfg.data_dir));
+        let db = non_empty(&payload.db_path).map(|p| policy.validate_db_path(&p, &current_db, move_db));
+        (dir.transpose(), db.transpose())
+    };
+    let (requested_dir, requested_db) = match (requested_dir, requested_db) {
+        (Ok(dir), Ok(db)) => (dir, db),
+        (Err(e), _) | (_, Err(e)) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
 
-            if target_path != current_dir {
-                let move_existing = payload.move_existing.unwrap_or(true);
-                if move_existing {
-                    match state.storage.migrate_data(&target_path) {
-                        Ok(count) => migrated_files = count,
-                        Err(e) => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Failed to migrate storage data: {}", e),
-                            )
-                                .into_response();
-                        }
+    // 1. Move the archive data directory if requested
+    if let Some(target_path) = requested_dir {
+        let current_dir = {
+            let cfg = state.config.read().await;
+            cfg.data_dir.clone()
+        };
+
+        if target_path != current_dir {
+            let move_existing = payload.move_existing.unwrap_or(true);
+            if move_existing {
+                match state.storage.migrate_data(&target_path) {
+                    Ok(count) => migrated_files = count,
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to migrate storage data: {}", e),
+                        )
+                            .into_response();
                     }
-                } else if let Err(e) = std::fs::create_dir_all(&target_path) {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "Failed to create storage directory {}: {}",
-                            target_path.display(),
-                            e
-                        ),
-                    )
-                        .into_response();
                 }
-
-                // Update storage engine runtime path
-                state.storage.set_base_dir(&target_path);
-                mailbackup_core::event_log::log_event(
-                    "STORAGE_MOVED",
-                    &format!("Archive storage directory changed to {}", target_path.display()),
-                );
-                resolved_storage_path = Some(target_path);
+            } else if let Err(e) = std::fs::create_dir_all(&target_path) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Failed to create storage directory {}: {}",
+                        target_path.display(),
+                        e
+                    ),
+                )
+                    .into_response();
             }
+
+            // Update storage engine runtime path
+            state.storage.set_base_dir(&target_path);
+            mailbackup_core::event_log::log_event(
+                "STORAGE_MOVED",
+                &format!("Archive storage directory changed to {}", target_path.display()),
+            );
+            resolved_storage_path = Some(target_path);
         }
     }
 
-    // 2. Check if new database path is requested
-    if let Some(ref raw_db) = payload.db_path {
-        let trimmed_db = raw_db.trim();
-        if !trimmed_db.is_empty() {
-            let target_db = mailbackup_core::config::resolve_path(trimmed_db);
-            let current_db = state.db.path();
-
-            if target_db != current_db {
-                let move_db = payload.move_db_existing.unwrap_or(true);
-                if let Err(e) = state.db.relocate(&target_db, move_db) {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to relocate database: {}", e),
-                    )
-                        .into_response();
-                }
-                mailbackup_core::event_log::log_event(
-                    "DATABASE_MOVED",
-                    &format!("Database catalog relocated from {} to {}", current_db.display(), target_db.display()),
-                );
-                resolved_db_path = Some(target_db);
+    // 2. Relocate the database catalog if requested
+    if let Some(target_db) = requested_db {
+        if target_db != current_db {
+            if let Err(e) = state.db.relocate(&target_db, move_db) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to relocate database: {}", e),
+                )
+                    .into_response();
             }
+            mailbackup_core::event_log::log_event(
+                "DATABASE_MOVED",
+                &format!("Database catalog relocated from {} to {}", current_db.display(), target_db.display()),
+            );
+            resolved_db_path = Some(target_db);
         }
     }
 
@@ -1806,11 +1857,13 @@ mod tests {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     async fn test_router(dir: &std::path::Path) -> Router {
-        let config = AppConfig {
-            data_dir: dir.join("data"),
-            db_path: dir.join("catalog.db"),
+        std::fs::create_dir_all(dir.join("exports")).unwrap();
+        let mut config = AppConfig {
+            data_dir: dir.join("state/data"),
+            db_path: dir.join("state/catalog.db"),
             ..AppConfig::default()
         };
+        config.settings.approved_dirs = vec![dir.join("exports")];
         let db = Database::open_in_memory().unwrap();
         let storage = StorageEngine::new(&config.data_dir);
         let credentials = Arc::new(CredentialStore::with_paths(
@@ -1951,6 +2004,101 @@ mod tests {
         assert!(!html.contains(" onclick="));
         let app_js = Assets::get("app.js").unwrap();
         assert!(!String::from_utf8_lossy(&app_js.data).contains(" onclick="));
+    }
+
+    fn json_request(method: &str, uri: &str, body: serde_json::Value) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:8765")
+            .header(API_TOKEN_HEADER, TOKEN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn export_request(path: &std::path::Path, overwrite: bool) -> HttpRequest<Body> {
+        json_request(
+            "POST",
+            "/api/export/mbox",
+            serde_json::json!({ "account_id": "acc", "output_path": path, "overwrite": overwrite }),
+        )
+    }
+
+    #[tokio::test]
+    async fn export_is_confined_to_allowed_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let inside = dir.path().join("exports/archive.mbox");
+        assert_eq!(status(&router, export_request(&inside, false)).await, StatusCode::OK);
+        assert!(inside.exists());
+
+        // Existing file: conflict unless overwrite is requested
+        assert_eq!(status(&router, export_request(&inside, false)).await, StatusCode::CONFLICT);
+        assert_eq!(status(&router, export_request(&inside, true)).await, StatusCode::OK);
+
+        for bad in [
+            outside.join("a.mbox"),
+            dir.path().join("exports/../outside/a.mbox"),
+            dir.path().join("exports/.hidden/a.mbox"),
+            dir.path().join("exports/startup.sh"),
+        ] {
+            assert_eq!(status(&router, export_request(&bad, true)).await, StatusCode::BAD_REQUEST, "{}", bad.display());
+        }
+        assert!(!outside.join("a.mbox").exists());
+    }
+
+    #[tokio::test]
+    async fn check_path_only_answers_for_allowed_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+
+        let uri = |p: &std::path::Path| format!("/api/export/check-path?path={}", p.display());
+        let ok = get(&uri(&dir.path().join("exports/a.mbox")), "127.0.0.1:8765")
+            .header(API_TOKEN_HEADER, TOKEN)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status(&router, ok).await, StatusCode::OK);
+
+        let outside = get(&uri(std::path::Path::new("/etc/passwd")), "127.0.0.1:8765")
+            .header(API_TOKEN_HEADER, TOKEN)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status(&router, outside).await, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn settings_locations_are_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let put = |body| json_request("PUT", "/api/settings", body);
+        assert_eq!(
+            status(&router, put(serde_json::json!({ "data_dir": outside.join("data") }))).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(&router, put(serde_json::json!({ "db_path": dir.path().join("exports/catalog.txt") }))).await,
+            StatusCode::BAD_REQUEST
+        );
+        // A rejected db_path must not leave a half-applied data_dir move behind
+        let new_data = dir.path().join("exports/archive-data");
+        assert_eq!(
+            status(&router, put(serde_json::json!({ "data_dir": new_data, "db_path": outside.join("x.db") }))).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!new_data.exists());
+
+        assert_eq!(
+            status(&router, put(serde_json::json!({ "data_dir": new_data, "move_existing": false }))).await,
+            StatusCode::OK
+        );
+        assert!(new_data.is_dir());
     }
 
     #[test]

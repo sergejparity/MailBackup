@@ -112,6 +112,11 @@ pub struct GlobalSettings {
     /// past the DNS-rebinding check, so list only names you control.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Folders the user picked in the native folder dialog. Together with the
+    /// standard user folders they are the only places the web API may export to
+    /// or move the archive/catalog to (see `safe_paths`).
+    #[serde(default)]
+    pub approved_dirs: Vec<PathBuf>,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
     #[serde(default)]
@@ -146,6 +151,7 @@ impl Default for GlobalSettings {
             web_port: default_server_port(),
             bind_address: default_bind_address(),
             allowed_hosts: Vec::new(),
+            approved_dirs: Vec::new(),
             close_to_tray: true,
             autostart: false,
             run_as_service: false,

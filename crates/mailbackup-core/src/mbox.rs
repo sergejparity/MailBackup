@@ -2,7 +2,7 @@ use crate::error::Result;
 use crate::storage::StorageEngine;
 use chrono::{DateTime, Utc};
 use mail_parser::MessageParser;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use tracing::info;
@@ -83,6 +83,17 @@ impl<'a> MboxExporter<'a> {
         eml_relative_paths: &[String],
         output_path: impl AsRef<Path>,
     ) -> Result<usize> {
+        self.export_to_mbox_with(eml_relative_paths, output_path, true)
+    }
+
+    /// Like [`Self::export_to_mbox`], but with `overwrite == false` the file is
+    /// created exclusively and an existing file is an error.
+    pub fn export_to_mbox_with(
+        &self,
+        eml_relative_paths: &[String],
+        output_path: impl AsRef<Path>,
+        overwrite: bool,
+    ) -> Result<usize> {
         let output_path = output_path.as_ref();
         if let Some(parent) = output_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -90,7 +101,14 @@ impl<'a> MboxExporter<'a> {
             }
         }
 
-        let file = File::create(output_path)?;
+        let mut options = OpenOptions::new();
+        options.write(true);
+        if overwrite {
+            options.create(true).truncate(true);
+        } else {
+            options.create_new(true);
+        }
+        let file = options.open(output_path)?;
         let writer = BufWriter::new(file);
         let count = self.export_to_writer(eml_relative_paths, writer)?;
         info!("Exported {} messages to mbox: {}", count, output_path.display());

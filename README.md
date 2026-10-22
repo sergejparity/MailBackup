@@ -107,6 +107,12 @@ settings:
 - If you use a reverse proxy with its own domain name, add that name to `allowed_hosts`. The proxy must pass the `X-MailBackup-Token` header through.
 - Scripts that called `/api/*` directly now need the token. It's printed nowhere and changes on every start, so the API is meant to be used through the web UI only.
 
+**Export and storage locations (web UI):**
+- `.mbox` exports, and moves of the archive folder or database, are limited to your Downloads, Documents and Desktop folders, your home folder, and folders you've chosen with **Browse…**. Browse adds the folder to `settings.approved_dirs` in `config.yaml`; remove entries there to revoke them.
+- Exports must end in `.mbox`, can't go into hidden (`.`) folders, and never overwrite symlinks or folders.
+- A new archive folder must be new or empty. A new database path must end in `.db`.
+- The CLI (`export-mbox`) is not restricted.
+
 ### 4. Running the Desktop GUI
 
 ```bash
