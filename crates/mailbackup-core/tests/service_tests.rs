@@ -21,6 +21,7 @@ enum Fault {
     Rm,
     /// `rm` exits 0 without removing anything
     RmNoop,
+    Chown,
 }
 
 struct Fixture {
@@ -73,6 +74,13 @@ fn fixture(fault: Fault) -> Fixture {
     };
     script(&bin.join("rm"), &format!("echo \"rm $*\" >> '{log_s}'\n{rm_body}"));
 
+    let chown_body = if fault == Fault::Chown { "exit 1\n" } else { "exit 0\n" };
+    script(&bin.join("chown"), &format!("echo \"chown $*\" >> '{log_s}'\n{chown_body}"));
+    let data = dir.path().join("home/.mailbackup");
+    let archive = dir.path().join("archive");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&archive).unwrap();
+
     let env = ServiceEnv {
         server_exe: PathBuf::from("/opt/mailbackup/mailbackup-server"),
         config_path: PathBuf::from("/home/alice/.mailbackup/config.yaml"),
@@ -83,6 +91,8 @@ fn fixture(fault: Fault) -> Fixture {
         systemctl: bin.join("systemctl"),
         install: bin.join("install"),
         rm: bin.join("rm"),
+        chown: bin.join("chown"),
+        owned_dirs: vec![data, archive, dir.path().join("missing-folder")],
     };
     Fixture { _dir: dir, env, log }
 }
@@ -199,4 +209,44 @@ fn status_flags_root_units_for_reinstall() {
     let current = linux_status(&f.env.definition_path, &f.env.systemctl);
     assert!(current.installed && current.running && !current.needs_reinstall);
     assert_eq!(current.runs_as.as_deref(), Some("alice"));
+}
+
+fn install_legacy_root_unit(f: &Fixture) {
+    std::fs::write(&f.env.definition_path, "[Service]\nExecStart=/opt/x --service\n").unwrap();
+}
+
+#[test]
+fn fresh_install_does_not_touch_ownership() {
+    let f = fixture(Fault::None);
+    set_service_enabled_in(&f.env, true).unwrap();
+    assert!(!calls(&f).iter().any(|l| l.contains("chown")), "{:?}", calls(&f));
+}
+
+#[test]
+fn migrating_from_root_gives_files_back_to_the_user() {
+    let f = fixture(Fault::None);
+    install_legacy_root_unit(&f);
+    set_service_enabled_in(&f.env, true).unwrap();
+
+    let c = calls(&f);
+    let expected = format!(
+        "pkexec {} -R -h alice {} {}",
+        f.env.chown.display(),
+        f.env.owned_dirs[0].display(),
+        f.env.owned_dirs[1].display()
+    );
+    let chown_at = c.iter().position(|l| l == &expected).unwrap_or_else(|| panic!("{c:?}"));
+    // Ownership is fixed before the service is started as the user
+    let restart_at = c.iter().position(|l| l.ends_with("systemctl restart mailbackup.service")).unwrap();
+    assert!(chown_at < restart_at, "{c:?}");
+    assert!(std::fs::read_to_string(&f.env.definition_path).unwrap().contains("User=alice"));
+}
+
+#[test]
+fn failed_ownership_fix_stops_the_migration() {
+    let f = fixture(Fault::Chown);
+    install_legacy_root_unit(&f);
+    let err = set_service_enabled_in(&f.env, true).unwrap_err().to_string();
+    assert!(err.contains("ownership"), "{err}");
+    assert!(!calls(&f).iter().any(|l| l.contains("systemctl")), "{:?}", calls(&f));
 }

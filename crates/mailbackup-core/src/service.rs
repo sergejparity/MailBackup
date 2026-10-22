@@ -342,13 +342,19 @@ pub struct ServiceEnv {
     pub systemctl: PathBuf,
     pub install: PathBuf,
     pub rm: PathBuf,
+    pub chown: PathBuf,
+    /// Folders the service writes to (`~/.mailbackup`, data folder, database
+    /// folder). After migrating from a root service their ownership is fixed.
+    pub owned_dirs: Vec<PathBuf>,
 }
 
 impl ServiceEnv {
     pub fn detect() -> Result<Self> {
+        let config_path = crate::config::default_config_path();
         Ok(Self {
+            owned_dirs: service_owned_dirs(&config_path),
             server_exe: find_server_executable(),
-            config_path: crate::config::default_config_path(),
+            config_path,
             user: current_user()?,
             staging_dir: crate::config::default_base_dir().join("staging"),
             definition_path: PathBuf::from(if cfg!(target_os = "macos") { LAUNCHD_PLIST_PATH } else { SYSTEMD_UNIT_PATH }),
@@ -356,8 +362,26 @@ impl ServiceEnv {
             systemctl: find_program("systemctl"),
             install: find_program("install"),
             rm: find_program("rm"),
+            chown: find_program("chown"),
         })
     }
+}
+
+/// `~/.mailbackup` plus the data and database folders named in the config.
+fn service_owned_dirs(config_path: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![crate::config::default_base_dir()];
+    if let Some(cfg) = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| serde_yaml::from_str::<crate::config::AppConfig>(&text).ok())
+    {
+        dirs.push(cfg.data_dir.clone());
+        if let Some(parent) = cfg.db_path.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 /// Absolute path of `name` from PATH (pkexec resets PATH, so root commands get
@@ -655,6 +679,12 @@ pub fn set_service_enabled(enabled: bool) -> Result<()> {
 pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
     let unit = env.definition_path.to_string_lossy().to_string();
     if enabled {
+        // An older version installed the service as root; files it created must
+        // become the user's, or the new service can't write to them.
+        let migrating_from_root = std::fs::read_to_string(&env.definition_path)
+            .map(|old| unit_runs_as(&old).is_none())
+            .unwrap_or(false);
+
         let content = generate_linux_systemd(&env.server_exe, &env.config_path, &env.user);
         let staged = StagedFile::write(&env.staging_dir, "service", content.as_bytes())?;
         let staged_path = staged.0.to_string_lossy().to_string();
@@ -672,6 +702,19 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
             .map_err(|e| Error::Config(format!("Service definition missing after install: {}", e)))?;
         if unit_runs_as(&installed).as_deref() != Some(env.user.as_str()) {
             return Err(Error::Config("The installed service definition doesn't run as your user.".into()));
+        }
+
+        let existing_dirs: Vec<&PathBuf> = env.owned_dirs.iter().filter(|d| d.exists()).collect();
+        if migrating_from_root && !existing_dirs.is_empty() {
+            // -h with -R (and chown's default -P) never follows symlinks, so a link
+            // inside these folders can't redirect the ownership change.
+            run_checked(
+                Command::new(&env.pkexec)
+                    .arg(&env.chown)
+                    .args(["-R", "-h", env.user.as_str()])
+                    .args(&existing_dirs),
+                "Giving your user ownership of files created by the old root service",
+            )?;
         }
 
         // `enable` reloads systemd; `restart` starts it, or replaces an old root instance
@@ -706,16 +749,34 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
     // Constant scripts: the only variable (the staged file) arrives via the
     // environment and is shell-quoted by AppleScript's `quoted form of`.
     const INSTALL_SCRIPT: &str = r#"set staged to system attribute "MB_STAGED_PLIST"
-do shell script "/usr/bin/install -m 644 -o root -g wheel " & quoted form of staged & " /Library/LaunchDaemons/com.mailbackup.service.plist && (/bin/launchctl bootout system/com.mailbackup.service 2>/dev/null; true) && /bin/launchctl bootstrap system /Library/LaunchDaemons/com.mailbackup.service.plist" with administrator privileges"#;
+set fixOwner to ""
+if (system attribute "MB_CHOWN") is "1" then
+    set fixOwner to "/usr/sbin/chown -R -h " & quoted form of (system attribute "MB_USER")
+    repeat with i from 0 to 2
+        set d to system attribute ("MB_DIR_" & i)
+        if d is not "" then set fixOwner to fixOwner & " " & quoted form of d
+    end repeat
+    set fixOwner to fixOwner & " && "
+end if
+do shell script fixOwner & "/usr/bin/install -m 644 -o root -g wheel " & quoted form of staged & " /Library/LaunchDaemons/com.mailbackup.service.plist && (/bin/launchctl bootout system/com.mailbackup.service 2>/dev/null; true) && /bin/launchctl bootstrap system /Library/LaunchDaemons/com.mailbackup.service.plist" with administrator privileges"#;
     const UNINSTALL_SCRIPT: &str = r#"do shell script "(/bin/launchctl bootout system/com.mailbackup.service 2>/dev/null; true) && /bin/rm -f /Library/LaunchDaemons/com.mailbackup.service.plist" with administrator privileges"#;
 
     if enabled {
+        // Files created by an older root LaunchDaemon must become the user's
+        let migrating_from_root = std::fs::read_to_string(LAUNCHD_PLIST_PATH)
+            .map(|old| plist_runs_as(&old).is_none())
+            .unwrap_or(false);
         let content = generate_macos_plist(&env.server_exe, &env.config_path, &env.user);
         let staged = StagedFile::write(&env.staging_dir, "plist", content.as_bytes())?;
-        run_checked(
-            Command::new("osascript").args(["-e", INSTALL_SCRIPT]).env("MB_STAGED_PLIST", &staged.0),
-            "Installing the LaunchDaemon",
-        )?;
+        let mut cmd = Command::new("osascript");
+        cmd.args(["-e", INSTALL_SCRIPT])
+            .env("MB_STAGED_PLIST", &staged.0)
+            .env("MB_USER", &env.user)
+            .env("MB_CHOWN", if migrating_from_root { "1" } else { "0" });
+        for (i, dir) in env.owned_dirs.iter().filter(|d| d.exists()).take(3).enumerate() {
+            cmd.env(format!("MB_DIR_{}", i), dir);
+        }
+        run_checked(&mut cmd, "Installing the LaunchDaemon")?;
         drop(staged);
         let installed = std::fs::read_to_string(LAUNCHD_PLIST_PATH)
             .map_err(|e| Error::Config(format!("LaunchDaemon missing after install: {}", e)))?;
@@ -735,7 +796,8 @@ do shell script "/usr/bin/install -m 644 -o root -g wheel " & quoted form of sta
 pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
     // Constant commands: the staged XML path is read from the environment.
     const CREATE_PS: &str = "$p = Start-Process -FilePath schtasks.exe -ArgumentList @('/Create','/TN','MailBackupService','/XML',('\"' + $env:MB_TASK_XML + '\"'),'/F') -Verb RunAs -Wait -PassThru; exit $p.ExitCode";
-    const DELETE_PS: &str = "$p = Start-Process -FilePath schtasks.exe -ArgumentList @('/Delete','/TN','MailBackupService','/F') -Verb RunAs -Wait -PassThru; exit $p.ExitCode";
+    const DELETE_PS: &str = "$e = Start-Process -FilePath schtasks.exe -ArgumentList @('/End','/TN','MailBackupService') -Verb RunAs -Wait -PassThru; $p = Start-Process -FilePath schtasks.exe -ArgumentList @('/Delete','/TN','MailBackupService','/F') -Verb RunAs -Wait -PassThru; exit $p.ExitCode";
+    const RUN_PS: &str = "$p = Start-Process -FilePath schtasks.exe -ArgumentList @('/Run','/TN','MailBackupService') -Verb RunAs -Wait -PassThru; exit $p.ExitCode";
 
     let task_exists = || {
         Command::new("schtasks")
@@ -762,9 +824,24 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
         if !status.installed || status.runs_as.is_none() {
             return Err(Error::Config("The background task wasn't registered to run as your user.".into()));
         }
-        // Start it now as well; if this fails it still starts at the next boot
-        let _ = Command::new("schtasks").args(["/Run", "/TN", SERVICE_TASK_NAME]).status();
+        // Start it now. The task was registered elevated, so an un-elevated /Run
+        // can be denied under a UAC split token; retry elevated. If that's
+        // declined too, the task still starts at the next boot.
+        let started = Command::new("schtasks")
+            .args(["/Run", "/TN", SERVICE_TASK_NAME])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !started {
+            if let Err(e) = run_checked(
+                Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", RUN_PS]),
+                "Starting the background task",
+            ) {
+                tracing::warn!("{} It will start at the next boot.", e);
+            }
+        }
     } else if task_exists() {
+        // Un-elevated first; DELETE_PS ends and deletes it elevated if denied
         let _ = Command::new("schtasks").args(["/End", "/TN", SERVICE_TASK_NAME]).status();
         let deleted = Command::new("schtasks")
             .args(["/Delete", "/TN", SERVICE_TASK_NAME, "/F"])
