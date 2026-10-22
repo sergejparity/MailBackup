@@ -398,6 +398,7 @@ pub struct ServiceEnv {
     pub install: PathBuf,
     pub rm: PathBuf,
     pub chown: PathBuf,
+    pub xargs: PathBuf,
     pub id: PathBuf,
 }
 
@@ -425,6 +426,7 @@ impl ServiceEnv {
             install: tool("install")?,
             rm: tool("rm")?,
             chown: tool("chown")?,
+            xargs: tool("xargs")?,
             id: tool("id")?,
         })
     }
@@ -438,11 +440,13 @@ impl ServiceEnv {
 /// ownership may need repair after an old root service wrote them:
 /// - specific files: the config, the credential store and its key, the service
 ///   logs, and the catalog database with its `-wal`/`-shm`/`-journal` files;
-/// - the data folder, only when it is a dedicated MailBackup archive
-///   ([`is_dedicated_archive_dir`]); it is the only entry repaired recursively.
+/// - the entries of the data folder that follow MailBackup's archive layout
+///   exactly ([`archive_entries`]).
 ///
-/// Parent folders are never included: a custom `db_path` such as
-/// `/var/lib/mailbackup.db` must not hand `/var/lib` to the user.
+/// Every entry is repaired on its own (never recursively), and parent folders
+/// are never included: a custom `db_path` such as `/var/lib/mailbackup.db` must
+/// not hand `/var/lib` to the user, and a shared data folder must not hand over
+/// unrelated content.
 pub fn ownership_candidates(config_path: &Path) -> Vec<PathBuf> {
     let mut paths = vec![config_path.to_path_buf()];
     if let Some(dir) = config_path.parent() {
@@ -463,39 +467,157 @@ pub fn ownership_candidates(config_path: &Path) -> Vec<PathBuf> {
         for suffix in ["-wal", "-shm", "-journal"] {
             paths.push(PathBuf::from(format!("{}{}", db, suffix)));
         }
-        if is_dedicated_archive_dir(&cfg.data_dir) {
-            paths.push(cfg.data_dir.clone());
-        }
+        paths.extend(archive_entries(&cfg.data_dir));
     }
     paths.dedup();
     paths
 }
 
-/// A folder that is safe to repair recursively: at least three levels below the
-/// filesystem root (so never `/var/lib`, `/home/<user>` or a volume root) and laid
-/// out like a MailBackup archive (only sub-folders at the top, `.eml` files inside).
-pub fn is_dedicated_archive_dir(dir: &Path) -> bool {
-    let Ok(real) = std::fs::canonicalize(dir) else { return false };
-    let depth = real.components().filter(|c| matches!(c, std::path::Component::Normal(_))).count();
-    depth >= 3 && crate::safe_paths::looks_like_archive(&real)
+/// Entries of a data folder that are certainly MailBackup's, validated against
+/// the exact layout `StorageEngine` writes:
+/// `<account>/<folder>/<YYYY>/<MM>/<uid>_<12 hex>.eml` and `.staging/<uuid>.tmp`.
+///
+/// Fail-closed: matching regular files are included; a folder is included only if
+/// its name fits its level *and* its whole subtree matches (OS metadata files like
+/// `.DS_Store` are neutral); the data folder itself only if the entire tree
+/// matches. Symlinks and anything unexpected are skipped, and so are the folders
+/// containing them, so unrelated content next to an archive is never handed over.
+pub fn archive_entries(data_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(meta) = std::fs::symlink_metadata(data_dir) else { return out };
+    if !meta.is_dir() {
+        return out;
+    }
+    if collect_archive_level(data_dir, 0, &mut out) {
+        out.push(data_dir.to_path_buf());
+    }
+    out
 }
 
-/// The candidates (see [`ownership_candidates`]) that exist and contain anything
-/// not owned by `uid`. Symlinks are never followed.
+/// Collects conforming entries below `dir` (at layout `level`); returns whether
+/// `dir` is a verified archive folder: it holds at least one conforming entry and
+/// nothing else. Empty folders don't qualify, so an empty `/var/lib/<x>` can never
+/// be mistaken for an archive account.
+fn collect_archive_level(dir: &Path, level: usize, out: &mut Vec<PathBuf>) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    let staging = level == 1 && dir.file_name().map(|n| n == ".staging").unwrap_or(false);
+    let mut all_conform = true;
+    let mut has_content = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            all_conform = false;
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(file_type) = entry.file_type() else {
+            all_conform = false;
+            continue;
+        };
+        let path = entry.path();
+        if IGNORABLE_METADATA.contains(&name.as_str()) && file_type.is_file() {
+            continue;
+        }
+        let conforms = if file_type.is_symlink() {
+            false
+        } else if file_type.is_dir() {
+            let name_ok = match level {
+                0 => name == ".staging" || is_slug(&name),
+                1 if !staging => is_slug(&name),
+                2 => name.len() == 4 && name.bytes().all(|b| b.is_ascii_digit()),
+                3 => name.len() == 2 && name.bytes().all(|b| b.is_ascii_digit()),
+                _ => false,
+            };
+            // Folders with unexpected names are unknown content: not entered at all
+            name_ok && {
+                let below = collect_archive_level(&path, level + 1, out);
+                if below {
+                    out.push(path.clone());
+                }
+                below
+            }
+        } else if file_type.is_file() {
+            let name_ok = (level == 4 && is_eml_name(&name)) || (staging && is_staging_name(&name));
+            if name_ok {
+                out.push(path.clone());
+            }
+            name_ok
+        } else {
+            false
+        };
+        all_conform &= conforms;
+        has_content |= conforms;
+    }
+    all_conform && has_content
+}
+
+/// OS metadata files that neither belong to nor disqualify an archive folder.
+const IGNORABLE_METADATA: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
+
+/// Account and folder names as produced by `StorageEngine::sanitize_slug`.
+fn is_slug(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// `<uid>_<first 12 hex chars of SHA-256>.eml`
+fn is_eml_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".eml") else { return false };
+    let Some((uid, hash)) = stem.split_once('_') else { return false };
+    !uid.is_empty()
+        && uid.bytes().all(|b| b.is_ascii_digit())
+        && hash.len() == 12
+        && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `<uuid v4>.tmp` as written to `.staging`
+fn is_staging_name(name: &str) -> bool {
+    name.strip_suffix(".tmp")
+        .map(|id| id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+        .unwrap_or(false)
+}
+
+/// The candidates (see [`ownership_candidates`]) that exist and aren't owned by
+/// `uid`. Each entry is checked on its own; symlinks are never followed.
 #[cfg(unix)]
 pub fn paths_needing_owner(candidates: &[PathBuf], uid: u32) -> Vec<PathBuf> {
     use std::os::unix::fs::MetadataExt;
-    fn foreign(path: &Path, uid: u32) -> bool {
-        let Ok(meta) = std::fs::symlink_metadata(path) else { return false };
-        if meta.uid() != uid {
-            return true;
-        }
-        meta.is_dir()
-            && std::fs::read_dir(path)
-                .map(|entries| entries.flatten().any(|e| foreign(&e.path(), uid)))
-                .unwrap_or(false)
+    candidates
+        .iter()
+        .filter(|p| std::fs::symlink_metadata(p).map(|m| m.uid() != uid).unwrap_or(false))
+        .cloned()
+        .collect()
+}
+
+/// NUL-separated path list for `xargs -0`.
+#[cfg(unix)]
+fn nul_list(paths: &[PathBuf]) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = Vec::new();
+    for p in paths {
+        out.extend_from_slice(p.as_os_str().as_bytes());
+        out.push(0);
     }
-    candidates.iter().filter(|p| foreign(p, uid)).cloned().collect()
+    out
+}
+
+/// Runs `cmd` with `input` on stdin and checks its exit status.
+#[cfg(target_os = "linux")]
+fn run_checked_with_stdin(cmd: &mut Command, input: &[u8], what: &str) -> Result<()> {
+    use std::io::Write;
+    let mut child = cmd
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::Config(format!("{}: could not run {:?}: {}", what, cmd.get_program(), e)))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input)?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::Config(format!("{} failed ({}). Authorization may have been cancelled.", what, status)))
+    }
 }
 
 #[cfg(unix)]
@@ -863,10 +985,15 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
         // themselves, so it also happens after the documented off/on reinstall.
         let repair = paths_needing_owner(&ownership_candidates(&env.config_path), user_uid(&env.id, user)?);
         if !repair.is_empty() {
-            // -h with -R (and chown's default -P) never follows symlinks; only the
-            // dedicated archive folder is a directory here
-            run_checked(
-                Command::new(&env.pkexec).arg(&env.chown).args(["-R", "-h", user]).args(&repair),
+            // One authorization for any number of entries: the list goes to xargs
+            // on stdin. Never recursive; -h changes symlinks themselves.
+            run_checked_with_stdin(
+                Command::new(&env.pkexec)
+                    .arg(&env.xargs)
+                    .args(["-0", "-r"])
+                    .arg(&env.chown)
+                    .args(["-h", "--", user]),
+                &nul_list(&repair),
                 "Giving your user ownership of files created by the old root service",
             )?;
         }
@@ -907,13 +1034,9 @@ pub fn set_service_enabled_in(env: &ServiceEnv, enabled: bool) -> Result<()> {
     // environment and is shell-quoted by AppleScript's `quoted form of`.
     const INSTALL_SCRIPT: &str = r#"set staged to system attribute "MB_STAGED_PLIST"
 set fixOwner to ""
-set pathCount to (system attribute "MB_PATH_COUNT") as integer
-if pathCount > 0 then
-    set fixOwner to "/usr/sbin/chown -R -h " & quoted form of (system attribute "MB_USER")
-    repeat with i from 0 to (pathCount - 1)
-        set fixOwner to fixOwner & " " & quoted form of (system attribute ("MB_PATH_" & i))
-    end repeat
-    set fixOwner to fixOwner & " && "
+set ownerList to system attribute "MB_OWNER_LIST"
+if ownerList is not "" then
+    set fixOwner to "/usr/bin/xargs -0 /usr/sbin/chown -h -- " & quoted form of (system attribute "MB_USER") & " < " & quoted form of ownerList & " && "
 end if
 do shell script fixOwner & "/usr/bin/install -m 644 -o root -g wheel " & quoted form of staged & " /Library/LaunchDaemons/com.mailbackup.service.plist && (/bin/launchctl bootout system/com.mailbackup.service 2>/dev/null; true) && /bin/launchctl bootstrap system /Library/LaunchDaemons/com.mailbackup.service.plist" with administrator privileges"#;
     const UNINSTALL_SCRIPT: &str = r#"do shell script "(/bin/launchctl bootout system/com.mailbackup.service 2>/dev/null; true) && /bin/rm -f /Library/LaunchDaemons/com.mailbackup.service.plist" with administrator privileges"#;
@@ -925,15 +1048,18 @@ do shell script fixOwner & "/usr/bin/install -m 644 -o root -g wheel " & quoted 
         let repair = paths_needing_owner(&ownership_candidates(&env.config_path), user_uid(&env.id, user)?);
         let content = generate_macos_plist(&env.server_exe, &env.config_path, user);
         let staged = StagedFile::write(&env.staging_dir, "plist", content.as_bytes())?;
+        let owner_list = if repair.is_empty() {
+            None
+        } else {
+            Some(StagedFile::write(&env.staging_dir, "list", &nul_list(&repair))?)
+        };
         let mut cmd = Command::new(OSASCRIPT);
         cmd.args(["-e", INSTALL_SCRIPT])
             .env("MB_STAGED_PLIST", &staged.0)
             .env("MB_USER", user)
-            .env("MB_PATH_COUNT", repair.len().to_string());
-        for (i, path) in repair.iter().enumerate() {
-            cmd.env(format!("MB_PATH_{}", i), path);
-        }
+            .env("MB_OWNER_LIST", owner_list.as_ref().map(|f| f.0.as_os_str()).unwrap_or_default());
         run_checked(&mut cmd, "Installing the LaunchDaemon")?;
+        drop(owner_list);
         drop(staged);
         let installed = std::fs::read_to_string(LAUNCHD_PLIST_PATH)
             .map_err(|e| Error::Config(format!("LaunchDaemon missing after install: {}", e)))?;

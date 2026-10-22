@@ -125,7 +125,7 @@ settings:
 
 Installing and removing still ask for administrator authorization once, because the definitions live in system folders. On Linux this can be up to three prompts.
 
-A service installed by version 0.2.12 or earlier runs with administrator rights. Settings shows "Admin rights: reinstall"; turn the option off and on again to reinstall it as your user. On Linux and macOS, every install also checks MailBackup's own files and hands any that aren't yours back to your user, so files left by the old root service keep working. That means the config, the credential store and key, the service logs, and the catalog database with its `-wal`/`-shm` files; the data folder is included recursively only when it's a dedicated MailBackup archive. Folders around them are never changed, and `chown -h` never follows symlinks.
+A service installed by version 0.2.12 or earlier runs with administrator rights. Settings shows "Admin rights: reinstall"; turn the option off and on again to reinstall it as your user. On Linux and macOS, every install also checks MailBackup's own files and hands any that aren't yours back to your user, so files left by the old root service keep working. That means the config, the credential store and key, the service logs, the catalog database with its `-wal`/`-shm` files, and the archive's own files and folders. The archive is checked against MailBackup's exact layout (`<account>/<folder>/<year>/<month>/<uid>_<hash>.eml`); anything else in the data folder, and any folder holding something else, is left alone. Nothing is changed recursively, and `chown -h` never follows symlinks.
 
 ### 4. Running the Desktop GUI
 

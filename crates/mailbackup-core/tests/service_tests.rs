@@ -105,12 +105,16 @@ fn fixture_as(fault: Fault, user: &str) -> Fixture {
 
     let chown_body = if fault == Fault::Chown { "exit 1\n" } else { "exit 0\n" };
     script(&bin.join("chown"), &format!("echo \"chown $*\" >> '{log_s}'\n{chown_body}"));
+    // Real xargs, so the fake chown sees the paths it would get in production
+    script(&bin.join("xargs"), &format!("echo \"xargs $*\" >> '{log_s}'\nexec /usr/bin/xargs \"$@\"\n"));
 
     // A realistic MailBackup folder: config, credentials, catalog, archive
     let base = dir.path().join("home/.mailbackup");
     let data = base.join("data");
     std::fs::create_dir_all(data.join("acc/inbox/2026/10")).unwrap();
-    std::fs::write(data.join("acc/inbox/2026/10/1_abc.eml"), "Subject: x").unwrap();
+    std::fs::write(data.join("acc/inbox/2026/10/1_0123456789ab.eml"), "Subject: x").unwrap();
+    std::fs::create_dir_all(data.join(".staging")).unwrap();
+    std::fs::write(data.join(".staging/0f8fad5b-d9cb-469f-a165-70867728950e.tmp"), "x").unwrap();
     std::fs::write(base.join("mailbackup.db"), "db").unwrap();
     std::fs::write(base.join(".credentials_store.json"), "{}").unwrap();
     std::fs::write(base.join(".credentials_key"), "k").unwrap();
@@ -136,6 +140,7 @@ fn fixture_as(fault: Fault, user: &str) -> Fixture {
         install: bin.join("install"),
         rm: bin.join("rm"),
         chown: bin.join("chown"),
+        xargs: bin.join("xargs"),
         id: trusted_program("id").unwrap(),
     };
     Fixture { dir, env, log, user: user.to_string() }
@@ -287,7 +292,17 @@ fn status_flags_root_units_for_reinstall() {
 // --- Ownership repair after an old root service -------------------------------
 
 fn chown_call(f: &Fixture) -> Option<String> {
-    calls(f).into_iter().find(|l| l.starts_with(&format!("pkexec {}", f.env.chown.display())))
+    calls(f).into_iter().find(|l| l.starts_with(&format!("pkexec {}", f.env.xargs.display())))
+}
+
+/// Every path the (fake) chown was given, across all xargs batches.
+fn chown_targets(f: &Fixture) -> Vec<PathBuf> {
+    let prefix = format!("chown -h -- {} ", f.user);
+    calls(f)
+        .iter()
+        .filter_map(|l| l.strip_prefix(&prefix))
+        .flat_map(|rest| rest.split(' ').map(PathBuf::from).collect::<Vec<_>>())
+        .collect()
 }
 
 #[test]
@@ -304,31 +319,73 @@ fn foreign_owned_files_are_given_to_the_service_user_before_start() {
     install_legacy_root_unit(&f);
     set_service_enabled_in(&f.env, true).unwrap();
 
+    // One elevated call: pkexec xargs -0 -r <chown> -h -- <user>, list on stdin
     let call = chown_call(&f).unwrap_or_else(|| panic!("{:?}", calls(&f)));
-    let args: Vec<&str> = call.split_whitespace().skip(2).collect();
-    assert_eq!(&args[..3], ["-R", "-h", f.user.as_str()]);
+    assert_eq!(
+        call,
+        format!("pkexec {} -0 -r {} -h -- {}", f.env.xargs.display(), f.env.chown.display(), f.user)
+    );
+    assert!(!calls(&f).iter().any(|l| l.contains(" -R ")), "never recursive: {:?}", calls(&f));
+
     let base = f.dir.path().join("home/.mailbackup");
-    let targets: Vec<PathBuf> = args[3..].iter().map(PathBuf::from).collect();
+    let data = base.join("data");
+    let targets = chown_targets(&f);
     for expected in [
         base.join("config.yaml"),
         base.join(".credentials_store.json"),
         base.join(".credentials_key"),
         base.join("mailbackup.db"),
-        base.join("data"),
+        data.join("acc/inbox/2026/10/1_0123456789ab.eml"),
+        data.join("acc/inbox/2026/10"),
+        data.join("acc"),
+        data.join(".staging/0f8fad5b-d9cb-469f-a165-70867728950e.tmp"),
+        data.clone(),
     ] {
-        assert!(targets.contains(&expected), "missing {} in {call}", expected.display());
+        assert!(targets.contains(&expected), "missing {} in {targets:?}", expected.display());
     }
-    // Only MailBackup's own files and archive: never the folders around them
+    // Never the folders around MailBackup's files
     for not_expected in [base.clone(), f.dir.path().join("home"), f.dir.path().to_path_buf()] {
-        assert!(!targets.contains(&not_expected), "{} in {call}", not_expected.display());
+        assert!(!targets.contains(&not_expected), "{} in {targets:?}", not_expected.display());
     }
-    // Missing files (WAL/SHM, logs) aren't passed
-    assert!(targets.iter().all(|t| t.exists()), "{call}");
+    assert!(targets.iter().all(|t| t.exists()), "{targets:?}");
 
     let c = calls(&f);
     let chown_at = c.iter().position(|l| l == &call).unwrap();
     let restart_at = c.iter().position(|l| l.ends_with("systemctl restart mailbackup.service")).unwrap();
     assert!(chown_at < restart_at, "ownership must be fixed before the service starts: {c:?}");
+}
+
+#[test]
+fn mixed_data_folder_only_repairs_archive_entries() {
+    // A shared folder holding one archive account next to unrelated content
+    let f = fixture_as(Fault::None, other_account());
+    let data = f.dir.path().join("home/.mailbackup/data");
+    std::fs::create_dir_all(data.join("unrelated-database")).unwrap();
+    std::fs::write(data.join("unrelated-database/private.db"), "secret").unwrap();
+    std::fs::create_dir_all(data.join("mail")).unwrap();
+    std::fs::write(data.join("mail/one.eml"), "Subject: y").unwrap();
+    // A symlink inside the archive is never followed or repaired
+    std::os::unix::fs::symlink("/etc/passwd", data.join("acc/inbox/2026/10/2_0123456789ab.eml")).unwrap();
+
+    install_legacy_root_unit(&f);
+    set_service_enabled_in(&f.env, true).unwrap();
+    let targets = chown_targets(&f);
+
+    // The valid archive file is still repaired...
+    assert!(targets.contains(&data.join("acc/inbox/2026/10/1_0123456789ab.eml")), "{targets:?}");
+    // ...but nothing unrelated, no folder holding unexpected content, and not the data folder itself
+    for forbidden in [
+        data.join("unrelated-database"),
+        data.join("unrelated-database/private.db"),
+        data.join("mail"),
+        data.join("mail/one.eml"),
+        data.join("acc/inbox/2026/10/2_0123456789ab.eml"),
+        data.join("acc/inbox/2026/10"),
+        data.join("acc"),
+        data.clone(),
+    ] {
+        assert!(!targets.contains(&forbidden), "{} must not be repaired: {targets:?}", forbidden.display());
+    }
 }
 
 #[test]
@@ -366,6 +423,16 @@ fn ownership_repair_never_targets_system_folders() {
     for forbidden in ["/var/lib", "/var", "/", "/etc"] {
         assert!(!candidates.contains(&PathBuf::from(forbidden)), "{forbidden} in {candidates:?}");
     }
+    // Nothing under /var/lib besides the catalog's own files
+    let db_files: Vec<PathBuf> = ["", "-wal", "-shm", "-journal"]
+        .iter()
+        .map(|suffix| PathBuf::from(format!("/var/lib/mailbackup-test.db{suffix}")))
+        .collect();
+    for c in &candidates {
+        if c.starts_with("/var/lib") {
+            assert!(db_files.contains(c), "unexpected candidate {}", c.display());
+        }
+    }
     assert!(candidates.contains(&PathBuf::from("/var/lib/mailbackup-test.db")));
     assert!(candidates.contains(&PathBuf::from("/var/lib/mailbackup-test.db-wal")));
     assert!(!candidates.contains(&dir.path().to_path_buf()), "the config's folder itself is never included");
@@ -392,4 +459,24 @@ fn privileged_process_installs_for_the_config_owner() {
     let root_only = dir.path().join("root.yaml");
     std::fs::write(&root_only, "x").unwrap();
     assert!(mailbackup_core::service::service_user(&root_only).is_err());
+}
+
+#[test]
+fn empty_or_unexpected_folders_are_never_archive_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    // Valid-looking names but empty: not MailBackup's (fail closed)
+    std::fs::create_dir_all(data.join("acc/inbox/2026/10")).unwrap();
+    std::fs::create_dir_all(data.join("other")).unwrap();
+    assert!(mailbackup_core::service::archive_entries(&data).is_empty());
+
+    // Wrong file names at the right level don't count either
+    std::fs::write(data.join("acc/inbox/2026/10/notes.txt"), "x").unwrap();
+    std::fs::write(data.join("acc/inbox/2026/10/1_xyz.eml"), "x").unwrap();
+    assert!(mailbackup_core::service::archive_entries(&data).is_empty());
+
+    // One real archive file makes exactly that file (and no folder holding junk) eligible
+    std::fs::write(data.join("acc/inbox/2026/10/7_00000000abcd.eml"), "x").unwrap();
+    let entries = mailbackup_core::service::archive_entries(&data);
+    assert_eq!(entries, vec![data.join("acc/inbox/2026/10/7_00000000abcd.eml")]);
 }
