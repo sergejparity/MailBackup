@@ -1769,10 +1769,45 @@ pub struct ServiceToggleResponse {
 /// (verified) before installing; disabling uninstalls first, then moves them
 /// back into the keyring (verified), leaving on disk what the keyring can't take.
 fn set_service_with_credentials(state: &AppState, enabled: bool, account_ids: &[String]) -> mailbackup_core::Result<()> {
+    set_service_with_credentials_using(
+        state,
+        enabled,
+        account_ids,
+        mailbackup_core::service::set_service_enabled,
+        || mailbackup_core::service::get_service_status().installed,
+    )
+}
+
+/// Sets `settings.run_as_service` in the config file on disk, leaving the
+/// rest of the file as it is there.
+fn persist_run_as_service(config_path: &std::path::Path, enabled: bool) -> mailbackup_core::Result<()> {
+    let mut on_disk = AppConfig::load_or_create(Some(config_path))?;
+    on_disk.settings.run_as_service = enabled;
+    on_disk.save(config_path)
+}
+
+/// [`set_service_with_credentials`] with the install/uninstall step injected.
+/// When enabling, `run_as_service: true` is written to the config before the
+/// service is installed (installing starts it, and the service must start in
+/// disk storage mode), and written back to `false` if the install fails.
+fn set_service_with_credentials_using(
+    state: &AppState,
+    enabled: bool,
+    account_ids: &[String],
+    set_enabled: impl FnOnce(bool, &std::path::Path) -> mailbackup_core::Result<()>,
+    still_installed: impl FnOnce() -> bool,
+) -> mailbackup_core::Result<()> {
     let config_path = state.config_path.clone();
     if enabled {
         let change = state.credentials.switch_to_disk_storage(account_ids, || {
-            mailbackup_core::service::set_service_enabled(true, &config_path)
+            persist_run_as_service(&config_path, true)?;
+            if let Err(e) = set_enabled(true, &config_path) {
+                if let Err(revert) = persist_run_as_service(&config_path, false) {
+                    tracing::warn!("Couldn't reset run_as_service after a failed install: {}", revert);
+                }
+                return Err(e);
+            }
+            Ok(())
         })?;
         if !change.skipped_accounts.is_empty() {
             mailbackup_core::event_log::log_event(
@@ -1782,9 +1817,10 @@ fn set_service_with_credentials(state: &AppState, enabled: bool, account_ids: &[
         }
     } else {
         let moved = state.credentials.switch_to_keyring_storage(
-            || mailbackup_core::service::set_service_enabled(false, &config_path),
-            || mailbackup_core::service::get_service_status().installed,
+            || set_enabled(false, &config_path),
+            still_installed,
         )?;
+        persist_run_as_service(&config_path, false)?;
         if !moved.kept.is_empty() {
             mailbackup_core::event_log::log_event(
                 "SERVICE_CREDENTIALS",
@@ -1967,6 +2003,10 @@ mod tests {
     }
 
     async fn test_router_with(dir: &std::path::Path, extra_approved: Vec<PathBuf>) -> Router {
+        create_router(test_state(dir, extra_approved).await)
+    }
+
+    async fn test_state(dir: &std::path::Path, extra_approved: Vec<PathBuf>) -> AppState {
         std::fs::create_dir_all(dir.join("exports")).unwrap();
         let mut config = AppConfig {
             data_dir: dir.join("state/data"),
@@ -1979,6 +2019,7 @@ mod tests {
         let storage = StorageEngine::new(&config.data_dir);
         let credentials = Arc::new(
             CredentialStore::with_paths(dir.join(".credentials_store.json"), dir.join(".credentials_key"))
+                .with_passphrase(None)
                 .with_keyring(Arc::new(mailbackup_core::keyring::NoKeyring)),
         );
         let scheduler = BackupScheduler::new(
@@ -1989,7 +2030,7 @@ mod tests {
         )
         .await
         .unwrap();
-        create_router(AppState {
+        AppState {
             config: Arc::new(RwLock::new(config)),
             config_path: dir.join("config.yaml"),
             db,
@@ -1998,7 +2039,59 @@ mod tests {
             scheduler: Arc::new(Mutex::new(scheduler)),
             active_syncs: Arc::new(StdRwLock::new(HashMap::new())),
             api_token: Arc::from(TOKEN),
-        })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_service_starts_with_disk_storage_already_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        state.config.read().await.save(&state.config_path).unwrap();
+        state.credentials.set_password("a", "pw").unwrap();
+
+        set_service_with_credentials_using(&state, true, &["a".to_string()], |enabled, path| {
+            assert!(enabled);
+            // What the service process reads when the install starts it
+            let on_disk = AppConfig::load_or_create(Some(path)).unwrap();
+            assert!(on_disk.settings.run_as_service, "saved before the service starts");
+            let service = CredentialStore::for_config(path, &on_disk.settings)
+                .with_passphrase(None)
+                .with_keyring(Arc::new(mailbackup_core::keyring::NoKeyring));
+            assert!(service.disk_storage());
+            assert_eq!(service.get_password("a").unwrap(), "pw");
+            Ok(())
+        }, || unreachable!())
+        .unwrap();
+        assert!(state.credentials.disk_storage());
+
+        // Still installed: nothing changes on disk
+        let err = set_service_with_credentials_using(&state, false, &[], |_, _| Ok(()), || true).unwrap_err();
+        assert!(err.to_string().contains("still installed"));
+        assert!(AppConfig::load_or_create(Some(&state.config_path)).unwrap().settings.run_as_service);
+
+        set_service_with_credentials_using(&state, false, &[], |enabled, _| {
+            assert!(!enabled);
+            Ok(())
+        }, || false)
+        .unwrap();
+        assert!(!AppConfig::load_or_create(Some(&state.config_path)).unwrap().settings.run_as_service);
+    }
+
+    #[tokio::test]
+    async fn a_failed_service_install_resets_run_as_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        state.config.read().await.save(&state.config_path).unwrap();
+        state.credentials.set_password("a", "pw").unwrap();
+
+        let err = set_service_with_credentials_using(&state, true, &["a".to_string()], |_, _| {
+            Err(mailbackup_core::Error::Other("authorization dismissed".into()))
+        }, || unreachable!())
+        .unwrap_err();
+        assert!(err.to_string().contains("authorization dismissed"));
+        assert!(!AppConfig::load_or_create(Some(&state.config_path)).unwrap().settings.run_as_service);
+        assert!(!state.credentials.disk_storage());
+        assert_eq!(state.credentials.get_password("a").unwrap(), "pw");
     }
 
     async fn status(router: &Router, req: HttpRequest<Body>) -> StatusCode {
