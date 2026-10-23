@@ -125,6 +125,35 @@ pub struct StorageStats {
     pub total_bytes: u64,
 }
 
+/// Makes the catalog owner-only before SQLite opens it. SQLite's unix VFS gives
+/// the `-wal`/`-shm`/`-journal` files it creates the database file's mode, so
+/// the file must be private first:
+/// - a missing database is pre-created empty with mode 0600 (SQLite treats an
+///   empty file as a new database), its missing parent folders owner-only;
+/// - an existing database we own, and any sidecar files left from an earlier
+///   run, lose group/other access before the connection and WAL are set up.
+fn prepare_private_db_file(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() || path == Path::new(":memory:") {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        crate::private_fs::create_dir_all(parent)?;
+    }
+    match crate::private_fs::options().write(true).create_new(true).open(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
+    }
+    let sidecars = ["-wal", "-shm", "-journal"].map(|s| PathBuf::from(format!("{}{}", path.display(), s)));
+    for file in std::iter::once(path.to_path_buf()).chain(sidecars) {
+        // A file we can't tighten (e.g. on a read-only volume) is still usable
+        if let Err(e) = crate::private_fs::restrict(&file) {
+            tracing::warn!("Could not make {} owner-only: {}", file.display(), e);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -134,6 +163,7 @@ pub struct Database {
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let p = path.as_ref().to_path_buf();
+        prepare_private_db_file(&p)?;
         let conn = Connection::open(&p)?;
         let _ = conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()));
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -172,7 +202,7 @@ impl Database {
         }
 
         if let Some(parent) = new_p.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::private_fs::create_dir_all(parent)?;
         }
 
         {
@@ -183,22 +213,23 @@ impl Database {
                 let _ = conn_guard.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
 
                 // Copy main .db file
-                std::fs::copy(&old_p, new_p)?;
+                crate::private_fs::copy(&old_p, new_p)?;
 
                 // Also copy WAL and SHM if present
                 let old_wal = format!("{}-wal", old_p.display());
                 let new_wal = format!("{}-wal", new_p.display());
                 if std::path::Path::new(&old_wal).exists() {
-                    let _ = std::fs::copy(&old_wal, &new_wal);
+                    let _ = crate::private_fs::copy(Path::new(&old_wal), Path::new(&new_wal));
                 }
                 let old_shm = format!("{}-shm", old_p.display());
                 let new_shm = format!("{}-shm", new_p.display());
                 if std::path::Path::new(&old_shm).exists() {
-                    let _ = std::fs::copy(&old_shm, &new_shm);
+                    let _ = crate::private_fs::copy(Path::new(&old_shm), Path::new(&new_shm));
                 }
             }
 
             // Open new connection on relocated path
+            prepare_private_db_file(new_p)?;
             let new_conn = Connection::open(new_p)?;
             let _ = new_conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()));
             new_conn.pragma_update(None, "synchronous", "NORMAL")?;

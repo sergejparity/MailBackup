@@ -2,7 +2,7 @@ use crate::config::default_base_dir;
 use crate::error::{Error, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -97,7 +97,7 @@ pub fn rotate_active_log() -> Result<Option<String>> {
     }
 
     let dir = log_dir();
-    fs::create_dir_all(&dir)?;
+    crate::private_fs::create_dir_all(&dir)?;
 
     let today = Utc::now().date_naive();
     let log_date = detect_log_file_date(&active_path).unwrap_or(today);
@@ -122,8 +122,8 @@ pub fn rotate_active_log() -> Result<Option<String>> {
 
     if fs::rename(&active_path, &candidate_path).is_err() {
         // Fallback: copy and truncate
-        fs::copy(&active_path, &candidate_path)?;
-        let _ = fs::write(&active_path, "");
+        crate::private_fs::copy(&active_path, &candidate_path)?;
+        let _ = crate::private_fs::write(&active_path, b"");
     }
 
     Ok(Some(final_name))
@@ -237,7 +237,7 @@ pub fn log_event(event_type: &str, details: &str) {
 
     let path = log_file_path();
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = crate::private_fs::create_dir_all(parent);
     }
 
     let now = Utc::now();
@@ -248,7 +248,7 @@ pub fn log_event(event_type: &str, details: &str) {
         details
     );
 
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut file) = crate::private_fs::open_append(&path) {
         let _ = file.write_all(formatted_line.as_bytes());
     }
 }
@@ -400,7 +400,7 @@ pub fn get_raw_log() -> Result<String> {
 pub fn clear_log() -> Result<()> {
     let path = log_file_path();
     if path.exists() {
-        std::fs::write(&path, "")?;
+        crate::private_fs::write(&path, b"")?;
     }
     log_event("LOGS_CLEARED", "Event logs cleared by user");
     Ok(())

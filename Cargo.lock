@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-cli"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2525,6 +2525,7 @@ dependencies = [
  "mailbackup-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2532,7 +2533,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-core"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2544,6 +2545,7 @@ dependencies = [
  "futures-util",
  "hex",
  "keyring",
+ "libc",
  "mail-parser",
  "regex",
  "rusqlite",
@@ -2564,7 +2566,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-gui"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2581,7 +2583,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-server"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "axum",

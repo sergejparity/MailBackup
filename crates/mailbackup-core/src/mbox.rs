@@ -2,7 +2,6 @@ use crate::error::Result;
 use crate::storage::StorageEngine;
 use chrono::{DateTime, Utc};
 use mail_parser::MessageParser;
-use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use tracing::info;
@@ -97,11 +96,11 @@ impl<'a> MboxExporter<'a> {
         let output_path = output_path.as_ref();
         if let Some(parent) = output_path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
+                crate::private_fs::create_dir_all(parent)?;
             }
         }
 
-        let mut options = OpenOptions::new();
+        let mut options = crate::private_fs::options();
         options.write(true);
         if overwrite {
             options.create(true).truncate(true);

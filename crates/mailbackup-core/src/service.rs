@@ -228,7 +228,7 @@ pub fn xml_escape(value: &str) -> String {
 
 /// Service logs live next to the config (not in the installing process's home,
 /// which is root's when an old root service performs the migration).
-fn service_log_paths(config_path: &Path) -> (PathBuf, PathBuf) {
+pub(crate) fn service_log_paths(config_path: &Path) -> (PathBuf, PathBuf) {
     let base = config_path.parent().map(Path::to_path_buf).unwrap_or_else(crate::config::default_base_dir);
     let log_dir = base.join("logs");
     (log_dir.join("service.log"), log_dir.join("service_err.log"))
@@ -982,8 +982,10 @@ fn decode_task_query(bytes: &[u8]) -> String {
 /// installed for that configuration and its owner.
 pub fn set_service_enabled(enabled: bool, config_path: &Path) -> Result<()> {
     let env = ServiceEnv::detect(config_path)?;
-    let log_dir = crate::config::default_base_dir().join("logs");
-    let _ = std::fs::create_dir_all(&log_dir);
+    let (out_log, _) = service_log_paths(&env.config_path);
+    if let Some(log_dir) = out_log.parent() {
+        let _ = crate::private_fs::create_dir_all(log_dir);
+    }
     set_service_enabled_in(&env, enabled)
 }
 
