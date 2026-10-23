@@ -155,6 +155,8 @@ async fn main() -> Result<()> {
         .try_init();
 
     let mut config = AppConfig::load_or_create(cli.config.as_deref())?;
+    let config_path = cli.config.clone().unwrap_or_else(mailbackup_core::config::default_config_path);
+    mailbackup_core::private_fs::tighten_existing_in_background(&config_path, &config.settings);
     let db = Database::open(&config.db_path)?;
     let storage = StorageEngine::new(&config.data_dir);
     let credentials = Arc::new(CredentialStore::new());

@@ -49,7 +49,7 @@ impl StorageEngine {
             return Ok(0);
         }
 
-        std::fs::create_dir_all(&new_base)?;
+        crate::private_fs::create_dir_all(&new_base)?;
 
         if !old_base.exists() {
             return Ok(0);
@@ -59,7 +59,7 @@ impl StorageEngine {
 
         fn copy_dir_recursive(src: &Path, dst: &Path, copied: &mut u64) -> Result<()> {
             if !dst.exists() {
-                std::fs::create_dir_all(dst)?;
+                crate::private_fs::create_dir_all(dst)?;
             }
             for entry in std::fs::read_dir(src)? {
                 let entry = entry?;
@@ -77,7 +77,7 @@ impl StorageEngine {
                 if file_type.is_dir() {
                     copy_dir_recursive(&src_path, &dst_path, copied)?;
                 } else if file_type.is_file() {
-                    std::fs::copy(&src_path, &dst_path)?;
+                    crate::private_fs::copy(&src_path, &dst_path)?;
                     *copied += 1;
                 }
             }
@@ -159,23 +159,27 @@ impl StorageEngine {
 
         // Staging directory for atomic rename
         let staging_dir = base.join(".staging");
-        std::fs::create_dir_all(&staging_dir)?;
+        crate::private_fs::create_dir_all(&staging_dir)?;
         let temp_filename = format!("{}.tmp", Uuid::new_v4());
         let temp_path = staging_dir.join(temp_filename);
 
-        // Write to temporary file
-        std::fs::write(&temp_path, raw_bytes)?;
+        // Write to temporary file (owner-only from creation)
+        {
+            use std::io::Write;
+            let mut file = crate::private_fs::options().write(true).create_new(true).open(&temp_path)?;
+            file.write_all(raw_bytes)?;
+        }
 
         // Ensure target directory exists
         if let Some(parent) = absolute_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::private_fs::create_dir_all(parent)?;
         }
 
         // Atomic move
         if let Err(e) = std::fs::rename(&temp_path, &absolute_path) {
             // Fallback for cross-device or permission quirks
             warn!("Failed to rename {} to {}: {}. Attempting copy fallback.", temp_path.display(), absolute_path.display(), e);
-            std::fs::copy(&temp_path, &absolute_path)?;
+            crate::private_fs::copy(&temp_path, &absolute_path)?;
             let _ = std::fs::remove_file(&temp_path);
         }
 

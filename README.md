@@ -127,6 +127,14 @@ Installing and removing still ask for administrator authorization once, because 
 
 A service installed by version 0.2.12 or earlier runs with administrator rights. Settings shows "Admin rights: reinstall"; turn the option off and on again to reinstall it as your user. On Linux and macOS, every install also checks MailBackup's own files and hands any that aren't yours back to your user, so files left by the old root service keep working. That means the config, the credential store and key, the service logs, the catalog database with its `-wal`/`-shm` files, and the archive's own files and folders. The archive is checked against MailBackup's exact layout (`<account>/<folder>/<year>/<month>/<uid>_<hash>.eml`); anything else in the data folder, and any folder holding something else, is left alone. Nothing is changed recursively, and `chown -h` never follows symlinks.
 
+**Files on disk are private to your user account (Linux/macOS).** MailBackup creates its folders as `0700` and its files as `0600`: the archived mail, the catalog database with its `-wal`/`-shm` files, `config.yaml`, the credential store, the event logs and `.mbox` exports. Existing folders it writes into, such as Documents or a custom database folder, are left as they are.
+
+At startup, files left readable by older versions are tightened too. Only MailBackup's own paths are changed:
+- the config, the credential store and key, the catalog and its sidecar files, `~/.mailbackup` and its logs;
+- archive entries that follow MailBackup's exact layout. A data folder that also holds other files keeps its own permissions, but the archive inside it is tightened.
+
+Only files you own are changed, and symlinks are never followed. To share an archive with a group on purpose, set `settings.tighten_permissions: false` and manage the permissions yourself; new files are still created owner-only. On Windows, the permissions of your user profile folder apply.
+
 ### 4. Running the Desktop GUI
 
 ```bash

@@ -125,6 +125,11 @@ pub struct GlobalSettings {
     pub run_as_service: bool,
     #[serde(default = "default_log_retention_days")]
     pub log_retention_days: Option<u32>,
+    /// At startup, remove other users' access from MailBackup's existing files
+    /// (see `private_fs::startup_candidates`). Turn off only for an archive
+    /// deliberately shared with a group. New files are always owner-only.
+    #[serde(default = "default_true")]
+    pub tighten_permissions: bool,
 }
 
 fn default_schedule() -> String {
@@ -156,6 +161,7 @@ impl Default for GlobalSettings {
             autostart: false,
             run_as_service: false,
             log_retention_days: default_log_retention_days(),
+            tighten_permissions: true,
         }
     }
 }
@@ -288,6 +294,7 @@ impl AppConfig {
         if !config_path.exists() {
             let default_config = Self::default();
             default_config.save(&config_path)?;
+            default_config.ensure_dirs()?;
             return Ok(default_config);
         }
 
@@ -296,28 +303,30 @@ impl AppConfig {
         let config: AppConfig = serde_yaml::from_str(&content)
             .map_err(|e| Error::Serialization(format!("Failed to parse config {}: {}", config_path.display(), e)))?;
 
-        // Ensure directories exist
-        if !config.data_dir.exists() {
-            std::fs::create_dir_all(&config.data_dir)?;
-        }
-        if let Some(parent) = config.db_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-
+        config.ensure_dirs()?;
         Ok(config)
+    }
+
+    /// Creates the data folder and the catalog's folder (owner-only) if missing,
+    /// on first run as well as later ones.
+    fn ensure_dirs(&self) -> Result<()> {
+        crate::private_fs::create_dir_all(&self.data_dir)?;
+        if let Some(parent) = self.db_path.parent() {
+            // `create_dir_all` ignores the empty parent of a bare "catalog.db"
+            crate::private_fs::create_dir_all(parent)?;
+        }
+        Ok(())
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
+                crate::private_fs::create_dir_all(parent)?;
             }
         }
         let yaml = serde_yaml::to_string(self)
             .map_err(|e| Error::Serialization(format!("Failed to serialize config: {}", e)))?;
-        std::fs::write(path, yaml)?;
+        crate::private_fs::write_atomic(path, yaml.as_bytes())?;
         Ok(())
     }
 
