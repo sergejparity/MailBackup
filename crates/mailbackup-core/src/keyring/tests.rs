@@ -546,3 +546,28 @@ fn keyring_copy_and_restart_with_a_shared_keyring() {
     assert_eq!(kind(keyring.get("account:acc")), Kind::NotFound);
     assert_eq!(kind(fx.store().get_password("acc")), Kind::NotFound);
 }
+
+#[test]
+fn delete_keeps_the_keyring_copy_when_the_store_cannot_be_updated() {
+    let fx = Fixture::new();
+    let keyring = Arc::new(MemoryKeyring::default());
+    let store = fx.store_with(keyring.clone());
+    store.set_password("acc", "pw").unwrap();
+    std::fs::write(fx.store_path(), b"{ damaged").unwrap();
+
+    assert_eq!(kind(store.delete_password("acc")), Kind::Corrupt);
+    assert_eq!(keyring.get("account:acc").unwrap(), "pw", "the only readable copy survives");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_lock_path_is_not_followed() {
+    let fx = Fixture::new();
+    let victim = fx.dir.path().join("victim");
+    std::fs::write(&victim, b"untouched").unwrap();
+    std::os::unix::fs::symlink(&victim, fx.dir.path().join(".credentials_store.json.lock")).unwrap();
+
+    assert!(fx.store().set_password("acc", "pw").is_err());
+    assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+    assert!(!fx.store_path().exists());
+}

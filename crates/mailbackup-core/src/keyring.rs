@@ -205,9 +205,9 @@ impl CredentialStore {
     }
 
     fn delete_secret(&self, key: &str) -> Result<()> {
-        let keyring_result = self.keyring.delete(key);
+        // Local store first: if it can't be updated, the keyring copy stays too
         self.update_fallback(|entries| entries.remove(key).is_some())?;
-        match keyring_result {
+        match self.keyring.delete(key) {
             Err(e) if e.credential_kind() == Some(Kind::Locked) => Err(e),
             _ => Ok(()),
         }
@@ -233,13 +233,15 @@ impl CredentialStore {
         if let Some(parent) = path.parent() {
             crate::private_fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
         }
-        let file = crate::private_fs::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|e| io_error(&path, e))?;
+        let mut options = crate::private_fs::options();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            // Never follow a symlink planted at the lock path
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&path).map_err(|e| io_error(&path, e))?;
         file.lock().map_err(|e| io_error(&path, e))?;
         Ok(file)
     }
