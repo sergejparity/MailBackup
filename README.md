@@ -118,6 +118,15 @@ settings:
 - If `config.yaml` is edited to point an account somewhere else, sync refuses to send the old password ("The saved password … belongs to a different server …") until it is re-entered.
 - Passwords saved by older versions are bound to the current settings the first time they're used.
 
+**Background service:** Settings → "Run as OS Background Service" installs a service that starts at boot and runs **as your user account**, not as root/SYSTEM:
+- Linux: a systemd unit with `User=`.
+- macOS: a LaunchDaemon with `UserName`.
+- Windows: a boot task with your account and S4U logon. This needs the "Log on as a batch job" right, which domain policy can remove.
+
+Installing and removing still ask for administrator authorization once, because the definitions live in system folders. On Linux this can be up to three prompts.
+
+A service installed by version 0.2.12 or earlier runs with administrator rights. Settings shows "Admin rights: reinstall"; turn the option off and on again to reinstall it as your user. On Linux and macOS, every install also checks MailBackup's own files and hands any that aren't yours back to your user, so files left by the old root service keep working. That means the config, the credential store and key, the service logs, the catalog database with its `-wal`/`-shm` files, and the archive's own files and folders. The archive is checked against MailBackup's exact layout (`<account>/<folder>/<year>/<month>/<uid>_<hash>.eml`); anything else in the data folder, and any folder holding something else, is left alone. Nothing is changed recursively, and `chown -h` never follows symlinks.
+
 ### 4. Running the Desktop GUI
 
 ```bash

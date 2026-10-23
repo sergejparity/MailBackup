@@ -1676,7 +1676,7 @@ async fn api_update_settings(
         }
 
         if let Some(service_val) = payload.run_as_service {
-            if let Err(e) = mailbackup_core::service::set_service_enabled(service_val) {
+            if let Err(e) = mailbackup_core::service::set_service_enabled(service_val, &state.config_path) {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to configure system service: {}", e),
@@ -1777,7 +1777,7 @@ async fn api_service_toggle(
     State(state): State<AppState>,
     Json(payload): Json<ServiceTogglePayload>,
 ) -> impl IntoResponse {
-    let res = mailbackup_core::service::set_service_enabled(payload.enabled);
+    let res = mailbackup_core::service::set_service_enabled(payload.enabled, &state.config_path);
     match res {
         Ok(_) => {
             {
