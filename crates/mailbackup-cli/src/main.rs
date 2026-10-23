@@ -161,7 +161,8 @@ async fn main() -> Result<()> {
     mailbackup_core::private_fs::tighten_at_startup(&config_path, &config.settings, long_running);
     let db = Database::open(&config.db_path)?;
     let storage = StorageEngine::new(&config.data_dir);
-    let credentials = Arc::new(CredentialStore::new());
+    // Same store as the server and the background service for this config
+    let credentials = Arc::new(CredentialStore::for_config(&config_path, &config.settings));
 
     match cli.command {
         Commands::Account(AccountCommands::Add(args)) => {

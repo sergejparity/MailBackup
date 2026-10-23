@@ -233,14 +233,8 @@ pub async fn start_server_with_options(
     mailbackup_core::private_fs::tighten_at_startup(&config_path, &config.settings, true);
     let db = Database::open(&config.db_path)?;
     let storage = StorageEngine::new(&config.data_dir);
-    let credentials = if let Some(parent) = config_path.parent() {
-        Arc::new(CredentialStore::with_paths(
-            parent.join(".credentials_store.json"),
-            parent.join(".credentials_key"),
-        ))
-    } else {
-        Arc::new(CredentialStore::new())
-    };
+    // Same store as the CLI and the background service for this config
+    let credentials = Arc::new(CredentialStore::for_config(&config_path, &config.settings));
     let port = port_override.unwrap_or(config.settings.web_port);
     let bind_ip = resolve_bind_ip(&config.settings.bind_address);
 
@@ -1677,7 +1671,8 @@ async fn api_update_settings(
         }
 
         if let Some(service_val) = payload.run_as_service {
-            if let Err(e) = mailbackup_core::service::set_service_enabled(service_val, &state.config_path) {
+            let account_ids: Vec<String> = cfg.accounts.iter().map(|a| a.id.clone()).collect();
+            if let Err(e) = set_service_with_credentials(&state, service_val, &account_ids) {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to configure system service: {}", e),
@@ -1769,6 +1764,41 @@ pub struct ServiceToggleResponse {
     pub message: String,
 }
 
+/// Installs or removes the background service together with moving the
+/// passwords where it can read them: enabling copies them to the local store
+/// (verified) before installing; disabling uninstalls first, then moves them
+/// back into the keyring (verified), leaving on disk what the keyring can't take.
+fn set_service_with_credentials(state: &AppState, enabled: bool, account_ids: &[String]) -> mailbackup_core::Result<()> {
+    let config_path = state.config_path.clone();
+    if enabled {
+        let change = state.credentials.switch_to_disk_storage(account_ids, || {
+            mailbackup_core::service::set_service_enabled(true, &config_path)
+        })?;
+        if !change.skipped_accounts.is_empty() {
+            mailbackup_core::event_log::log_event(
+                "SERVICE_CREDENTIALS",
+                &format!("No saved password to copy for: {}", change.skipped_accounts.join(", ")),
+            );
+        }
+    } else {
+        let moved = state.credentials.switch_to_keyring_storage(
+            || mailbackup_core::service::set_service_enabled(false, &config_path),
+            || mailbackup_core::service::get_service_status().installed,
+        )?;
+        if !moved.kept.is_empty() {
+            mailbackup_core::event_log::log_event(
+                "SERVICE_CREDENTIALS",
+                &format!(
+                    "{} saved passwords stay in the local encrypted store{}",
+                    moved.kept.len(),
+                    moved.reason.map(|r| format!(": {}", r)).unwrap_or_default()
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn api_service_status() -> impl IntoResponse {
     let status = mailbackup_core::service::get_service_status();
     Json(status).into_response()
@@ -1778,7 +1808,8 @@ async fn api_service_toggle(
     State(state): State<AppState>,
     Json(payload): Json<ServiceTogglePayload>,
 ) -> impl IntoResponse {
-    let res = mailbackup_core::service::set_service_enabled(payload.enabled, &state.config_path);
+    let account_ids: Vec<String> = state.config.read().await.accounts.iter().map(|a| a.id.clone()).collect();
+    let res = set_service_with_credentials(&state, payload.enabled, &account_ids);
     match res {
         Ok(_) => {
             {
@@ -1946,10 +1977,10 @@ mod tests {
         config.settings.approved_dirs.extend(extra_approved);
         let db = Database::open_in_memory().unwrap();
         let storage = StorageEngine::new(&config.data_dir);
-        let credentials = Arc::new(CredentialStore::with_paths(
-            dir.join(".credentials_store.json"),
-            dir.join(".credentials_key"),
-        ));
+        let credentials = Arc::new(
+            CredentialStore::with_paths(dir.join(".credentials_store.json"), dir.join(".credentials_key"))
+                .with_keyring(Arc::new(mailbackup_core::keyring::NoKeyring)),
+        );
         let scheduler = BackupScheduler::new(
             Arc::new(config.clone()),
             db.clone(),
@@ -2229,7 +2260,8 @@ mod tests {
     async fn connection_changes_require_the_password() {
         let dir = tempfile::tempdir().unwrap();
         let router = test_router(dir.path()).await;
-        let creds = CredentialStore::with_paths(dir.path().join(".credentials_store.json"), dir.path().join(".credentials_key"));
+        let creds = CredentialStore::with_paths(dir.path().join(".credentials_store.json"), dir.path().join(".credentials_key"))
+            .with_keyring(Arc::new(mailbackup_core::keyring::NoKeyring));
         // Unique address so a real OS keyring on a developer machine isn't touched by a fixed key
         let email = format!("reauth-{}@example.com", getrandom_suffix());
         let id = StorageEngine::sanitize_slug(&email);

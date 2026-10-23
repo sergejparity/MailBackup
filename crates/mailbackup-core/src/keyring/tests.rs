@@ -258,7 +258,7 @@ fn a_damaged_or_missing_key_file_is_never_replaced() {
 fn a_locked_keyring_holding_the_key_blocks_instead_of_starting_over() {
     let fx = Fixture::new();
     let keyring = Arc::new(MemoryKeyring::default());
-    fx.store_with(keyring.clone()).set_password("acc", "pw").unwrap();
+    fx.store_with(keyring.clone()).with_disk_storage(true).set_password("acc", "pw").unwrap();
     // The key lives only in the keyring now, and the keyring gets locked
     std::fs::remove_file(fx.key_path()).unwrap();
     let before = fx.raw();
@@ -531,13 +531,13 @@ fn concurrent_key_creation_has_one_winner() {
 }
 
 #[test]
-fn keyring_copy_and_restart_with_a_shared_keyring() {
+fn keyring_primary_storage_survives_a_restart() {
     let fx = Fixture::new();
     let keyring = Arc::new(MemoryKeyring::default());
     let store = fx.store_with(keyring.clone());
     store.set_password("acc", "pw").unwrap();
     assert_eq!(keyring.get("account:acc").unwrap(), "pw");
-    assert!(keyring.get(MASTER_KEY_ENTRY).is_ok());
+    assert!(!fx.store_path().exists(), "nothing on disk while the keyring works");
 
     // "Restart": a new store object over the same keyring and files
     let restarted = fx.store_with(keyring.clone());
@@ -586,4 +586,366 @@ fn saving_an_unchanged_password_still_applies_a_new_passphrase() {
     let before = fx.raw();
     protected.set_password("acc", "pw").unwrap();
     assert_eq!(fx.raw(), before);
+}
+
+// ---------------------------------------------------------------------------
+// Keyring-primary storage and service transitions
+// ---------------------------------------------------------------------------
+
+/// A persistent fake keyring shared by every store built with it, whose state
+/// can be switched: working, unavailable, locked, read-only (sets fail) or
+/// returning wrong values.
+#[derive(Default)]
+struct FakeKeyring {
+    entries: Mutex<HashMap<String, String>>,
+    fail: Mutex<Option<Kind>>,
+    sets_fail: std::sync::atomic::AtomicBool,
+    wrong_reads: std::sync::atomic::AtomicBool,
+}
+
+impl FakeKeyring {
+    fn with(entries: &[(&str, &str)]) -> Arc<Self> {
+        let fake = Self::default();
+        for (k, v) in entries {
+            fake.entries.lock().unwrap().insert(k.to_string(), v.to_string());
+        }
+        Arc::new(fake)
+    }
+    fn set_state(&self, fail: Option<Kind>) {
+        *self.fail.lock().unwrap() = fail;
+    }
+    fn raw(&self, key: &str) -> Option<String> {
+        self.entries.lock().unwrap().get(key).cloned()
+    }
+    fn check(&self) -> Result<()> {
+        match *self.fail.lock().unwrap() {
+            Some(kind) => Err(Error::credential(kind, format!("fake keyring is {:?}", kind))),
+            None => Ok(()),
+        }
+    }
+}
+
+impl SecretBackend for FakeKeyring {
+    fn get(&self, key: &str) -> Result<String> {
+        self.check()?;
+        let value = self.raw(key).ok_or_else(|| not_found(key))?;
+        if self.wrong_reads.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(format!("{}-garbled", value));
+        }
+        Ok(value)
+    }
+    fn set(&self, key: &str, secret: &str) -> Result<()> {
+        self.check()?;
+        if self.sets_fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::credential(Kind::Unavailable, "fake keyring refuses writes"));
+        }
+        self.entries.lock().unwrap().insert(key.to_string(), secret.to_string());
+        Ok(())
+    }
+    fn delete(&self, key: &str) -> Result<()> {
+        self.check()?;
+        self.entries.lock().unwrap().remove(key).map(|_| ()).ok_or_else(|| not_found(key))
+    }
+}
+
+impl Fixture {
+    /// The local entries as the background service would read them.
+    fn local(&self) -> BTreeMap<String, String> {
+        let reader = CredentialStore::with_paths(self.store_path(), self.key_path())
+            .with_passphrase(None)
+            .with_keyring(Arc::new(NoKeyring));
+        let _lock = reader.lock().unwrap();
+        reader.load().unwrap().map(|l| l.entries).unwrap_or_default()
+    }
+    fn service_reader(&self) -> CredentialStore {
+        self.store_with(Arc::new(NoKeyring)).with_disk_storage(true)
+    }
+}
+
+#[test]
+fn local_secrets_move_into_a_working_keyring_on_first_use() {
+    let fx = Fixture::new();
+    // Saved while there was no keyring (or by an older version)
+    fx.store().set_password("acc", "pw").unwrap();
+    assert_eq!(fx.local().get("account:acc").map(String::as_str), Some("pw"));
+
+    let keyring = FakeKeyring::with(&[]);
+    assert_eq!(fx.store_with(keyring.clone()).get_password("acc").unwrap(), "pw");
+    assert_eq!(keyring.raw("account:acc").as_deref(), Some("pw"));
+    assert!(!fx.local().contains_key("account:acc"), "removed locally after the verified move");
+    // A restarted process finds it in the keyring
+    assert_eq!(fx.store_with(keyring).get_password("acc").unwrap(), "pw");
+}
+
+#[test]
+fn a_move_that_does_not_read_back_keeps_the_local_copy() {
+    let fx = Fixture::new();
+    fx.store().set_password("acc", "pw").unwrap();
+    let keyring = FakeKeyring::with(&[]);
+    keyring.wrong_reads.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(fx.store_with(keyring).get_password("acc").unwrap(), "pw");
+    assert_eq!(fx.local().get("account:acc").map(String::as_str), Some("pw"));
+}
+
+#[test]
+fn unavailable_keyring_falls_back_to_the_local_store() {
+    let fx = Fixture::new();
+    let keyring = FakeKeyring::with(&[]);
+    keyring.set_state(Some(Kind::Unavailable));
+    let store = fx.store_with(keyring.clone());
+    store.set_password("acc", "pw").unwrap();
+    assert_eq!(fx.local().get("account:acc").map(String::as_str), Some("pw"));
+    assert_eq!(store.get_password("acc").unwrap(), "pw");
+
+    // Once a keyring shows up, a save goes there and drops the local copy
+    keyring.set_state(None);
+    store.set_password("acc", "pw2").unwrap();
+    assert_eq!(keyring.raw("account:acc").as_deref(), Some("pw2"));
+    assert!(!fx.local().contains_key("account:acc"));
+}
+
+#[test]
+fn locked_keyring_is_never_bypassed_by_writing_to_disk() {
+    let fx = Fixture::new();
+    let keyring = FakeKeyring::with(&[("account:acc", "pw")]);
+    keyring.set_state(Some(Kind::Locked));
+    let store = fx.store_with(keyring.clone());
+    assert_eq!(kind(store.set_password("acc", "new")), Kind::Locked);
+    assert!(!fx.store_path().exists(), "nothing written to disk");
+    assert_eq!(kind(store.get_password("acc")), Kind::Locked, "locked, not 'not found'");
+    assert_eq!(kind(store.delete_password("acc")), Kind::Locked);
+
+    keyring.set_state(None);
+    assert_eq!(store.get_password("acc").unwrap(), "pw");
+}
+
+#[test]
+fn disk_storage_reads_and_writes_the_local_store_first() {
+    let fx = Fixture::new();
+    let keyring = FakeKeyring::with(&[("account:acc", "old")]);
+    let store = fx.store_with(keyring.clone()).with_disk_storage(true);
+    store.set_password("acc", "new").unwrap();
+    assert_eq!(keyring.raw("account:acc").as_deref(), Some("old"), "keyring untouched");
+    assert_eq!(store.get_password("acc").unwrap(), "new", "the disk copy wins");
+    // Not on disk yet: the keyring still answers
+    keyring.entries.lock().unwrap().insert("account:other".into(), "k".into());
+    assert_eq!(store.get_password("other").unwrap(), "k");
+}
+
+fn ids(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn enabling_the_service_copies_and_verifies_before_installing() {
+    let fx = Fixture::new();
+    let keyring = FakeKeyring::with(&[
+        ("account:a", "pw-a"),
+        ("account:a:binding", "bind-a"),
+        ("account:b", "pw-b"),
+    ]);
+    let store = fx.store_with(keyring.clone());
+    let mut installed = false;
+    let change = store
+        .switch_to_disk_storage(&ids(&["a", "b", "c"]), || {
+            // Everything is on disk before the service exists
+            let local = fx.local();
+            assert_eq!(local.get("account:a").map(String::as_str), Some("pw-a"));
+            assert_eq!(local.get("account:b").map(String::as_str), Some("pw-b"));
+            installed = true;
+            Ok(())
+        })
+        .unwrap();
+    assert!(installed);
+    assert!(store.disk_storage());
+    assert_eq!(change.skipped_accounts, ids(&["c"]));
+    assert_eq!(fx.local().get("account:a:binding").map(String::as_str), Some("bind-a"));
+
+    // The service process: no keyring, files only, after a "reboot"
+    let service = fx.service_reader();
+    assert_eq!(service.get_password("a").unwrap(), "pw-a");
+    assert_eq!(service.get_password("b").unwrap(), "pw-b");
+}
+
+#[test]
+fn a_failed_install_rolls_back_without_losing_the_only_copy() {
+    let fx = Fixture::new();
+    // "local" exists only on disk; the keyring can't take it
+    fx.store().set_password("local", "pw-local").unwrap();
+    let keyring = FakeKeyring::with(&[("account:a", "pw-a")]);
+    keyring.sets_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let store = fx.store_with(keyring.clone());
+
+    let err = store
+        .switch_to_disk_storage(&ids(&["a", "local"]), || Err(Error::Other("pkexec dismissed".into())))
+        .unwrap_err();
+    assert_eq!(err.to_string(), "Generic error: pkexec dismissed");
+    assert!(!store.disk_storage());
+    let local = fx.local();
+    assert!(!local.contains_key("account:a"), "copy of a keyring secret removed");
+    assert_eq!(local.get("account:local").map(String::as_str), Some("pw-local"), "only copy kept");
+    assert_eq!(keyring.raw("account:a").as_deref(), Some("pw-a"));
+}
+
+#[test]
+fn enabling_the_service_is_refused_without_changes_when_secrets_cannot_be_read() {
+    let fx = Fixture::new();
+    let keyring = FakeKeyring::with(&[("account:a", "pw-a")]);
+    keyring.set_state(Some(Kind::Locked));
+    let mut called = false;
+    let err = fx.store_with(keyring).switch_to_disk_storage(&ids(&["a"]), || {
+        called = true;
+        Ok(())
+    });
+    assert_eq!(kind(err), Kind::Locked);
+    assert!(!called && !fx.store_path().exists());
+
+    // A passphrase store can't be opened by the service
+    let mut called = false;
+    let err = fx.store_with_passphrase("pw").switch_to_disk_storage(&ids(&["a"]), || {
+        called = true;
+        Ok(())
+    });
+    assert_eq!(kind(err), Kind::NoKey);
+    assert!(!called);
+}
+
+#[test]
+fn disabling_the_service_moves_verified_secrets_back_into_the_keyring() {
+    let fx = Fixture::new();
+    let keyring = FakeKeyring::with(&[("account:a", "pw-a"), ("account:a:binding", "bind-a")]);
+    let store = fx.store_with(keyring.clone());
+    store.switch_to_disk_storage(&ids(&["a"]), || Ok(())).unwrap();
+    // Changed while the service ran: only on disk
+    store.set_password("a", "pw-a2").unwrap();
+    keyring.entries.lock().unwrap().clear();
+
+    let mut uninstalled = false;
+    let moved = store
+        .switch_to_keyring_storage(
+            || {
+                uninstalled = true;
+                Ok(())
+            },
+            || false,
+        )
+        .unwrap();
+    assert!(uninstalled && !store.disk_storage());
+    assert_eq!(moved.moved, ids(&["account:a", "account:a:binding"]));
+    assert!(moved.kept.is_empty());
+    assert_eq!(keyring.raw("account:a").as_deref(), Some("pw-a2"));
+    assert!(fx.local().is_empty());
+    assert_eq!(fx.store_with(keyring).get_password("a").unwrap(), "pw-a2");
+}
+
+#[test]
+fn disabling_keeps_disk_secrets_the_keyring_cannot_take() {
+    for state in [Some(Kind::Unavailable), Some(Kind::Locked), None] {
+        let fx = Fixture::new();
+        fx.store().with_disk_storage(true).set_password("a", "pw-a").unwrap();
+        let keyring = FakeKeyring::with(&[]);
+        keyring.set_state(state);
+        // With a working keyring, make the read-back disagree
+        keyring.wrong_reads.store(state.is_none(), std::sync::atomic::Ordering::SeqCst);
+        let store = fx.store_with(keyring).with_disk_storage(true);
+        let moved = store.switch_to_keyring_storage(|| Ok(()), || false).unwrap();
+        assert!(moved.moved.is_empty(), "{:?}", state);
+        assert_eq!(moved.kept, ids(&["account:a"]));
+        assert_eq!(moved.reason.is_some(), state.is_some());
+        assert_eq!(fx.local().get("account:a").map(String::as_str), Some("pw-a"));
+        // Still readable afterwards
+        assert_eq!(fx.service_reader().get_password("a").unwrap(), "pw-a");
+    }
+}
+
+#[test]
+fn disabling_stops_while_the_service_is_still_installed() {
+    let fx = Fixture::new();
+    let keyring = FakeKeyring::with(&[("account:a", "pw-a")]);
+    let store = fx.store_with(keyring.clone());
+    store.switch_to_disk_storage(&ids(&["a"]), || Ok(())).unwrap();
+    keyring.entries.lock().unwrap().clear();
+
+    let err = store.switch_to_keyring_storage(|| Ok(()), || true).unwrap_err();
+    assert!(err.to_string().contains("still installed"));
+    assert!(store.disk_storage());
+    assert_eq!(fx.local().get("account:a").map(String::as_str), Some("pw-a"));
+    assert!(keyring.raw("account:a").is_none());
+
+    let err = store.switch_to_keyring_storage(|| Err(Error::Other("denied".into())), || false).unwrap_err();
+    assert!(err.to_string().contains("denied"));
+    assert!(store.disk_storage());
+}
+
+#[test]
+fn legacy_location_is_read_migrated_and_cleaned_on_delete() {
+    let fx = Fixture::new();
+    let legacy_dir = fx.dir.path().join("home/.mailbackup");
+    let legacy = CredentialStore::with_paths(legacy_dir.join(".credentials_store.json"), legacy_dir.join(".credentials_key"))
+        .with_passphrase(None)
+        .with_keyring(Arc::new(NoKeyring));
+    legacy.set_password("custom", "pw-custom").unwrap();
+    legacy.set_password("default", "pw-default").unwrap();
+
+    let store = fx
+        .store()
+        .with_legacy_store(legacy_dir.join(".credentials_store.json"), legacy_dir.join(".credentials_key"));
+    assert_eq!(store.get_password("custom").unwrap(), "pw-custom");
+    assert_eq!(fx.local().get("account:custom").map(String::as_str), Some("pw-custom"), "copied to the config's store");
+    assert_eq!(legacy.get_password("custom").unwrap(), "pw-custom", "the old copy is preserved");
+
+    store.delete_password("custom").unwrap();
+    assert_eq!(kind(store.get_password("custom")), Kind::NotFound, "doesn't come back from the legacy store");
+    assert_eq!(legacy.get_password("default").unwrap(), "pw-default", "other entries untouched");
+
+    // The default config's own password for an id this config also uses (a
+    // different value) survives a delete here
+    legacy.set_password("shared", "default-config-pw").unwrap();
+    store.set_password("shared", "custom-config-pw").unwrap();
+    store.delete_password("shared").unwrap();
+    assert_eq!(legacy.get_password("shared").unwrap(), "default-config-pw");
+}
+
+#[test]
+fn every_process_resolves_a_config_to_the_same_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("custom/config.yaml");
+    let (store, key) = CredentialStore::paths_for_config(&config);
+    let real = std::fs::canonicalize(tmp.path()).unwrap();
+    assert_eq!(store, real.join("custom/.credentials_store.json"), "not created yet: resolved like it will be");
+    assert_eq!(key, real.join("custom/.credentials_key"));
+    std::fs::create_dir_all(tmp.path().join("custom")).unwrap();
+    assert_eq!(CredentialStore::paths_for_config(&config).0, store);
+    #[cfg(unix)]
+    {
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(tmp.path().join("custom"), &link).unwrap();
+        assert_eq!(CredentialStore::paths_for_config(&link.join("config.yaml")).0, store, "a symlinked folder");
+    }
+
+    // A relative --config from the config's folder resolves identically
+    let cwd = std::env::current_dir().unwrap();
+    let relative = pathdiff(&config, &cwd);
+    assert_eq!(CredentialStore::paths_for_config(&relative).0, store);
+
+    let settings = crate::config::GlobalSettings { run_as_service: true, ..Default::default() };
+    let resolved = CredentialStore::for_config(&config, &settings);
+    assert_eq!(resolved.store_paths().0, store.as_path());
+    assert!(resolved.disk_storage(), "follows run_as_service");
+    assert!(!CredentialStore::for_config(&config, &Default::default()).disk_storage());
+}
+
+/// `path` relative to `base` (both absolute), via `..` components.
+fn pathdiff(path: &Path, base: &Path) -> PathBuf {
+    let path: Vec<_> = path.components().collect();
+    let base: Vec<_> = base.components().collect();
+    let common = path.iter().zip(&base).take_while(|(a, b)| a == b).count();
+    let mut out = PathBuf::new();
+    for _ in common..base.len() {
+        out.push("..");
+    }
+    for c in &path[common..] {
+        out.push(c.as_os_str());
+    }
+    out
 }
