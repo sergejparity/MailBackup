@@ -210,7 +210,8 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 #[test]
 fn startup_tightening_changes_only_mailbackups_own_paths() {
     let install = loose_install(false);
-    let candidates = private_fs::startup_candidates_in(&install.config_path, &install.base);
+    let mut candidates = private_fs::sensitive_targets_in(&install.config_path, &install.base);
+    candidates.extend(private_fs::archive_targets(&install.config_path));
     assert!(private_fs::tighten(&candidates) > 0);
 
     for file in [
@@ -239,7 +240,8 @@ fn startup_tightening_changes_only_mailbackups_own_paths() {
 #[test]
 fn startup_tightening_leaves_a_shared_data_folder_and_foreign_files_alone() {
     let install = loose_install(true);
-    let candidates = private_fs::startup_candidates_in(&install.config_path, &install.base);
+    let mut candidates = private_fs::sensitive_targets_in(&install.config_path, &install.base);
+    candidates.extend(private_fs::archive_targets(&install.config_path));
     private_fs::tighten(&candidates);
 
     assert_eq!(mode(&install.data_dir), 0o755, "data folder holding other files");
@@ -258,9 +260,121 @@ fn startup_tightening_never_follows_symlinks() {
     std::fs::remove_file(install.config_dir.join(".credentials_key")).unwrap();
     std::os::unix::fs::symlink(&outside, install.config_dir.join(".credentials_key")).unwrap();
 
-    let candidates = private_fs::startup_candidates_in(&install.config_path, &install.base);
+    let mut candidates = private_fs::sensitive_targets_in(&install.config_path, &install.base);
+    candidates.extend(private_fs::archive_targets(&install.config_path));
     private_fs::tighten(&candidates);
     assert_eq!(mode(&outside), 0o644);
+}
+
+#[test]
+fn sensitive_targets_do_not_walk_the_archive() {
+    let install = loose_install(false);
+    let sensitive = private_fs::sensitive_targets_in(&install.config_path, &install.base);
+    assert!(sensitive.iter().all(|t| !t.path().starts_with(&install.data_dir)));
+    assert!(sensitive.len() < 30, "a short fixed list: {}", sensitive.len());
+    private_fs::tighten(&sensitive);
+    assert_eq!(mode(&install.config_dir.join(".credentials_store.json")), 0o600);
+    assert_eq!(mode(&install.eml), 0o644, "the archive is left to the background pass");
+}
+
+/// Swaps `path` between a regular file and a symlink to `victim` until stopped.
+fn swap_with_symlink(path: PathBuf, victim: PathBuf, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let staged_file = path.with_extension("file");
+        let staged_link = path.with_extension("link");
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            std::fs::write(&staged_file, b"x").unwrap();
+            set_mode(&staged_file, 0o644);
+            let _ = std::fs::rename(&staged_file, &path);
+            let _ = std::fs::remove_file(&staged_link);
+            std::os::unix::fs::symlink(&victim, &staged_link).unwrap();
+            let _ = std::fs::rename(&staged_link, &path);
+        }
+    })
+}
+
+#[test]
+fn restrict_never_follows_a_symlink_swapped_in_concurrently() {
+    let tmp = shared_parent();
+    let victim = tmp.path().join("unrelated.txt");
+    std::fs::write(&victim, b"keep my mode").unwrap();
+    set_mode(&victim, 0o644);
+    let target = tmp.path().join("candidate");
+    std::fs::write(&target, b"x").unwrap();
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let swapper = swap_with_symlink(target.clone(), victim.clone(), stop.clone());
+    let mut changed = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline && mode(&victim) == 0o644 {
+        if private_fs::restrict(&target).unwrap_or(false) {
+            changed += 1;
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapper.join().unwrap();
+    assert_eq!(mode(&victim), 0o644, "the symlink target was changed");
+    assert!(changed > 0, "the race never hit the regular file");
+}
+
+#[test]
+fn restrict_beneath_never_follows_a_folder_swapped_for_a_symlink() {
+    let tmp = shared_parent();
+    let anchor = tmp.path().join("anchor");
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&anchor).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let victim = elsewhere.join("file");
+    std::fs::write(&victim, b"keep my mode").unwrap();
+    set_mode(&victim, 0o644);
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let swapper = {
+        let (anchor, elsewhere, stop) = (anchor.clone(), elsewhere.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let sub = anchor.join("sub");
+            let staged_dir = anchor.join("sub.dir");
+            let staged_link = anchor.join("sub.link");
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::fs::remove_file(&sub);
+                let _ = std::fs::remove_dir_all(&sub);
+                std::fs::create_dir_all(&staged_dir).unwrap();
+                std::fs::write(staged_dir.join("file"), b"x").unwrap();
+                set_mode(&staged_dir.join("file"), 0o644);
+                let _ = std::fs::rename(&staged_dir, &sub);
+                let _ = std::fs::remove_file(&staged_link);
+                std::os::unix::fs::symlink(&elsewhere, &staged_link).unwrap();
+                let _ = std::fs::remove_dir_all(&sub);
+                let _ = std::fs::rename(&staged_link, &sub);
+            }
+        })
+    };
+    let mut changed = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline && mode(&victim) == 0o644 {
+        if private_fs::restrict_beneath(&anchor, Path::new("sub/file")).unwrap_or(false) {
+            changed += 1;
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapper.join().unwrap();
+    assert_eq!(mode(&victim), 0o644, "a file outside the anchor was changed");
+    assert!(changed > 0, "the race never hit the real folder");
+}
+
+#[test]
+fn restrict_skips_fifos_without_blocking() {
+    let tmp = shared_parent();
+    let fifo = tmp.path().join("fifo");
+    let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+    // SAFETY: valid NUL-terminated path
+    assert_eq!(unsafe { libc_mkfifo(c.as_ptr(), 0o644) }, 0);
+    assert!(!private_fs::restrict(&fifo).unwrap());
+}
+
+extern "C" {
+    #[link_name = "mkfifo"]
+    fn libc_mkfifo(path: *const std::os::raw::c_char, mode: u32) -> i32;
 }
 
 #[test]

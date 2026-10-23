@@ -126,7 +126,7 @@ pub struct GlobalSettings {
     #[serde(default = "default_log_retention_days")]
     pub log_retention_days: Option<u32>,
     /// At startup, remove other users' access from MailBackup's existing files
-    /// (see `private_fs::startup_candidates`). Turn off only for an archive
+    /// (see `private_fs::tighten_at_startup`). Turn off only for an archive
     /// deliberately shared with a group. New files are always owner-only.
     #[serde(default = "default_true")]
     pub tighten_permissions: bool,

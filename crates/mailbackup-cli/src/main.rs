@@ -156,7 +156,9 @@ async fn main() -> Result<()> {
 
     let mut config = AppConfig::load_or_create(cli.config.as_deref())?;
     let config_path = cli.config.clone().unwrap_or_else(mailbackup_core::config::default_config_path);
-    mailbackup_core::private_fs::tighten_existing_in_background(&config_path, &config.settings);
+    // Sensitive files synchronously; the archive walk only for the long-running daemon
+    let long_running = matches!(cli.command, Commands::Daemon);
+    mailbackup_core::private_fs::tighten_at_startup(&config_path, &config.settings, long_running);
     let db = Database::open(&config.db_path)?;
     let storage = StorageEngine::new(&config.data_dir);
     let credentials = Arc::new(CredentialStore::new());

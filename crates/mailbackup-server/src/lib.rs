@@ -230,7 +230,7 @@ pub async fn start_server_with_options(
 ) -> Result<()> {
     let config_path = config_path_override.unwrap_or_else(mailbackup_core::config::default_config_path);
     let config = AppConfig::load_or_create(Some(&config_path))?;
-    mailbackup_core::private_fs::tighten_existing_in_background(&config_path, &config.settings);
+    mailbackup_core::private_fs::tighten_at_startup(&config_path, &config.settings, true);
     let db = Database::open(&config.db_path)?;
     let storage = StorageEngine::new(&config.data_dir);
     let credentials = if let Some(parent) = config_path.parent() {
