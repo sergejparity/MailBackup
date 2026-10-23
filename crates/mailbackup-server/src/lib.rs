@@ -58,7 +58,12 @@ pub struct AppState {
     /// Per-process secret that every `/api/*` request must present, either in the
     /// `X-MailBackup-Token` header or (for plain downloads) the `token` query parameter.
     pub api_token: Arc<str>,
+    /// Handshake secret proving to the desktop GUI that this is a genuine
+    /// server (see `runtime`). Never sent to clients.
+    pub identity: Arc<runtime::ServerIdentity>,
 }
+
+pub mod runtime;
 
 pub const API_TOKEN_HEADER: &str = "x-mailbackup-token";
 
@@ -124,6 +129,7 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(serve_index))
         .route("/api/stats", get(api_stats))
+        .route("/api/handshake", get(api_handshake))
         .route("/api/accounts", get(api_get_accounts).post(api_add_account))
         .route("/api/accounts/import-csv", post(api_import_accounts_csv))
         .route("/api/accounts/csv-template", get(api_accounts_csv_template))
@@ -196,7 +202,9 @@ async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> R
         }
     }
 
-    if req.uri().path().starts_with("/api/") {
+    // The handshake proves the server's identity to a client that has no
+    // credentials yet (see `runtime`); Host/Origin checks above still apply
+    if req.uri().path().starts_with("/api/") && req.uri().path() != "/api/handshake" {
         let presented = request_token(headers, req.uri().query());
         let valid = presented
             .map(|t| constant_time_eq(t.as_bytes(), state.api_token.as_bytes()))
@@ -264,6 +272,36 @@ pub async fn start_server_with_options(
     port_override: Option<u16>,
     config_path_override: Option<PathBuf>,
 ) -> Result<()> {
+    run_server(port_override, config_path_override, None).await
+}
+
+/// Runs the server. Once it listens and has published its runtime file
+/// (see [`runtime`]), the bound port is sent on `ready` (port `0` binds a
+/// free one); a bind failure is sent there too.
+pub async fn run_server(
+    port_override: Option<u16>,
+    config_path_override: Option<PathBuf>,
+    ready: Option<std::sync::mpsc::Sender<std::result::Result<u16, String>>>,
+) -> Result<()> {
+    let report = |result: std::result::Result<u16, String>| {
+        if let Some(ready) = &ready {
+            let _ = ready.send(result);
+        }
+    };
+    match serve(port_override, config_path_override, &report).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            report(Err(e.to_string()));
+            Err(e)
+        }
+    }
+}
+
+async fn serve(
+    port_override: Option<u16>,
+    config_path_override: Option<PathBuf>,
+    report: &dyn Fn(std::result::Result<u16, String>),
+) -> Result<()> {
     let config_path = config_path_override.unwrap_or_else(mailbackup_core::config::default_config_path);
     let config = AppConfig::load_or_create(Some(&config_path))?;
     mailbackup_core::private_fs::tighten_at_startup(&config_path, &config.settings, true);
@@ -273,6 +311,13 @@ pub async fn start_server_with_options(
     let credentials = Arc::new(CredentialStore::for_config(&config_path, &config.settings));
     let port = port_override.unwrap_or(config.settings.web_port);
     let bind_ip = resolve_bind_ip(&config.settings.bind_address);
+    // Bind before anything else starts, so a taken port fails fast and
+    // nothing is published for it
+    let addr = SocketAddr::new(bind_ip, port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let port = listener.local_addr()?.port();
+    let addr = SocketAddr::new(bind_ip, port);
+    let identity = Arc::new(runtime::ServerIdentity::new(port));
 
     let config_arc = Arc::new(RwLock::new(config.clone()));
     let active_syncs = Arc::new(StdRwLock::new(HashMap::new()));
@@ -382,10 +427,11 @@ pub async fn start_server_with_options(
         scheduler: scheduler_arc,
         active_syncs,
         api_token: Arc::from(generate_api_token()),
+        identity: identity.clone(),
     };
 
+    let config_dir = state.config_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
     let app = create_router(state);
-    let addr = SocketAddr::new(bind_ip, port);
     if !bind_ip.is_loopback() {
         tracing::warn!(
             "Web UI / REST API is exposed on {} (bind_address). It is reachable from other machines on the network.",
@@ -394,9 +440,60 @@ pub async fn start_server_with_options(
     }
     info!("🚀 MailBackup Studio running on http://127.0.0.1:{} (listening on {})", port, addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // Published only now that the port is ours; removed again on shutdown
+    let published = match runtime::PublishedRuntime::publish(&config_dir, &identity) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!("Couldn't publish the server runtime file in {}: {}", config_dir.display(), e);
+            None
+        }
+    };
+    report(Ok(port));
+    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    drop(published);
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM on unix (what systemd and launchd send).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+#[derive(Deserialize)]
+struct HandshakeQuery {
+    nonce: String,
+}
+
+/// Proves to the desktop GUI that this server holds the handshake secret
+/// from its runtime file (see `runtime`). Needs no API token: the GUI must not
+/// disclose anything to a server it hasn't verified yet.
+async fn api_handshake(State(state): State<AppState>, Query(query): Query<HandshakeQuery>) -> impl IntoResponse {
+    match state.identity.proof(&query.nonce) {
+        Some(proof) => Json(serde_json::json!({
+            "proof": proof,
+            "port": state.identity.port,
+            "version": env!("CARGO_PKG_VERSION"),
+        }))
+        .into_response(),
+        None => (StatusCode::BAD_REQUEST, "Invalid nonce").into_response(),
+    }
 }
 
 // Static Assets Handler
@@ -2095,6 +2192,7 @@ mod tests {
             scheduler: Arc::new(Mutex::new(scheduler)),
             active_syncs: Arc::new(StdRwLock::new(HashMap::new())),
             api_token: Arc::from(TOKEN),
+            identity: Arc::new(runtime::ServerIdentity::new(8765)),
         }
     }
 

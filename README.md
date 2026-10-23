@@ -85,6 +85,13 @@ Open your browser at `http://127.0.0.1:8765` to access the full offline email br
 
 **API access:** the server listens on `127.0.0.1` only. Every `/api/*` request must carry a random per-process token, which the server embeds in the page it serves, so other websites and DNS-rebinding attacks can't call the API. The token changes whenever the server restarts, so reload open browser tabs after a restart.
 
+**Desktop app and the server it shows:** the desktop app only displays a MailBackup server that proves it was started by your account.
+- **The runtime file:** every server writes a private runtime file next to its `config.yaml`, `.server-<port>.json`. It is owner-only, and on Windows it inherits the permissions of your user profile.
+- **The check:** the file holds a random secret that is never sent over the network. The app sends a fresh challenge to `/api/handshake` and checks the server's HMAC answer.
+- **When the check fails:** if another program holds the port and can't answer, the app starts its own server on a free port. It never shows the other program's page.
+- **What this does and doesn't cover:** it stops another user's program from posing as MailBackup. A program running under your own account can read the runtime file.
+- **Fonts:** the UI's fonts are bundled, so it makes no requests to font services.
+
 Network settings in `config.yaml`:
 
 ```yaml

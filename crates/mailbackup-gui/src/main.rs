@@ -1,45 +1,53 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::net::TcpStream;
 use std::time::Duration;
 use tauri::{CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem};
 
-fn is_server_running(port: u16) -> bool {
-    TcpStream::connect_timeout(
-        &format!("127.0.0.1:{}", port).parse().unwrap(),
-        Duration::from_millis(200),
-    )
-    .is_ok()
+/// The port of a server the window may show: a running MailBackup server of
+/// this user that proves itself (see `mailbackup_server::runtime`), else one
+/// started here. A process holding the port that can't prove itself is never
+/// shown; the embedded server then runs on a free port instead.
+fn genuine_server(port: u16) -> Result<u16, String> {
+    let config_path = mailbackup_core::config::default_config_path();
+    let config_dir = config_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+    if mailbackup_server::runtime::verify_genuine(&config_dir, port).is_some() {
+        println!("Using the MailBackup server already running on port {}", port);
+        return Ok(port);
+    }
+    let bound = match start_embedded_server(port) {
+        Ok(bound) => bound,
+        Err(e) => {
+            eprintln!(
+                "Port {} is in use by a process that isn't a verified MailBackup server ({}). Starting on a free port instead.",
+                port, e
+            );
+            start_embedded_server(0)?
+        }
+    };
+    mailbackup_server::runtime::verify_genuine(&config_dir, bound)
+        .map(|_| bound)
+        .ok_or_else(|| format!("The server on port {} couldn't be verified", bound))
 }
 
-fn start_background_server(port: u16) {
-    if is_server_running(port) {
-        println!("MailBackup Studio server already running on port {}", port);
-        return;
-    }
-
+/// Starts the server on its own thread; returns the port it bound (`0` binds
+/// a free one) or why it couldn't start.
+fn start_embedded_server(port: u16) -> Result<u16, String> {
     println!("Starting embedded background server on port {}...", port);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime for background server");
-
         rt.block_on(async move {
-            if let Err(e) = mailbackup_server::start_server(Some(port)).await {
+            if let Err(e) = mailbackup_server::run_server(Some(port), None, Some(ready_tx)).await {
                 eprintln!("Background server error: {}", e);
             }
         });
     });
-
-    // Wait until port is ready (up to 4 seconds)
-    for _ in 0..40 {
-        std::thread::sleep(Duration::from_millis(100));
-        if is_server_running(port) {
-            println!("Background server is ready!");
-            break;
-        }
-    }
+    ready_rx
+        .recv_timeout(Duration::from_secs(30))
+        .map_err(|_| "the server didn't start in time".to_string())?
 }
 
 fn show_main_window<R: tauri::Runtime>(manager: &impl Manager<R>) {
@@ -134,7 +142,10 @@ fn main() {
     }
 
     let port_num = port.unwrap_or(8765);
-    start_background_server(port_num);
+    let server = genuine_server(port_num);
+    if let Err(e) = &server {
+        eprintln!("Not showing the MailBackup UI: {}", e);
+    }
 
     // Sync OS autostart registration if configured
     if let Ok(cfg) = mailbackup_core::config::AppConfig::load_or_create(None) {
@@ -155,6 +166,21 @@ fn main() {
     let system_tray = SystemTray::new().with_menu(tray_menu);
 
     tauri::Builder::default()
+        .setup(move |app| {
+            // The window is created here, only for the verified server
+            let builder = match server {
+                Ok(port) => {
+                    let origin = format!("http://127.0.0.1:{}", port);
+                    let url = format!("{}/", origin).parse().expect("valid URL");
+                    tauri::WindowBuilder::new(app, "main", tauri::WindowUrl::External(url))
+                        // Never leave the verified server
+                        .on_navigation(move |url| url.origin().ascii_serialization() == origin)
+                }
+                Err(_) => tauri::WindowBuilder::new(app, "main", tauri::WindowUrl::App("gui-error.html".into())),
+            };
+            builder.title("MailBackup Studio").inner_size(1280.0, 840.0).resizable(true).build()?;
+            Ok(())
+        })
         .system_tray(system_tray)
         .on_system_tray_event(|app, event| match event {
             SystemTrayEvent::LeftClick { .. } => {
