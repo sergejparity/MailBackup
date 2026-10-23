@@ -63,7 +63,7 @@ fn test_config_serialization() {
 fn test_credential_fallback_store() {
     let dir = tempdir().unwrap();
     let cred_file = dir.path().join("secrets.json");
-    let store = CredentialStore::with_fallback_path(cred_file.clone());
+    let store = CredentialStore::with_fallback_path(cred_file.clone()).with_keyring(std::sync::Arc::new(mailbackup_core::keyring::NoKeyring));
 
     store.set_password("acc1", "supersecret123").unwrap();
     let retrieved = store.get_password("acc1").unwrap();
@@ -93,7 +93,7 @@ fn test_legacy_plaintext_credential_migration() {
     let initial_raw = std::fs::read_to_string(&cred_file).unwrap();
     assert!(initial_raw.contains("cleartext_password_999"));
 
-    let store = CredentialStore::with_fallback_path(cred_file.clone());
+    let store = CredentialStore::with_fallback_path(cred_file.clone()).with_keyring(std::sync::Arc::new(mailbackup_core::keyring::NoKeyring));
 
     // Reading legacy password must succeed seamlessly
     let retrieved = store.get_password("legacy_user").unwrap();
@@ -121,7 +121,7 @@ fn test_legacy_undotted_file_migration() {
     });
     std::fs::write(&undotted_file, serde_json::to_string_pretty(&legacy_content).unwrap()).unwrap();
 
-    let store = CredentialStore::with_fallback_path(target_file.clone());
+    let store = CredentialStore::with_fallback_path(target_file.clone()).with_keyring(std::sync::Arc::new(mailbackup_core::keyring::NoKeyring));
 
     // Reading password should migrate from undotted to dotted encrypted file
     let retrieved = store.get_password("user2").unwrap();
@@ -611,7 +611,7 @@ async fn test_scheduler_event_logging_and_listener() {
     let dir = tempdir().unwrap();
     let db = Database::open(&dir.path().join("test.db")).unwrap();
     let storage = StorageEngine::new(&dir.path().join("storage"));
-    let creds = Arc::new(CredentialStore::new());
+    let creds = Arc::new(CredentialStore::new().with_keyring(Arc::new(mailbackup_core::keyring::NoKeyring)));
 
     let mut config = AppConfig::default();
     config.accounts.push(AccountConfig {
@@ -965,7 +965,7 @@ fn binding_test_account(id: &str) -> AccountConfig {
 #[test]
 fn test_password_is_bound_to_connection() {
     let dir = tempdir().unwrap();
-    let store = CredentialStore::with_fallback_path(dir.path().join("secrets.json"));
+    let store = CredentialStore::with_fallback_path(dir.path().join("secrets.json")).with_keyring(std::sync::Arc::new(mailbackup_core::keyring::NoKeyring));
     // Unique id so a real OS keyring on a developer machine can't interfere
     let id = format!("binding-{}", uuid::Uuid::new_v4().simple());
     let acc = binding_test_account(&id);
@@ -1004,7 +1004,7 @@ fn test_password_is_bound_to_connection() {
 #[test]
 fn test_legacy_password_is_bound_on_first_use() {
     let dir = tempdir().unwrap();
-    let store = CredentialStore::with_fallback_path(dir.path().join("secrets.json"));
+    let store = CredentialStore::with_fallback_path(dir.path().join("secrets.json")).with_keyring(std::sync::Arc::new(mailbackup_core::keyring::NoKeyring));
     let id = format!("legacy-{}", uuid::Uuid::new_v4().simple());
     let acc = binding_test_account(&id);
 

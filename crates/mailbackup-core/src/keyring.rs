@@ -94,19 +94,115 @@ fn keyring_error(e: keyring::Error) -> Error {
     }
 }
 
+/// No keyring: every call is `Unavailable`. Used when `MAILBACKUP_KEYRING=none`
+/// (headless machines, tests) and to check what the background service sees.
+pub struct NoKeyring;
+
+impl SecretBackend for NoKeyring {
+    fn get(&self, _: &str) -> Result<String> {
+        Err(Error::credential(Kind::Unavailable, "The OS keyring is turned off"))
+    }
+    fn set(&self, _: &str, _: &str) -> Result<()> {
+        Err(Error::credential(Kind::Unavailable, "The OS keyring is turned off"))
+    }
+    fn delete(&self, _: &str) -> Result<()> {
+        Err(Error::credential(Kind::Unavailable, "The OS keyring is turned off"))
+    }
+}
+
+/// The OS keyring, unless `MAILBACKUP_KEYRING` is `none`, `off` or `disabled`.
+fn default_keyring() -> Arc<dyn SecretBackend> {
+    match std::env::var("MAILBACKUP_KEYRING").map(|v| v.trim().to_ascii_lowercase()) {
+        Ok(v) if matches!(v.as_str(), "none" | "off" | "disabled" | "0" | "false") => Arc::new(NoKeyring),
+        _ => Arc::new(OsKeyring),
+    }
+}
+
+/// What a switch to disk storage added, so a failed service install can undo it.
+#[derive(Debug, Default)]
+pub struct DiskStorageChange {
+    /// Keys written to the local store that weren't there before.
+    pub added: Vec<String>,
+    /// Accounts without a saved password (nothing to copy).
+    pub skipped_accounts: Vec<String>,
+}
+
+/// What a switch back to keyring storage did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct KeyringMove {
+    /// Moved into the keyring (verified) and removed from the local store.
+    pub moved: Vec<String>,
+    /// Left in the local store: the keyring couldn't take or confirm them.
+    pub kept: Vec<String>,
+    /// Why entries were kept, if any.
+    pub reason: Option<String>,
+}
+
+/// Account passwords and their connection bindings.
+///
+/// By default the OS keyring holds them and the local encrypted store is the
+/// fallback for machines without a keyring. With disk storage on (the
+/// background service, which can't open the keyring when it starts at boot),
+/// the local store holds them. See [`CredentialStore::for_config`].
 pub struct CredentialStore {
     fallback_path: PathBuf,
     key_path: PathBuf,
     passphrase: Option<String>,
     keyring: Arc<dyn SecretBackend>,
+    /// Prefix of this store's keyring entries (see [`keyring_key`](Self::keyring_key)).
+    keyring_ns: String,
+    /// Keep secrets in the local store (background service mode).
+    disk_storage: std::sync::atomic::AtomicBool,
+    /// Older locations of this config's store, read (and cleaned on delete)
+    /// but otherwise left alone.
+    legacy_stores: Vec<CredentialStore>,
     /// Last Argon2 result: (fingerprint of passphrase + parameters, key)
     derived: Mutex<Option<([u8; 32], [u8; 32])>>,
 }
 
 impl CredentialStore {
+    /// The store for the default config (`~/.mailbackup`).
     pub fn new() -> Self {
-        let base_dir = crate::config::default_base_dir();
-        Self::with_paths(base_dir.join(".credentials_store.json"), base_dir.join(".credentials_key"))
+        Self::for_config(&crate::config::default_config_path(), &crate::config::GlobalSettings::default())
+    }
+
+    /// The store every process uses for `config_path`: the CLI, the server and
+    /// the background service (the server run with `--config`) all resolve the
+    /// same config to `<config folder>/.credentials_store.json` and
+    /// `.credentials_key`. Disk storage follows `settings.run_as_service`.
+    ///
+    /// Versions before 0.3.0 of the CLI kept credentials for a custom
+    /// `--config` in `~/.mailbackup`, which is also the default config's
+    /// store. It stays readable as a legacy location: secrets found there are
+    /// copied on first use, and a delete removes only a copy with the same
+    /// value. Nothing else in it changes.
+    pub fn for_config(config_path: &Path, settings: &crate::config::GlobalSettings) -> Self {
+        let (store, key) = Self::paths_for_config(config_path);
+        let mut credentials = Self::with_paths(store.clone(), key);
+        let (legacy_store, _) = Self::paths_for_config(&crate::config::default_config_path());
+        if legacy_store != store {
+            let legacy_key = legacy_store.with_file_name(".credentials_key");
+            credentials.legacy_stores.push(Self::with_paths(legacy_store, legacy_key).with_keyring(Arc::new(NoKeyring)));
+        }
+        credentials.set_disk_storage(settings.run_as_service);
+        credentials
+    }
+
+    /// Where [`for_config`](Self::for_config) keeps the store and key for `config_path`.
+    ///
+    /// The config's folder is resolved to its real path (so `./config.yaml`,
+    /// `../x/config.yaml` and a symlinked folder all give the same store), or
+    /// cleaned up lexically if it doesn't exist yet.
+    pub fn paths_for_config(config_path: &Path) -> (PathBuf, PathBuf) {
+        let absolute = std::path::absolute(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+        let dir = absolute.parent().map(Path::to_path_buf).unwrap_or_else(crate::config::default_base_dir);
+        let dir = resolve_existing_prefix(&normalize_lexically(&dir));
+        (dir.join(".credentials_store.json"), dir.join(".credentials_key"))
+    }
+
+    /// The local store and key file this store uses.
+    pub fn store_paths(&self) -> (&Path, &Path) {
+        (&self.fallback_path, &self.key_path)
     }
 
     pub fn with_fallback_path(fallback_path: PathBuf) -> Self {
@@ -118,17 +214,47 @@ impl CredentialStore {
     /// from `MAILBACKUP_MASTER_KEY` / `MAILBACKUP_ENCRYPTION_KEY` if set.
     pub fn with_paths(fallback_path: PathBuf, key_path: PathBuf) -> Self {
         Self {
+            keyring_ns: keyring_namespace(&fallback_path),
             fallback_path,
             key_path,
             passphrase: passphrase_from_env(),
-            keyring: Arc::new(OsKeyring),
+            keyring: default_keyring(),
+            disk_storage: std::sync::atomic::AtomicBool::new(false),
+            legacy_stores: Vec::new(),
             derived: Mutex::new(None),
         }
+    }
+
+    /// Turns disk storage on or off (see [`switch_to_disk_storage`](Self::switch_to_disk_storage)
+    /// for doing it safely around a service install).
+    pub fn with_disk_storage(self, on: bool) -> Self {
+        self.set_disk_storage(on);
+        self
+    }
+
+    pub fn set_disk_storage(&self, on: bool) {
+        self.disk_storage.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn disk_storage(&self) -> bool {
+        self.disk_storage.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Adds an older location to read from (see [`for_config`](Self::for_config)).
+    pub fn with_legacy_store(mut self, fallback_path: PathBuf, key_path: PathBuf) -> Self {
+        let passphrase = self.passphrase.clone();
+        self.legacy_stores.push(
+            Self::with_paths(fallback_path, key_path).with_passphrase(passphrase).with_keyring(Arc::new(NoKeyring)),
+        );
+        self
     }
 
     /// Replaces the passphrase taken from the environment.
     pub fn with_passphrase(mut self, passphrase: Option<String>) -> Self {
         self.passphrase = passphrase.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+        for legacy in &mut self.legacy_stores {
+            legacy.passphrase = self.passphrase.clone();
+        }
         self
     }
 
@@ -184,33 +310,358 @@ impl CredentialStore {
     }
 
     fn set_secret(&self, key: &str, secret: &str) -> Result<()> {
-        self.update_fallback(|entries| {
-            entries.insert(key.to_string(), secret.to_string()) != Some(secret.to_string())
-        })?;
-        // Also keep a copy in the OS keyring when there is one
-        let _ = self.keyring.set(key, secret);
-        Ok(())
+        if self.disk_storage() {
+            return self.set_local(key, secret);
+        }
+        match self.kr_set(key, secret) {
+            Ok(()) => {
+                // The keyring has it now. A local copy would still win on reads
+                // (see `get_secret`), so failing to drop it is an error.
+                self.update_fallback(|entries| entries.remove(key).is_some()).map_err(|e| {
+                    Error::credential(
+                        e.credential_kind().unwrap_or(Kind::Unavailable),
+                        format!("Saved in the keyring, but the older local copy couldn't be removed: {}", e),
+                    )
+                })
+            }
+            // No keyring on this machine: the local store is the fallback
+            Err(e) if e.credential_kind() == Some(Kind::Unavailable) => self.set_local(key, secret),
+            // Locked or refused: never quietly put it on disk instead
+            Err(e) => Err(e),
+        }
     }
 
+    fn set_local(&self, key: &str, secret: &str) -> Result<()> {
+        self.update_fallback(|entries| entries.insert(key.to_string(), secret.to_string()) != Some(secret.to_string()))
+    }
+
+    /// Order of authority:
+    /// 1. A local copy. It only exists while it's newer than (or missing from)
+    ///    the keyring: no keyring, disk storage, a move back into the keyring
+    ///    that hasn't succeeded yet, or an older version's store. Outside disk
+    ///    storage it's moved into the keyring here when the keyring takes it.
+    /// 2. The keyring.
+    /// 3. Legacy locations, unless the keyring is locked (it may hold a newer
+    ///    value) or this config deleted the secret.
     fn get_secret(&self, key: &str) -> Result<String> {
-        let keyring_error = match self.keyring.get(key) {
+        match self.get_fallback(key) {
+            Ok(secret) => {
+                if !self.disk_storage() {
+                    self.move_to_keyring(key, &secret);
+                }
+                return Ok(secret);
+            }
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e),
+        }
+        let keyring_error = match self.kr_get(key) {
             Ok(secret) => return Ok(secret),
             Err(e) => e,
         };
-        match self.get_fallback(key) {
-            // A locked keyring may hold the secret: say so rather than "not found"
-            Err(e) if e.is_not_found() && keyring_error.credential_kind() == Some(Kind::Locked) => Err(keyring_error),
-            other => other,
+        if keyring_error.credential_kind() == Some(Kind::Locked) {
+            return Err(keyring_error);
         }
+        match self.get_legacy(key)? {
+            Some(secret) => {
+                self.adopt_legacy(key, &secret);
+                Ok(secret)
+            }
+            None => Err(not_found(key)),
+        }
+    }
+
+    /// The secret from a legacy location, unless this config deleted it.
+    fn get_legacy(&self, key: &str) -> Result<Option<String>> {
+        if self.legacy_stores.is_empty() || self.get_fallback(&no_legacy_key(key)).is_ok() {
+            return Ok(None);
+        }
+        for legacy in &self.legacy_stores {
+            match legacy.get_fallback(key) {
+                Ok(secret) => return Ok(Some(secret)),
+                Err(e) if e.is_not_found() => {}
+                Err(e) => tracing::warn!("Skipping the old credential store {}: {}", legacy.fallback_path.display(), e),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Copies a legacy secret into this config's storage and remembers which
+    /// value came from there, so deleting it later can clean up that copy.
+    fn adopt_legacy(&self, key: &str, secret: &str) {
+        let marker = value_fingerprint(secret);
+        let copied = self.update_fallback(|entries| {
+            entries.insert(key.to_string(), secret.to_string());
+            entries.insert(migrated_key(key), marker);
+            true
+        });
+        match copied {
+            Ok(()) if !self.disk_storage() => {
+                self.move_to_keyring(key, secret);
+            }
+            Ok(()) => {}
+            Err(e) => tracing::warn!("Couldn't copy '{}' from the old credential store: {}", key, e),
+        }
+    }
+
+    /// Puts `secret` in the keyring, reads it back, and only then removes the
+    /// local copy (if it still holds the same value). Failures leave it local,
+    /// where it stays authoritative.
+    fn move_to_keyring(&self, key: &str, secret: &str) -> bool {
+        let verified = self.kr_set(key, secret).is_ok() && self.kr_get(key).ok().as_deref() == Some(secret);
+        if !verified {
+            return false;
+        }
+        let removed = self.update_fallback(|entries| {
+            if entries.get(key).map(String::as_str) == Some(secret) {
+                entries.remove(key);
+                true
+            } else {
+                false
+            }
+        });
+        if let Err(e) = removed {
+            tracing::warn!("Moved '{}' to the keyring but couldn't remove the local copy: {}", key, e);
+        }
+        true
     }
 
     fn delete_secret(&self, key: &str) -> Result<()> {
         // Local store first: if it can't be updated, the keyring copy stays too
-        self.update_fallback(|entries| entries.remove(key).is_some())?;
-        match self.keyring.delete(key) {
+        let mut migrated = None;
+        self.update_fallback(|entries| {
+            let removed = entries.remove(key).is_some();
+            migrated = entries.remove(&migrated_key(key));
+            removed || migrated.is_some()
+        })?;
+        for legacy in &self.legacy_stores {
+            let Ok(old) = legacy.get_fallback(key) else { continue };
+            // Never read it from the old location again, whoever owns that value
+            self.set_local(&no_legacy_key(key), "1")?;
+            // `~/.mailbackup` is also the default config's store: remove the
+            // old value only if it's the one this config copied from there
+            if migrated.as_deref() == Some(value_fingerprint(&old).as_str()) {
+                let removed = legacy.update_fallback(|entries| {
+                    if entries.get(key) == Some(&old) {
+                        entries.remove(key);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if let Err(e) = removed {
+                    tracing::warn!("Couldn't remove '{}' from {}: {}", key, legacy.fallback_path.display(), e);
+                }
+            }
+        }
+        match self.kr_delete(key) {
             Err(e) if e.credential_kind() == Some(Kind::Locked) => Err(e),
             _ => Ok(()),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Keyring entries, namespaced per store
+    // -----------------------------------------------------------------------
+
+    /// The keyring entry name for `key`. Entries carry this store's namespace,
+    /// so two configs with the same account id never share a keyring entry.
+    pub fn keyring_key(&self, key: &str) -> String {
+        format!("{}:{}", self.keyring_ns, key)
+    }
+
+    fn kr_get(&self, key: &str) -> Result<String> {
+        self.keyring.get(&self.keyring_key(key))
+    }
+
+    fn kr_set(&self, key: &str, secret: &str) -> Result<()> {
+        self.keyring.set(&self.keyring_key(key), secret)
+    }
+
+    fn kr_delete(&self, key: &str) -> Result<()> {
+        self.keyring.delete(&self.keyring_key(key))
+    }
+
+    // -----------------------------------------------------------------------
+    // Background service transitions
+    // -----------------------------------------------------------------------
+
+    /// Switches to disk storage for the background service, then runs
+    /// `install`. Before anything is installed, every account's password and
+    /// binding is copied to the local store in one verified write, and read
+    /// back by a reader without keyring access, as the service will be.
+    ///
+    /// If `install` fails, it may still have registered the service (e.g. the
+    /// unit is enabled but starting it was refused), so `remove` is asked to
+    /// take it away again and report whether no service remains. Only then is
+    /// disk storage turned off and the copies removed, and only those whose
+    /// keyring copy reads back equal: the only copy of a secret is never
+    /// removed. If a service may remain, disk storage and the copies stay so
+    /// it can still run, and the error says so.
+    pub fn switch_to_disk_storage(
+        &self,
+        account_ids: &[String],
+        install: impl FnOnce() -> Result<()>,
+        remove: impl FnOnce() -> bool,
+    ) -> Result<DiskStorageChange> {
+        if self.passphrase.is_some() {
+            return Err(Error::credential(
+                Kind::NoKey,
+                "The credential store is protected by MAILBACKUP_MASTER_KEY, which the background service doesn't receive. Unset it and save the passwords again before enabling the service.",
+            ));
+        }
+        let mut wanted = BTreeMap::new();
+        let mut change = DiskStorageChange::default();
+        for id in account_ids {
+            let password_key = format!("account:{}", id);
+            match self.get_secret(&password_key) {
+                Ok(secret) => {
+                    wanted.insert(password_key, secret);
+                }
+                Err(e) if e.is_not_found() => {
+                    change.skipped_accounts.push(id.clone());
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+            match self.get_secret(&binding_key(id)) {
+                Ok(binding) => {
+                    wanted.insert(binding_key(id), binding);
+                }
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut added = Vec::new();
+        self.update_fallback(|entries| {
+            let mut changed = false;
+            for (k, v) in &wanted {
+                match entries.insert(k.clone(), v.clone()) {
+                    None => {
+                        added.push(k.clone());
+                        changed = true;
+                    }
+                    Some(old) if &old != v => changed = true,
+                    Some(_) => {}
+                }
+            }
+            changed
+        })?;
+        change.added = added;
+
+        // What the service will see: the files only, no keyring, no passphrase
+        let service_view = Self::with_paths(self.fallback_path.clone(), self.key_path.clone())
+            .with_passphrase(None)
+            .with_keyring(Arc::new(NoKeyring))
+            .with_disk_storage(true);
+        for (k, v) in &wanted {
+            if service_view.get_fallback(k).ok().as_ref() != Some(v) {
+                self.undo_disk_copies(&change.added);
+                return Err(Error::credential(
+                    Kind::Unavailable,
+                    format!("Couldn't verify the copy of '{}' in {}. The service wasn't installed.", k, self.fallback_path.display()),
+                ));
+            }
+        }
+
+        self.set_disk_storage(true);
+        if let Err(e) = install() {
+            if !remove() {
+                return Err(Error::Other(format!(
+                    "{} The background service may still be installed, so its passwords stay in the local store and disk storage stays on. Turn the service off to undo this.",
+                    e
+                )));
+            }
+            self.set_disk_storage(false);
+            self.undo_disk_copies(&change.added);
+            return Err(e);
+        }
+        Ok(change)
+    }
+
+    /// Removes the given local copies whose keyring copy reads back equal.
+    fn undo_disk_copies(&self, keys: &[String]) {
+        let safe: Vec<(String, String)> = keys
+            .iter()
+            .filter_map(|k| self.kr_get(k).ok().map(|v| (k.clone(), v)))
+            .collect();
+        if safe.is_empty() {
+            return;
+        }
+        let result = self.update_fallback(|entries| {
+            let mut changed = false;
+            for (k, v) in &safe {
+                if entries.get(k) == Some(v) {
+                    entries.remove(k);
+                    changed = true;
+                }
+            }
+            changed
+        });
+        if let Err(e) = result {
+            tracing::warn!("Couldn't remove the local copies after a failed service install: {}", e);
+        }
+    }
+
+    /// Runs `uninstall`, checks with `still_installed` that the service is
+    /// gone, then switches back to keyring storage: each local secret is put
+    /// in the keyring and read back, and only verified ones (still holding the
+    /// same value) are removed from the local store. Secrets the keyring can't
+    /// take (no keyring, locked, mismatch) stay on disk and are reported.
+    pub fn switch_to_keyring_storage(
+        &self,
+        uninstall: impl FnOnce() -> Result<()>,
+        still_installed: impl FnOnce() -> bool,
+    ) -> Result<KeyringMove> {
+        uninstall()?;
+        if still_installed() {
+            return Err(Error::Other(
+                "The background service is still installed, so its passwords were left on disk.".to_string(),
+            ));
+        }
+        self.set_disk_storage(false);
+
+        let entries = {
+            let _lock = self.lock()?;
+            match self.load()? {
+                Some(loaded) => loaded.entries,
+                None => return Ok(KeyringMove::default()),
+            }
+        };
+        let mut result = KeyringMove::default();
+        let mut verified = Vec::new();
+        // Bookkeeping entries (`meta:…`) belong to the local store
+        for (k, v) in entries.iter().filter(|(k, _)| !k.starts_with(META_PREFIX)) {
+            if result.reason.is_some() {
+                result.kept.push(k.clone());
+                continue;
+            }
+            match self.kr_set(k, v) {
+                Ok(()) if self.kr_get(k).ok().as_ref() == Some(v) => verified.push((k.clone(), v.clone())),
+                Ok(()) => {
+                    result.kept.push(k.clone());
+                }
+                Err(e) => {
+                    result.reason = Some(e.to_string());
+                    result.kept.push(k.clone());
+                }
+            }
+        }
+        self.update_fallback(|current| {
+            let mut changed = false;
+            for (k, v) in &verified {
+                if current.get(k) == Some(v) {
+                    current.remove(k);
+                    result.moved.push(k.clone());
+                    changed = true;
+                } else {
+                    result.kept.push(k.clone());
+                }
+            }
+            changed
+        })?;
+        result.kept.sort();
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -468,7 +919,7 @@ impl CredentialStore {
             Ok(None) => {}
             Err(e) => blocker = Some(e),
         }
-        match self.keyring.get(MASTER_KEY_ENTRY) {
+        match self.kr_get(MASTER_KEY_ENTRY) {
             Ok(hex_key) => match parse_key(&hex_key) {
                 Some(key) if !keys.contains(&key) => keys.push(key),
                 Some(_) => {}
@@ -497,7 +948,7 @@ impl CredentialStore {
         if let Some(key) = read_key_file(&self.key_path)? {
             return Ok(key);
         }
-        let from_keyring = self.keyring.get(MASTER_KEY_ENTRY).ok().and_then(|hex_key| parse_key(&hex_key));
+        let from_keyring = self.kr_get(MASTER_KEY_ENTRY).ok().and_then(|hex_key| parse_key(&hex_key));
         let key = from_keyring.unwrap_or_else(|| {
             let generated = Aes256Gcm::generate_key(&mut OsRng);
             let mut key = [0u8; 32];
@@ -518,7 +969,7 @@ impl CredentialStore {
             Err(e) => return Err(key_file_error(&self.key_path, e)),
         }
         if from_keyring.is_none() {
-            let _ = self.keyring.set(MASTER_KEY_ENTRY, &hex::encode(key));
+            let _ = self.kr_set(MASTER_KEY_ENTRY, &hex::encode(key));
         }
         Ok(key)
     }
@@ -647,6 +1098,73 @@ fn decrypt_v2(file: &StoreFile, key: &[u8; 32], path: &Path) -> Result<BTreeMap<
             Ok((k.clone(), plain))
         })
         .collect()
+}
+
+/// Local-store entries that aren't secrets: which value was copied from a
+/// legacy location, and which secrets this config deleted (never read from a
+/// legacy location again).
+const META_PREFIX: &str = "meta:";
+
+fn migrated_key(key: &str) -> String {
+    format!("{}migrated:{}", META_PREFIX, key)
+}
+
+fn no_legacy_key(key: &str) -> String {
+    format!("{}deleted:{}", META_PREFIX, key)
+}
+
+fn value_fingerprint(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+/// Keyring namespace of the store at `fallback_path`: a fingerprint of its
+/// resolved folder, the same for every process using that config.
+///
+/// Releases before 0.3.0 were built without any platform keyring (only the
+/// crate's in-memory mock), so no un-namespaced entries exist to migrate.
+fn keyring_namespace(fallback_path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let absolute = std::path::absolute(fallback_path).unwrap_or_else(|_| fallback_path.to_path_buf());
+    let dir = absolute.parent().map(Path::to_path_buf).unwrap_or_default();
+    let dir = resolve_existing_prefix(&normalize_lexically(&dir));
+    let digest = Sha256::digest(dir.to_string_lossy().as_bytes());
+    format!("cfg-{}", &hex::encode(digest)[..16])
+}
+
+/// `path` with its deepest existing ancestor resolved to the real path and the
+/// missing rest appended, so a folder that doesn't exist yet resolves the same
+/// way it will once created (`/var` vs `/private/var` on macOS).
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&current) {
+            return rest.iter().rev().fold(real, |acc: PathBuf, name: &std::ffi::OsString| acc.join(name));
+        }
+        match (current.file_name().map(|n| n.to_os_string()), current.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name);
+                current = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Removes `.` and resolves `..` without touching the file system.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn passphrase_from_env() -> Option<String> {
