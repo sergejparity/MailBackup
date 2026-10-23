@@ -1051,7 +1051,7 @@ fn search_with_a_multibyte_date_is_an_input_error() {
 #[test]
 fn only_mailbackup_log_names_are_served() {
     use mailbackup_core::event_log::{get_log_file_content, is_log_file_name};
-    for good in ["events.log", "events-2026-10-01.log", "events-2026-10-01.3.log"] {
+    for good in ["events.log", "events-2026-10-01.log", "events-2026-10-01.3.log", "service.log", "service_err.log"] {
         assert!(is_log_file_name(good), "{}", good);
     }
     for bad in ["\r\nevil.log", "events.log\r\n", "events-2026-13-01.log", "events-2026-10-01..log", "events-2026-10-01.x.log", "notes.txt", "../events.log", "events-2026-1-1.log"] {
@@ -1062,4 +1062,30 @@ fn only_mailbackup_log_names_are_served() {
         get_log_file_content("events-2000-01-01.log"),
         Err(mailbackup_core::Error::NotFound(_))
     ));
+}
+
+#[test]
+fn every_listed_log_file_can_be_downloaded() {
+    use mailbackup_core::event_log::{get_log_file_content, list_log_files, log_dir};
+    let dir = log_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    // Written by the background service; "notes.log" is someone else's
+    let mut created = Vec::new();
+    for (name, body) in [("service.log", "started"), ("service_err.log", "warning"), ("notes.log", "other")] {
+        let path = dir.join(name);
+        if !path.exists() {
+            std::fs::write(&path, body).unwrap();
+            created.push(path);
+        }
+    }
+    let listed = list_log_files().unwrap();
+    let names: Vec<&str> = listed.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"service.log") && names.contains(&"service_err.log"), "{:?}", names);
+    assert!(!names.contains(&"notes.log"), "only files the viewer can download are listed");
+    for file in &listed {
+        assert!(get_log_file_content(&file.name).is_ok(), "{}", file.name);
+    }
+    for path in created {
+        let _ = std::fs::remove_file(path);
+    }
 }

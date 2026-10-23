@@ -268,7 +268,8 @@ pub fn list_log_files() -> Result<Vec<LogFileInfo>> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".log") && !name.contains(".log.") {
+        // Only files the viewer can also download (see `is_log_file_name`)
+        if !is_log_file_name(&name) {
             continue;
         }
 
@@ -312,10 +313,11 @@ pub fn get_log_file_content(filename: &str) -> Result<String> {
     Ok(fs::read_to_string(&path)?)
 }
 
-/// Names MailBackup gives its log files: `events.log` and rotated
-/// `events-YYYY-MM-DD.log` / `events-YYYY-MM-DD.N.log`.
+/// Names MailBackup gives its log files: `events.log`, rotated
+/// `events-YYYY-MM-DD.log` / `events-YYYY-MM-DD.N.log`, and the background
+/// service's `service.log` / `service_err.log`.
 pub fn is_log_file_name(name: &str) -> bool {
-    if name == "events.log" {
+    if matches!(name, "events.log" | "service.log" | "service_err.log") {
         return true;
     }
     let Some(rest) = name.strip_prefix("events-").and_then(|r| r.strip_suffix(".log")) else {

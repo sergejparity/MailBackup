@@ -2342,6 +2342,19 @@ mod tests {
         let missing = router.clone().oneshot(authed_get("/api/logs/download?file=events-2000-01-01.log")).await.unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
+        // Service logs listed by the viewer stay downloadable
+        let service_log = mailbackup_core::event_log::log_dir().join("service_err.log");
+        let created = !service_log.exists();
+        if created {
+            std::fs::create_dir_all(service_log.parent().unwrap()).unwrap();
+            std::fs::write(&service_log, "warning").unwrap();
+        }
+        let res = router.clone().oneshot(authed_get("/api/logs/download?file=service_err.log")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        if created {
+            let _ = std::fs::remove_file(&service_log);
+        }
+
         let active = router.clone().oneshot(authed_get("/api/logs/download")).await.unwrap();
         assert_eq!(active.status(), StatusCode::OK);
         let disposition = active.headers().get(header::CONTENT_DISPOSITION).unwrap().to_str().unwrap();
