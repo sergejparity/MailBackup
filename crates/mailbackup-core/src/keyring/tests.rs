@@ -762,7 +762,7 @@ fn enabling_the_service_copies_and_verifies_before_installing() {
             assert_eq!(local.get("account:b").map(String::as_str), Some("pw-b"));
             installed = true;
             Ok(())
-        })
+        }, || true)
         .unwrap();
     assert!(installed);
     assert!(store.disk_storage());
@@ -785,7 +785,7 @@ fn a_failed_install_rolls_back_without_losing_the_only_copy() {
     let store = fx.store_with(keyring.clone());
 
     let err = store
-        .switch_to_disk_storage(&ids(&["a", "local"]), || Err(Error::Other("pkexec dismissed".into())))
+        .switch_to_disk_storage(&ids(&["a", "local"]), || Err(Error::Other("pkexec dismissed".into())), || true)
         .unwrap_err();
     assert_eq!(err.to_string(), "Generic error: pkexec dismissed");
     assert!(!store.disk_storage());
@@ -804,7 +804,7 @@ fn enabling_the_service_is_refused_without_changes_when_secrets_cannot_be_read()
     let err = fx.store_with(keyring).switch_to_disk_storage(&ids(&["a"]), || {
         called = true;
         Ok(())
-    });
+    }, || true);
     assert_eq!(kind(err), Kind::Locked);
     assert!(!called && !fx.store_path().exists());
 
@@ -813,7 +813,7 @@ fn enabling_the_service_is_refused_without_changes_when_secrets_cannot_be_read()
     let err = fx.store_with_passphrase("pw").switch_to_disk_storage(&ids(&["a"]), || {
         called = true;
         Ok(())
-    });
+    }, || true);
     assert_eq!(kind(err), Kind::NoKey);
     assert!(!called);
 }
@@ -823,7 +823,7 @@ fn disabling_the_service_moves_verified_secrets_back_into_the_keyring() {
     let fx = Fixture::new();
     let keyring = fx.fake(&[("account:a", "pw-a"), ("account:a:binding", "bind-a")]);
     let store = fx.store_with(keyring.clone());
-    store.switch_to_disk_storage(&ids(&["a"]), || Ok(())).unwrap();
+    store.switch_to_disk_storage(&ids(&["a"]), || Ok(()), || true).unwrap();
     // Changed while the service ran: only on disk
     store.set_password("a", "pw-a2").unwrap();
     keyring.entries.lock().unwrap().clear();
@@ -871,7 +871,7 @@ fn disabling_stops_while_the_service_is_still_installed() {
     let fx = Fixture::new();
     let keyring = fx.fake(&[("account:a", "pw-a")]);
     let store = fx.store_with(keyring.clone());
-    store.switch_to_disk_storage(&ids(&["a"]), || Ok(())).unwrap();
+    store.switch_to_disk_storage(&ids(&["a"]), || Ok(()), || true).unwrap();
     keyring.entries.lock().unwrap().clear();
 
     let err = store.switch_to_keyring_storage(|| Ok(()), || true).unwrap_err();
@@ -988,7 +988,7 @@ fn a_newer_disk_password_stays_authoritative_until_it_reaches_the_keyring() {
     // The keyring still has the password from before the service was enabled
     let keyring = fx.fake(&[("account:a", "old")]);
     let store = fx.store_with(keyring.clone());
-    store.switch_to_disk_storage(&ids(&["a"]), || Ok(())).unwrap();
+    store.switch_to_disk_storage(&ids(&["a"]), || Ok(()), || true).unwrap();
     store.set_password("a", "new").unwrap();
     assert_eq!(keyring.raw("account:a").as_deref(), Some("old"));
 
@@ -1065,4 +1065,36 @@ fn bookkeeping_entries_stay_out_of_the_keyring() {
     let moved = store.switch_to_keyring_storage(|| Ok(()), || false).unwrap();
     assert_eq!(moved.moved, ids(&["account:x"]));
     assert!(keyring.entries.lock().unwrap().keys().all(|k| !k.contains(META_PREFIX)));
+}
+
+#[test]
+fn a_partly_installed_service_keeps_its_disk_passwords() {
+    let fx = Fixture::new();
+    let keyring = fx.fake(&[("account:a", "pw-a")]);
+    let store = fx.store_with(keyring.clone());
+    let mut removal_tried = false;
+    // The service got registered, then starting it failed and it couldn't be removed
+    let err = store
+        .switch_to_disk_storage(
+            &ids(&["a"]),
+            || Err(Error::Other("restart authorization dismissed".into())),
+            || {
+                removal_tried = true;
+                false
+            },
+        )
+        .unwrap_err();
+    assert!(removal_tried);
+    assert!(err.to_string().contains("may still be installed"), "{}", err);
+    assert!(store.disk_storage(), "the remaining service must still find its passwords");
+    assert_eq!(fx.local().get("account:a").map(String::as_str), Some("pw-a"));
+    assert_eq!(fx.service_reader().get_password("a").unwrap(), "pw-a");
+
+    // Removed after all: disk storage and the copies are undone
+    let store = fx.store_with(keyring);
+    let err = store
+        .switch_to_disk_storage(&ids(&["a"]), || Err(Error::Other("failed".into())), || true)
+        .unwrap_err();
+    assert_eq!(err.to_string(), "Generic error: failed");
+    assert!(!store.disk_storage());
 }

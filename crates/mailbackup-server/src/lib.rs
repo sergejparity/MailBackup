@@ -1673,6 +1673,8 @@ async fn api_update_settings(
         if let Some(service_val) = payload.run_as_service {
             let account_ids: Vec<String> = cfg.accounts.iter().map(|a| a.id.clone()).collect();
             if let Err(e) = set_service_with_credentials(&state, service_val, &account_ids) {
+                // A partial install keeps run_as_service on disk; don't overwrite it later
+                cfg.settings.run_as_service = persisted_run_as_service(&state.config_path, cfg.settings.run_as_service);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to configure system service: {}", e),
@@ -1778,6 +1780,15 @@ fn set_service_with_credentials(state: &AppState, enabled: bool, account_ids: &[
     )
 }
 
+/// `settings.run_as_service` as saved in the config file (`fallback` if it
+/// can't be read).
+fn persisted_run_as_service(config_path: &std::path::Path, fallback: bool) -> bool {
+    if !config_path.exists() {
+        return fallback;
+    }
+    AppConfig::load_or_create(Some(config_path)).map(|cfg| cfg.settings.run_as_service).unwrap_or(fallback)
+}
+
 /// Sets `settings.run_as_service` in the config file on disk, leaving the
 /// rest of the file as it is there.
 fn persist_run_as_service(config_path: &std::path::Path, enabled: bool) -> mailbackup_core::Result<()> {
@@ -1794,21 +1805,36 @@ fn set_service_with_credentials_using(
     state: &AppState,
     enabled: bool,
     account_ids: &[String],
-    set_enabled: impl FnOnce(bool, &std::path::Path) -> mailbackup_core::Result<()>,
-    still_installed: impl FnOnce() -> bool,
+    set_enabled: impl Fn(bool, &std::path::Path) -> mailbackup_core::Result<()>,
+    still_installed: impl Fn() -> bool,
 ) -> mailbackup_core::Result<()> {
     let config_path = state.config_path.clone();
     if enabled {
-        let change = state.credentials.switch_to_disk_storage(account_ids, || {
-            persist_run_as_service(&config_path, true)?;
-            if let Err(e) = set_enabled(true, &config_path) {
-                if let Err(revert) = persist_run_as_service(&config_path, false) {
-                    tracing::warn!("Couldn't reset run_as_service after a failed install: {}", revert);
+        let change = state.credentials.switch_to_disk_storage(
+            account_ids,
+            || {
+                persist_run_as_service(&config_path, true)?;
+                set_enabled(true, &config_path)
+            },
+            // A failed install may have registered the service anyway: remove
+            // it, and undo disk storage only once it's confirmed gone
+            || {
+                if let Err(e) = set_enabled(false, &config_path) {
+                    tracing::warn!("Couldn't remove the partly installed service: {}", e);
                 }
-                return Err(e);
-            }
-            Ok(())
-        })?;
+                if still_installed() {
+                    mailbackup_core::event_log::log_event(
+                        "SERVICE_PARTIAL_INSTALL",
+                        "The background service may still be installed; its passwords stay in the local store",
+                    );
+                    return false;
+                }
+                if let Err(e) = persist_run_as_service(&config_path, false) {
+                    tracing::warn!("Couldn't reset run_as_service after a failed install: {}", e);
+                }
+                true
+            },
+        )?;
         if !change.skipped_accounts.is_empty() {
             mailbackup_core::event_log::log_event(
                 "SERVICE_CREDENTIALS",
@@ -1871,6 +1897,11 @@ async fn api_service_toggle(
                 .into_response()
         }
         Err(e) => {
+            {
+                // A partial install keeps run_as_service on disk; don't overwrite it later
+                let mut cfg = state.config.write().await;
+                cfg.settings.run_as_service = persisted_run_as_service(&state.config_path, cfg.settings.run_as_service);
+            }
             let status = mailbackup_core::service::get_service_status();
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2086,12 +2117,52 @@ mod tests {
 
         let err = set_service_with_credentials_using(&state, true, &["a".to_string()], |_, _| {
             Err(mailbackup_core::Error::Other("authorization dismissed".into()))
-        }, || unreachable!())
+        }, || false)
         .unwrap_err();
         assert!(err.to_string().contains("authorization dismissed"));
         assert!(!AppConfig::load_or_create(Some(&state.config_path)).unwrap().settings.run_as_service);
         assert!(!state.credentials.disk_storage());
         assert_eq!(state.credentials.get_password("a").unwrap(), "pw");
+    }
+
+    #[tokio::test]
+    async fn a_partly_installed_service_keeps_disk_storage_and_its_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        state.config.read().await.save(&state.config_path).unwrap();
+        state.credentials.set_password("a", "pw").unwrap();
+
+        // Like Linux: the unit is installed and enabled, then starting it is
+        // refused, and removing it is refused too
+        let installed = std::sync::atomic::AtomicBool::new(false);
+        let removal_attempts = std::sync::atomic::AtomicUsize::new(0);
+        let err = set_service_with_credentials_using(
+            &state,
+            true,
+            &["a".to_string()],
+            |enabled, _| {
+                if enabled {
+                    installed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Err(mailbackup_core::Error::Other("restart authorization dismissed".into()))
+                } else {
+                    removal_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(mailbackup_core::Error::Other("removal authorization dismissed".into()))
+                }
+            },
+            || installed.load(std::sync::atomic::Ordering::SeqCst),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("may still be installed"), "{}", err);
+        assert_eq!(removal_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The boot service can still start in disk mode and read the password
+        let on_disk = AppConfig::load_or_create(Some(&state.config_path)).unwrap();
+        assert!(on_disk.settings.run_as_service);
+        assert!(state.credentials.disk_storage());
+        let service = CredentialStore::for_config(&state.config_path, &on_disk.settings)
+            .with_passphrase(None)
+            .with_keyring(Arc::new(mailbackup_core::keyring::NoKeyring));
+        assert_eq!(service.get_password("a").unwrap(), "pw");
+        assert!(persisted_run_as_service(&state.config_path, false), "handlers sync the in-memory flag from this");
     }
 
     async fn status(router: &Router, req: HttpRequest<Body>) -> StatusCode {

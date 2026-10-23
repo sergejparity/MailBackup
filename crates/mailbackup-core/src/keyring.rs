@@ -490,13 +490,18 @@ impl CredentialStore {
     /// binding is copied to the local store in one verified write, and read
     /// back by a reader without keyring access, as the service will be.
     ///
-    /// If `install` fails, disk storage is turned off again and the copies are
-    /// removed, but only those whose keyring copy reads back equal: the only
-    /// copy of a secret is never removed.
+    /// If `install` fails, it may still have registered the service (e.g. the
+    /// unit is enabled but starting it was refused), so `remove` is asked to
+    /// take it away again and report whether no service remains. Only then is
+    /// disk storage turned off and the copies removed, and only those whose
+    /// keyring copy reads back equal: the only copy of a secret is never
+    /// removed. If a service may remain, disk storage and the copies stay so
+    /// it can still run, and the error says so.
     pub fn switch_to_disk_storage(
         &self,
         account_ids: &[String],
         install: impl FnOnce() -> Result<()>,
+        remove: impl FnOnce() -> bool,
     ) -> Result<DiskStorageChange> {
         if self.passphrase.is_some() {
             return Err(Error::credential(
@@ -561,6 +566,12 @@ impl CredentialStore {
 
         self.set_disk_storage(true);
         if let Err(e) = install() {
+            if !remove() {
+                return Err(Error::Other(format!(
+                    "{} The background service may still be installed, so its passwords stay in the local store and disk storage stays on. Turn the service off to undo this.",
+                    e
+                )));
+            }
             self.set_disk_storage(false);
             self.undo_disk_copies(&change.added);
             return Err(e);
