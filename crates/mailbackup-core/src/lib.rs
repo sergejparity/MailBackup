@@ -15,5 +15,6 @@ pub mod error;
 pub mod csv_import;
 pub mod safe_paths;
 pub mod private_fs;
+pub mod html_view;
 
 pub use error::{Error, Result};

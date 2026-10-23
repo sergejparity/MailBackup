@@ -107,6 +107,12 @@ settings:
 - If you use a reverse proxy with its own domain name, add that name to `allowed_hosts`. The proxy must pass the `X-MailBackup-Token` header through.
 - Scripts that called `/api/*` directly now need the token. It's printed nowhere and changes on every start, so the API is meant to be used through the web UI only.
 
+**Reading HTML mail:** messages are shown in a sandboxed frame that can't run scripts, submit forms, open windows or reach the app.
+- **Blocked by default:** remote images, stylesheets and fonts. Opening a mail doesn't tell the sender you read it and doesn't reveal your IP address.
+- **Removed from every mail:** auto-refresh redirects, `<base>` and prefetch/preconnect hints.
+- **Images sent inside the mail** (`cid:`) are shown, up to 5 MB per image and 20 MB per message.
+- **Load remote content:** when a mail references remote content, a notice above it offers this button. It applies to that message only, until you open another.
+
 **Export and storage locations (web UI):**
 - `.mbox` exports, and moves of the archive folder or database, are limited to your Downloads, Documents and Desktop folders, your home folder, and folders you've chosen with **Browse…**. Browse adds the folder to `settings.approved_dirs` in `config.yaml`; remove entries there to revoke them.
 - Exports must end in `.mbox`, can't go into hidden (`.`) folders, and never overwrite symlinks or folders.
@@ -166,4 +172,11 @@ cargo run -p mailbackup-gui
 
 ```bash
 cargo test --workspace
+```
+
+Browser test for the mail viewer (needs Node, Playwright and its Chromium):
+
+```bash
+cargo build -p mailbackup-server
+NODE_PATH="$(npm root -g)" node scripts/browser-tests/remote-content.mjs
 ```

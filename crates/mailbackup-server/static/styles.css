@@ -963,6 +963,19 @@ body.is-modal-resizing * {
   border-color: var(--primary);
 }
 
+/* Remote content notice */
+.remote-content-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 24px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  background: var(--item-hover-bg);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
 /* Email Body */
 .email-body-container {
   flex: 1;
