@@ -125,6 +125,21 @@ pub struct StorageStats {
     pub total_bytes: u64,
 }
 
+/// A search date filter: `YYYY-MM-DD`, optionally followed by a time (`T…` or
+/// a space, as in an ISO timestamp). Anything else is `Error::InvalidInput`.
+pub fn parse_date_filter(input: &str) -> Result<chrono::NaiveDate> {
+    let invalid = || crate::Error::InvalidInput(format!("Invalid date '{}': expected YYYY-MM-DD", input.escape_debug()));
+    let input = input.trim();
+    // Split by character: never slice a string by byte offset
+    let mut chars = input.char_indices();
+    let date_end = chars.nth(10).map(|(i, _)| i).unwrap_or(input.len());
+    let (date, rest) = input.split_at(date_end);
+    if !(rest.is_empty() || rest.starts_with('T') || rest.starts_with(' ')) {
+        return Err(invalid());
+    }
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| invalid())
+}
+
 /// Makes the catalog owner-only before SQLite opens it. SQLite's unix VFS gives
 /// the `-wal`/`-shm`/`-journal` files it creates the database file's mode, so
 /// the file must be private first:
@@ -707,15 +722,15 @@ impl Database {
         }
 
         if let Some(df) = filter.date_from.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            let clean_df = if df.len() >= 10 { &df[..10] } else { df };
+            let date = parse_date_filter(df)?;
             conditions.push("date(m.date) >= ?".to_string());
-            params.push(rusqlite::types::Value::Text(clean_df.to_string()));
+            params.push(rusqlite::types::Value::Text(date.format("%Y-%m-%d").to_string()));
         }
 
         if let Some(dt) = filter.date_to.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            let clean_dt = if dt.len() >= 10 { &dt[..10] } else { dt };
+            let date = parse_date_filter(dt)?;
             conditions.push("date(m.date) <= ?".to_string());
-            params.push(rusqlite::types::Value::Text(clean_dt.to_string()));
+            params.push(rusqlite::types::Value::Text(date.format("%Y-%m-%d").to_string()));
         }
 
         if let Some(acc) = filter.account_id.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "ALL") {
