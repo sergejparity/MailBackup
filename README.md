@@ -118,6 +118,12 @@ settings:
 - If `config.yaml` is edited to point an account somewhere else, sync refuses to send the old password ("The saved password … belongs to a different server …") until it is re-entered.
 - Passwords saved by older versions are bound to the current settings the first time they're used.
 
+**Local credential store:** passwords are also kept in `.credentials_store.json` next to `config.yaml`. Each one is encrypted with AES-256-GCM.
+- **Key:** by default, a random key in `.credentials_key`. If `MAILBACKUP_MASTER_KEY` is set, the key is derived from that passphrase with Argon2id, using a random salt stored in the file.
+- **Older files** are upgraded automatically the first time they're read. This also covers files that older versions protected with a weaker key.
+- **Problems are reported, never papered over.** A store that can't be read is reported instead of being treated as empty, and it's never overwritten: a wrong passphrase, a missing or replaced key file, a locked keyring, or a damaged file.
+- **Limit:** whoever can read both the store and its key file (your account or an administrator) can read the passwords. File permissions keep other users out.
+
 **Background service:** Settings → "Run as OS Background Service" installs a service that starts at boot and runs **as your user account**, not as root/SYSTEM:
 - Linux: a systemd unit with `User=`.
 - macOS: a LaunchDaemon with `UserName`.

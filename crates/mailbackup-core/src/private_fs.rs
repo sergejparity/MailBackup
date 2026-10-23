@@ -74,18 +74,91 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     if std::fs::symlink_metadata(path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
         return write(path, data);
     }
+    write_atomic_verified(path, data, |_| Ok(()))
+}
+
+/// [`write_atomic`] that runs `verify` on the fully written temp file before
+/// it replaces `path`. If writing or verifying fails, `path` is untouched and
+/// the temp file is removed. Symlinked targets are replaced, not followed.
+pub fn write_atomic_verified(
+    path: &Path,
+    data: &[u8],
+    verify: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let temp = temp_path_for(path)?;
     let result = (|| {
         let mut file = options().write(true).create_new(true).open(&temp)?;
         file.write_all(data)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temp, path)
+        verify(&temp)?;
+        std::fs::rename(&temp, path)?;
+        sync_parent(path);
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+/// Creates `path` with `data` only if it doesn't exist yet, and never leaves a
+/// partially written file at `path`: the data is written to a temp file and
+/// hard-linked into place, which fails with `AlreadyExists` if another writer
+/// got there first. On file systems without hard links (FAT/exFAT) it falls
+/// back to an exclusive create.
+pub fn create_new_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    let temp = temp_path_for(path)?;
+    let mut file = options().write(true).create_new(true).open(&temp)?;
+    let written = file.write_all(data).and_then(|_| file.sync_all());
+    drop(file);
+    let result = written.and_then(|_| std::fs::hard_link(&temp, path));
+    let _ = std::fs::remove_file(&temp);
+    match result {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists && std::fs::symlink_metadata(path).is_err() => {
+            // No hard links here: exclusive create, then write
+            let mut file = options().write(true).create_new(true).open(path)?;
+            file.write_all(data)?;
+            file.sync_all()?;
+        }
+        other => other?,
+    }
+    sync_parent(path);
+    Ok(())
+}
+
+/// Temp files left next to `path` by an interrupted [`write_atomic`] (a crash
+/// between writing and renaming). Only safe to delete while holding whatever
+/// lock serializes writers of `path`.
+pub fn stale_temp_files(path: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return Vec::new() };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let prefix = format!(".{}.", name.to_string_lossy());
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    n.starts_with(&prefix) && n.ends_with(".tmp")
+                })
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Flushes the rename/link of `path` itself to disk (best effort, unix).
+fn sync_parent(path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let dir = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+        if let Ok(dir) = File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Copies `src` to `dst`. Unlike `std::fs::copy`, which gives the copy the

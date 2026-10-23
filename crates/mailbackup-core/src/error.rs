@@ -14,6 +14,11 @@ pub enum Error {
     #[error("Keyring error: {0}")]
     Keyring(String),
 
+    /// A secret couldn't be read or written; `kind` says why, so callers can
+    /// tell a missing secret from a store they must not overwrite.
+    #[error("{message}")]
+    Credential { kind: CredentialErrorKind, message: String },
+
     #[error("IMAP error: {0}")]
     Imap(String),
 
@@ -46,6 +51,43 @@ pub enum Error {
 
     #[error("Generic error: {0}")]
     Other(String),
+}
+
+/// Why a credential operation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialErrorKind {
+    /// No such secret (or no store yet). The only kind that means "empty".
+    NotFound,
+    /// The OS keyring exists but is locked or refused access.
+    Locked,
+    /// The OS keyring or the store can't be reached right now.
+    Unavailable,
+    /// The store or key file isn't readable/writable for this user.
+    PermissionDenied,
+    /// The store, an entry or the key file is damaged or has an unknown format.
+    Corrupt,
+    /// The store doesn't decrypt with the available key or passphrase.
+    WrongKey,
+    /// The store needs a key or passphrase that isn't available.
+    NoKey,
+}
+
+impl Error {
+    pub fn credential(kind: CredentialErrorKind, message: impl Into<String>) -> Self {
+        Error::Credential { kind, message: message.into() }
+    }
+
+    /// The credential error kind, if this is one.
+    pub fn credential_kind(&self) -> Option<CredentialErrorKind> {
+        match self {
+            Error::Credential { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        self.credential_kind() == Some(CredentialErrorKind::NotFound)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
