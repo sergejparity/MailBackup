@@ -267,7 +267,10 @@ impl CredentialStore {
         let mut entries = loaded.as_ref().map(|l| l.entries.clone()).unwrap_or_default();
         let changed = change(&mut entries);
         let migrate = loaded.as_ref().map(|l| l.needs_migration).unwrap_or(false);
-        if !changed && !migrate {
+        // A key-file store with a passphrase now set is rekeyed on any write
+        let rekey = self.passphrase.is_some()
+            && loaded.as_ref().and_then(|l| l.current.as_ref()).is_some_and(|k| k.kdf.is_none());
+        if !changed && !migrate && !rekey {
             return Ok(());
         }
         self.save(&entries, loaded.as_ref())

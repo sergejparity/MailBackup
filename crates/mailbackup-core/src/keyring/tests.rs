@@ -571,3 +571,19 @@ fn a_symlink_at_the_lock_path_is_not_followed() {
     assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
     assert!(!fx.store_path().exists());
 }
+
+#[test]
+fn saving_an_unchanged_password_still_applies_a_new_passphrase() {
+    let fx = Fixture::new();
+    fx.store().set_password("acc", "pw").unwrap();
+    let protected = fx.store_with_passphrase("now with passphrase");
+    protected.set_password("acc", "pw").unwrap();
+    assert_eq!(fx.json()["kdf"]["alg"], "argon2id");
+    assert_eq!(kind(fx.store().get_password("acc")), Kind::NoKey, "the key file alone no longer opens it");
+    assert_eq!(protected.get_password("acc").unwrap(), "pw");
+
+    // Without a pending rekey, an unchanged save doesn't rewrite the file
+    let before = fx.raw();
+    protected.set_password("acc", "pw").unwrap();
+    assert_eq!(fx.raw(), before);
+}
