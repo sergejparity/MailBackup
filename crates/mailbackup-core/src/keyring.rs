@@ -149,6 +149,8 @@ pub struct CredentialStore {
     key_path: PathBuf,
     passphrase: Option<String>,
     keyring: Arc<dyn SecretBackend>,
+    /// Prefix of this store's keyring entries (see [`keyring_key`](Self::keyring_key)).
+    keyring_ns: String,
     /// Keep secrets in the local store (background service mode).
     disk_storage: std::sync::atomic::AtomicBool,
     /// Older locations of this config's store, read (and cleaned on delete)
@@ -212,6 +214,7 @@ impl CredentialStore {
     /// from `MAILBACKUP_MASTER_KEY` / `MAILBACKUP_ENCRYPTION_KEY` if set.
     pub fn with_paths(fallback_path: PathBuf, key_path: PathBuf) -> Self {
         Self {
+            keyring_ns: keyring_namespace(&fallback_path),
             fallback_path,
             key_path,
             passphrase: passphrase_from_env(),
@@ -310,13 +313,16 @@ impl CredentialStore {
         if self.disk_storage() {
             return self.set_local(key, secret);
         }
-        match self.keyring.set(key, secret) {
+        match self.kr_set(key, secret) {
             Ok(()) => {
-                // The keyring has it now; drop an older local copy
-                if let Err(e) = self.update_fallback(|entries| entries.remove(key).is_some()) {
-                    tracing::warn!("Saved '{}' in the keyring but couldn't remove the local copy: {}", key, e);
-                }
-                Ok(())
+                // The keyring has it now. A local copy would still win on reads
+                // (see `get_secret`), so failing to drop it is an error.
+                self.update_fallback(|entries| entries.remove(key).is_some()).map_err(|e| {
+                    Error::credential(
+                        e.credential_kind().unwrap_or(Kind::Unavailable),
+                        format!("Saved in the keyring, but the older local copy couldn't be removed: {}", e),
+                    )
+                })
             }
             // No keyring on this machine: the local store is the fallback
             Err(e) if e.credential_kind() == Some(Kind::Unavailable) => self.set_local(key, secret),
@@ -329,61 +335,79 @@ impl CredentialStore {
         self.update_fallback(|entries| entries.insert(key.to_string(), secret.to_string()) != Some(secret.to_string()))
     }
 
+    /// Order of authority:
+    /// 1. A local copy. It only exists while it's newer than (or missing from)
+    ///    the keyring: no keyring, disk storage, a move back into the keyring
+    ///    that hasn't succeeded yet, or an older version's store. Outside disk
+    ///    storage it's moved into the keyring here when the keyring takes it.
+    /// 2. The keyring.
+    /// 3. Legacy locations, unless the keyring is locked (it may hold a newer
+    ///    value) or this config deleted the secret.
     fn get_secret(&self, key: &str) -> Result<String> {
-        if self.disk_storage() {
-            return match self.get_local(key) {
-                Err(e) if e.is_not_found() => match self.keyring.get(key) {
-                    Ok(secret) => Ok(secret),
-                    Err(k) if k.credential_kind() == Some(Kind::Locked) => Err(k),
-                    Err(_) => Err(e),
-                },
-                other => other,
-            };
+        match self.get_fallback(key) {
+            Ok(secret) => {
+                if !self.disk_storage() {
+                    self.move_to_keyring(key, &secret);
+                }
+                return Ok(secret);
+            }
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e),
         }
-        let keyring_error = match self.keyring.get(key) {
+        let keyring_error = match self.kr_get(key) {
             Ok(secret) => return Ok(secret),
             Err(e) => e,
         };
-        match self.get_local(key) {
-            Ok(secret) => {
-                // The keyring works but doesn't have it yet: move it there
-                if keyring_error.is_not_found() {
-                    self.move_to_keyring(key, &secret);
-                }
+        if keyring_error.credential_kind() == Some(Kind::Locked) {
+            return Err(keyring_error);
+        }
+        match self.get_legacy(key)? {
+            Some(secret) => {
+                self.adopt_legacy(key, &secret);
                 Ok(secret)
             }
-            // A locked keyring may hold the secret: say so rather than "not found"
-            Err(e) if e.is_not_found() && keyring_error.credential_kind() == Some(Kind::Locked) => Err(keyring_error),
-            Err(e) => Err(e),
+            None => Err(not_found(key)),
         }
     }
 
-    /// The local store, then the legacy locations. A secret found only in a
-    /// legacy location is copied into the local store.
-    fn get_local(&self, key: &str) -> Result<String> {
-        let primary = match self.get_fallback(key) {
-            Err(e) if e.is_not_found() => e,
-            other => return other,
-        };
+    /// The secret from a legacy location, unless this config deleted it.
+    fn get_legacy(&self, key: &str) -> Result<Option<String>> {
+        if self.legacy_stores.is_empty() || self.get_fallback(&no_legacy_key(key)).is_ok() {
+            return Ok(None);
+        }
         for legacy in &self.legacy_stores {
             match legacy.get_fallback(key) {
-                Ok(secret) => {
-                    if let Err(e) = self.set_local(key, &secret) {
-                        tracing::warn!("Couldn't copy '{}' from {}: {}", key, legacy.fallback_path.display(), e);
-                    }
-                    return Ok(secret);
-                }
+                Ok(secret) => return Ok(Some(secret)),
                 Err(e) if e.is_not_found() => {}
                 Err(e) => tracing::warn!("Skipping the old credential store {}: {}", legacy.fallback_path.display(), e),
             }
         }
-        Err(primary)
+        Ok(None)
+    }
+
+    /// Copies a legacy secret into this config's storage and remembers which
+    /// value came from there, so deleting it later can clean up that copy.
+    fn adopt_legacy(&self, key: &str, secret: &str) {
+        let marker = value_fingerprint(secret);
+        let copied = self.update_fallback(|entries| {
+            entries.insert(key.to_string(), secret.to_string());
+            entries.insert(migrated_key(key), marker);
+            true
+        });
+        match copied {
+            Ok(()) if !self.disk_storage() => {
+                self.move_to_keyring(key, secret);
+            }
+            Ok(()) => {}
+            Err(e) => tracing::warn!("Couldn't copy '{}' from the old credential store: {}", key, e),
+        }
     }
 
     /// Puts `secret` in the keyring, reads it back, and only then removes the
-    /// local copy (if it still holds the same value). Failures leave it local.
+    /// local copy (if it still holds the same value). Failures leave it local,
+    /// where it stays authoritative.
     fn move_to_keyring(&self, key: &str, secret: &str) -> bool {
-        let verified = self.keyring.set(key, secret).is_ok() && self.keyring.get(key).ok().as_deref() == Some(secret);
+        let verified = self.kr_set(key, secret).is_ok() && self.kr_get(key).ok().as_deref() == Some(secret);
         if !verified {
             return false;
         }
@@ -402,30 +426,59 @@ impl CredentialStore {
     }
 
     fn delete_secret(&self, key: &str) -> Result<()> {
-        // Local stores first: if one can't be updated, the keyring copy stays too
-        let mut deleted = None;
+        // Local store first: if it can't be updated, the keyring copy stays too
+        let mut migrated = None;
         self.update_fallback(|entries| {
-            deleted = entries.remove(key);
-            deleted.is_some()
+            let removed = entries.remove(key).is_some();
+            migrated = entries.remove(&migrated_key(key));
+            removed || migrated.is_some()
         })?;
-        // A legacy location may also be another config's store (`~/.mailbackup`
-        // is the default config's): only remove the copy migrated from there
-        if let Some(value) = &deleted {
-            for legacy in &self.legacy_stores {
-                legacy.update_fallback(|entries| {
-                    if entries.get(key) == Some(value) {
+        for legacy in &self.legacy_stores {
+            let Ok(old) = legacy.get_fallback(key) else { continue };
+            // Never read it from the old location again, whoever owns that value
+            self.set_local(&no_legacy_key(key), "1")?;
+            // `~/.mailbackup` is also the default config's store: remove the
+            // old value only if it's the one this config copied from there
+            if migrated.as_deref() == Some(value_fingerprint(&old).as_str()) {
+                let removed = legacy.update_fallback(|entries| {
+                    if entries.get(key) == Some(&old) {
                         entries.remove(key);
                         true
                     } else {
                         false
                     }
-                })?;
+                });
+                if let Err(e) = removed {
+                    tracing::warn!("Couldn't remove '{}' from {}: {}", key, legacy.fallback_path.display(), e);
+                }
             }
         }
-        match self.keyring.delete(key) {
+        match self.kr_delete(key) {
             Err(e) if e.credential_kind() == Some(Kind::Locked) => Err(e),
             _ => Ok(()),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Keyring entries, namespaced per store
+    // -----------------------------------------------------------------------
+
+    /// The keyring entry name for `key`. Entries carry this store's namespace,
+    /// so two configs with the same account id never share a keyring entry.
+    pub fn keyring_key(&self, key: &str) -> String {
+        format!("{}:{}", self.keyring_ns, key)
+    }
+
+    fn kr_get(&self, key: &str) -> Result<String> {
+        self.keyring.get(&self.keyring_key(key))
+    }
+
+    fn kr_set(&self, key: &str, secret: &str) -> Result<()> {
+        self.keyring.set(&self.keyring_key(key), secret)
+    }
+
+    fn kr_delete(&self, key: &str) -> Result<()> {
+        self.keyring.delete(&self.keyring_key(key))
     }
 
     // -----------------------------------------------------------------------
@@ -519,7 +572,7 @@ impl CredentialStore {
     fn undo_disk_copies(&self, keys: &[String]) {
         let safe: Vec<(String, String)> = keys
             .iter()
-            .filter_map(|k| self.keyring.get(k).ok().map(|v| (k.clone(), v)))
+            .filter_map(|k| self.kr_get(k).ok().map(|v| (k.clone(), v)))
             .collect();
         if safe.is_empty() {
             return;
@@ -566,13 +619,14 @@ impl CredentialStore {
         };
         let mut result = KeyringMove::default();
         let mut verified = Vec::new();
-        for (k, v) in &entries {
+        // Bookkeeping entries (`meta:…`) belong to the local store
+        for (k, v) in entries.iter().filter(|(k, _)| !k.starts_with(META_PREFIX)) {
             if result.reason.is_some() {
                 result.kept.push(k.clone());
                 continue;
             }
-            match self.keyring.set(k, v) {
-                Ok(()) if self.keyring.get(k).ok().as_ref() == Some(v) => verified.push((k.clone(), v.clone())),
+            match self.kr_set(k, v) {
+                Ok(()) if self.kr_get(k).ok().as_ref() == Some(v) => verified.push((k.clone(), v.clone())),
                 Ok(()) => {
                     result.kept.push(k.clone());
                 }
@@ -854,7 +908,7 @@ impl CredentialStore {
             Ok(None) => {}
             Err(e) => blocker = Some(e),
         }
-        match self.keyring.get(MASTER_KEY_ENTRY) {
+        match self.kr_get(MASTER_KEY_ENTRY) {
             Ok(hex_key) => match parse_key(&hex_key) {
                 Some(key) if !keys.contains(&key) => keys.push(key),
                 Some(_) => {}
@@ -883,7 +937,7 @@ impl CredentialStore {
         if let Some(key) = read_key_file(&self.key_path)? {
             return Ok(key);
         }
-        let from_keyring = self.keyring.get(MASTER_KEY_ENTRY).ok().and_then(|hex_key| parse_key(&hex_key));
+        let from_keyring = self.kr_get(MASTER_KEY_ENTRY).ok().and_then(|hex_key| parse_key(&hex_key));
         let key = from_keyring.unwrap_or_else(|| {
             let generated = Aes256Gcm::generate_key(&mut OsRng);
             let mut key = [0u8; 32];
@@ -904,7 +958,7 @@ impl CredentialStore {
             Err(e) => return Err(key_file_error(&self.key_path, e)),
         }
         if from_keyring.is_none() {
-            let _ = self.keyring.set(MASTER_KEY_ENTRY, &hex::encode(key));
+            let _ = self.kr_set(MASTER_KEY_ENTRY, &hex::encode(key));
         }
         Ok(key)
     }
@@ -1033,6 +1087,38 @@ fn decrypt_v2(file: &StoreFile, key: &[u8; 32], path: &Path) -> Result<BTreeMap<
             Ok((k.clone(), plain))
         })
         .collect()
+}
+
+/// Local-store entries that aren't secrets: which value was copied from a
+/// legacy location, and which secrets this config deleted (never read from a
+/// legacy location again).
+const META_PREFIX: &str = "meta:";
+
+fn migrated_key(key: &str) -> String {
+    format!("{}migrated:{}", META_PREFIX, key)
+}
+
+fn no_legacy_key(key: &str) -> String {
+    format!("{}deleted:{}", META_PREFIX, key)
+}
+
+fn value_fingerprint(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+/// Keyring namespace of the store at `fallback_path`: a fingerprint of its
+/// resolved folder, the same for every process using that config.
+///
+/// Releases before 0.3.0 were built without any platform keyring (only the
+/// crate's in-memory mock), so no un-namespaced entries exist to migrate.
+fn keyring_namespace(fallback_path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let absolute = std::path::absolute(fallback_path).unwrap_or_else(|_| fallback_path.to_path_buf());
+    let dir = absolute.parent().map(Path::to_path_buf).unwrap_or_default();
+    let dir = resolve_existing_prefix(&normalize_lexically(&dir));
+    let digest = Sha256::digest(dir.to_string_lossy().as_bytes());
+    format!("cfg-{}", &hex::encode(digest)[..16])
 }
 
 /// `path` with its deepest existing ancestor resolved to the real path and the

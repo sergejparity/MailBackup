@@ -122,7 +122,8 @@ settings:
 - **No keyring:** on a headless Linux machine, or with `MAILBACKUP_KEYRING=none`, passwords go to the local encrypted store instead: `.credentials_store.json` next to `config.yaml`.
 - **Locked keyring:** if the keyring is locked or refuses access, MailBackup reports that. It never quietly writes the password to disk instead.
 - **Moving into the keyring:** passwords saved by older versions are in the local store. Each one moves into the keyring the first time it's used, and the local copy is removed only after the keyring copy has been read back.
-- **Same store for every process:** the CLI, the web server and the background service use the same store for the same `config.yaml`, even with a custom `--config` path. Older CLI versions kept passwords for a custom `--config` in `~/.mailbackup`; they're still found there and copied over.
+- **Separate per config:** each config's keyring entries are named after its folder, so two configs with the same account ID never overwrite each other.
+- **Same store for every process:** the CLI, the web server and the background service use the same store for the same `config.yaml`, even with a custom `--config` path. Older CLI versions kept passwords for a custom `--config` in `~/.mailbackup`; they're still found there and copied over. Removing the account also removes that copy, and a removed password is never read from there again.
 
 **Local credential store:** each password is encrypted with AES-256-GCM.
 - **Key:** by default, a random key in `.credentials_key`. If `MAILBACKUP_MASTER_KEY` is set, the key is derived from that passphrase with Argon2id, using a random salt stored in the file.
@@ -138,7 +139,7 @@ settings:
 The service starts at boot, before anyone logs in, when the keyring is locked or not there yet. So turning it on moves the passwords into the local encrypted store:
 - **Turning it on:** all passwords and their server bindings are copied to the local store and read back, the way the service will read them, before the service is installed. If the install fails, the copies are removed again, but only those the keyring still holds.
 - **While it's on:** new passwords are saved to the local store.
-- **Turning it off:** the service is removed and confirmed gone, then the passwords move back into the keyring. Each one is read back before its local copy is removed. Any the keyring can't take (none available, or locked) stay in the local store.
+- **Turning it off:** the service is removed and confirmed gone, then the passwords move back into the keyring. Each one is read back before its local copy is removed. Any the keyring can't take (none available, or locked) stay in the local store, and that copy keeps winning over an older keyring value until it has been moved.
 - A store protected by `MAILBACKUP_MASTER_KEY` can't be used by the service, which doesn't receive that variable. Enabling the service is refused until it's unset.
 
 Installing and removing still ask for administrator authorization once, because the definitions live in system folders. On Linux this can be up to three prompts.
