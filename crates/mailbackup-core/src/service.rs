@@ -228,7 +228,7 @@ pub fn xml_escape(value: &str) -> String {
 
 /// Service logs live next to the config (not in the installing process's home,
 /// which is root's when an old root service performs the migration).
-fn service_log_paths(config_path: &Path) -> (PathBuf, PathBuf) {
+pub(crate) fn service_log_paths(config_path: &Path) -> (PathBuf, PathBuf) {
     let base = config_path.parent().map(Path::to_path_buf).unwrap_or_else(crate::config::default_base_dir);
     let log_dir = base.join("logs");
     (log_dir.join("service.log"), log_dir.join("service_err.log"))

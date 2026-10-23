@@ -175,29 +175,126 @@ pub fn copy(src: &Path, dst: &Path) -> io::Result<u64> {
 /// Removes group/other access from one existing path that MailBackup has
 /// identified as its own. Nothing happens to missing paths, symlinks (never
 /// followed) or paths owned by another user. Returns whether the mode changed.
+///
+/// The last component is opened without following symlinks, and the checks
+/// and the change go through that one handle, so a symlink swapped in at any
+/// moment is never followed. See [`restrict_beneath`] for whole paths.
 pub fn restrict(path: &Path) -> io::Result<bool> {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+            restrict_beneath(parent, Path::new(name))
+        }
+        _ => restrict_beneath(path, Path::new("")),
+    }
+}
+
+/// [`restrict`] for `anchor/rel`, where no component of `rel` may be a
+/// symlink: each folder is opened relative to the previous one with
+/// `O_NOFOLLOW`, so swapping a folder for a symlink can't redirect the change
+/// outside `anchor`. The anchor itself (a folder from the configuration) is
+/// trusted; an empty `rel` restricts the anchor, which must not be a symlink.
+pub fn restrict_beneath(anchor: &Path, rel: &Path) -> io::Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let meta = match std::fs::symlink_metadata(path) {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        let mut names = Vec::new();
+        for component in rel.components() {
+            match component {
+                std::path::Component::Normal(name) => names.push(name.to_os_string()),
+                std::path::Component::CurDir => {}
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("'{}' must be a relative path inside the folder", rel.display()),
+                    ))
+                }
+            }
+        }
+        let file = match nofollow::open_beneath(anchor, &names) {
+            Ok(Some(file)) => file,
+            Ok(None) => return Ok(false),
+            Err(e) if nofollow::is_skippable(&e) => return Ok(false),
             Err(e) => return Err(e),
         };
-        if meta.file_type().is_symlink() || meta.uid() != effective_uid() {
+        let meta = file.metadata()?;
+        let file_type = meta.file_type();
+        if !(file_type.is_file() || file_type.is_dir()) || meta.uid() != effective_uid() {
             return Ok(false);
         }
-        let mode = meta.permissions().mode() & 0o7777;
+        let mode = meta.mode() & 0o7777;
         if mode & GROUP_OTHER == 0 {
             return Ok(false);
         }
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !GROUP_OTHER))?;
+        // fchmod on the handle that was checked
+        file.set_permissions(std::fs::Permissions::from_mode(mode & !GROUP_OTHER))?;
         Ok(true)
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = (anchor, rel);
         Ok(false)
+    }
+}
+
+#[cfg(unix)]
+mod nofollow {
+    use std::ffi::{CString, OsString};
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+
+    /// Missing, a symlink, not a folder where one is expected, or unreadable:
+    /// nothing to tighten.
+    pub fn is_skippable(e: &io::Error) -> bool {
+        matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied)
+            || matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK) | Some(libc::ENOTDIR))
+    }
+
+    /// Opens `anchor/names…` without following a symlink in any of `names`
+    /// (or in `anchor` itself when `names` is empty). `Ok(None)` for anything
+    /// but a regular file or folder, which is never opened (FIFOs, devices).
+    pub fn open_beneath(anchor: &Path, names: &[OsString]) -> io::Result<Option<File>> {
+        let leaf_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        let Some((last, folders)) = names.split_last() else {
+            let meta = std::fs::symlink_metadata(anchor)?;
+            if !(meta.is_file() || meta.is_dir()) {
+                return Ok(None);
+            }
+            return std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(anchor).map(Some);
+        };
+        let mut dir = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(anchor)?;
+        for name in folders {
+            dir = openat(&dir, name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)?;
+        }
+        let c_last = c_name(last)?;
+        // SAFETY: zeroed stat is a valid out-parameter; the fd and name are valid.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatat(dir.as_raw_fd(), c_last.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let kind = st.st_mode & libc::S_IFMT;
+        if kind != libc::S_IFREG && kind != libc::S_IFDIR {
+            return Ok(None);
+        }
+        openat(&dir, last, leaf_flags).map(Some)
+    }
+
+    fn openat(dir: &File, name: &OsString, flags: libc::c_int) -> io::Result<File> {
+        let c = c_name(name)?;
+        // SAFETY: valid directory fd and NUL-terminated name; the new fd is owned by the File.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn c_name(name: &OsString) -> io::Result<CString> {
+        CString::new(name.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in file name"))
     }
 }
 
@@ -232,70 +329,132 @@ fn temp_path_for(path: &Path) -> io::Result<PathBuf> {
     Ok(path.with_file_name(temp_name))
 }
 
-/// The existing paths tightened at startup: exactly MailBackup's own files
-/// (see [`crate::service::ownership_candidates`]: the config, the credential
-/// store and key, the service logs, the catalog with its `-wal`/`-shm`/`-journal`
-/// files, and archive entries matching MailBackup's exact layout), plus the app
-/// folder `~/.mailbackup`, its `logs` folder and the event logs in it.
-///
-/// Never included: a custom config folder, the folder holding a custom
-/// `db_path`, or a data folder that holds anything but MailBackup's archive.
-/// Ownership alone doesn't make a folder MailBackup's.
-pub fn startup_candidates(config_path: &Path) -> Vec<PathBuf> {
-    startup_candidates_in(config_path, &crate::config::default_base_dir())
+/// An existing path to tighten: `rel` inside the folder `anchor`, opened
+/// without following symlinks below `anchor` (see [`restrict_beneath`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Target {
+    pub anchor: PathBuf,
+    pub rel: PathBuf,
 }
 
-/// [`startup_candidates`] with the app folder given explicitly.
-pub fn startup_candidates_in(config_path: &Path, base: &Path) -> Vec<PathBuf> {
-    let mut paths = crate::service::ownership_candidates(config_path);
-    let base = base.to_path_buf();
-    let log_dir = base.join("logs");
-    if let Ok(entries) = std::fs::read_dir(&log_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("events") && name.ends_with(".log") {
-                paths.push(entry.path());
+impl Target {
+    fn new(anchor: &Path, rel: impl Into<PathBuf>) -> Self {
+        Self { anchor: anchor.to_path_buf(), rel: rel.into() }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.anchor.join(&self.rel)
+    }
+}
+
+/// MailBackup's sensitive files and its own folders: a short, fixed list
+/// tightened synchronously at startup.
+/// - next to the config: `config.yaml`, the credential store and key, the
+///   service logs;
+/// - the catalog and its `-wal`/`-shm`/`-journal` files;
+/// - the app folder (`~/.mailbackup`), the store and key the CLI keeps there,
+///   its `logs` folder and the `events*.log` files in it.
+///
+/// Never included: a custom config folder, the folder holding a custom
+/// `db_path`, or anything else that merely sits next to these files.
+pub fn sensitive_targets(config_path: &Path) -> Vec<Target> {
+    sensitive_targets_in(config_path, &crate::config::default_base_dir())
+}
+
+/// [`sensitive_targets`] with the app folder given explicitly.
+pub fn sensitive_targets_in(config_path: &Path, base: &Path) -> Vec<Target> {
+    const STORE_FILES: [&str; 3] = [".credentials_store.json", "credentials_store.json", ".credentials_key"];
+    let mut targets = Vec::new();
+    if let (Some(dir), Some(name)) = (config_path.parent(), config_path.file_name()) {
+        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        targets.push(Target::new(dir, name));
+        targets.extend(STORE_FILES.iter().map(|f| Target::new(dir, f)));
+        let (out_log, err_log) = crate::service::service_log_paths(config_path);
+        for log in [out_log, err_log] {
+            if let Ok(rel) = log.strip_prefix(dir) {
+                targets.push(Target::new(dir, rel));
             }
         }
     }
-    paths.push(log_dir);
-    paths.push(base);
-    paths.sort();
-    paths.dedup();
-    paths
+    if let Some(cfg) = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| serde_yaml::from_str::<crate::config::AppConfig>(&text).ok())
+    {
+        if let (Some(dir), Some(name)) = (cfg.db_path.parent(), cfg.db_path.file_name()) {
+            let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+            let name = name.to_string_lossy();
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                targets.push(Target::new(dir, format!("{}{}", name, suffix)));
+            }
+        }
+    }
+    targets.push(Target::new(base, ""));
+    targets.extend(STORE_FILES.iter().map(|f| Target::new(base, f)));
+    targets.push(Target::new(base, "logs"));
+    if let Ok(entries) = std::fs::read_dir(base.join("logs")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("events") && name.ends_with(".log") {
+                targets.push(Target::new(base, Path::new("logs").join(name)));
+            }
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
-/// Tightens [`startup_candidates`] that are ours and still open to others.
-/// Returns how many paths were changed; per-path failures are skipped.
-pub fn tighten_existing(config_path: &Path) -> usize {
-    tighten(&startup_candidates(config_path))
+/// Archive entries that follow MailBackup's exact layout
+/// ([`crate::service::archive_entries`]); the data folder itself only if it
+/// holds nothing else. Walking a large archive takes a while.
+pub fn archive_targets(config_path: &Path) -> Vec<Target> {
+    let Some(cfg) = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| serde_yaml::from_str::<crate::config::AppConfig>(&text).ok())
+    else {
+        return Vec::new();
+    };
+    let data_dir = cfg.data_dir;
+    crate::service::archive_entries(&data_dir)
+        .into_iter()
+        .filter_map(|p| p.strip_prefix(&data_dir).ok().map(|rel| Target::new(&data_dir, rel)))
+        .collect()
 }
 
-/// [`restrict`]s each path; returns how many changed. Failures are skipped.
-pub fn tighten(paths: &[PathBuf]) -> usize {
-    paths
+/// [`restrict_beneath`]s each target; returns how many changed. Failures are skipped.
+pub fn tighten(targets: &[Target]) -> usize {
+    targets
         .iter()
-        .filter(|p| restrict(p).unwrap_or(false))
+        .filter(|t| restrict_beneath(&t.anchor, &t.rel).unwrap_or(false))
         .count()
 }
 
-/// Runs [`tighten_existing`] on a background thread, unless the user turned it
-/// off with `settings.tighten_permissions: false`. Walking a large archive takes
-/// a moment, so startup doesn't wait for it.
-pub fn tighten_existing_in_background(config_path: &Path, settings: &crate::config::GlobalSettings) {
+/// Startup tightening of existing files, unless the user turned it off with
+/// `settings.tighten_permissions: false`:
+/// - the [`sensitive_targets`] synchronously, so they're private before this
+///   returns, even for a CLI command that exits right away;
+/// - with `include_archive`, the [`archive_targets`] on a background thread
+///   (for long-running processes: the server and the daemon).
+pub fn tighten_at_startup(config_path: &Path, settings: &crate::config::GlobalSettings, include_archive: bool) {
     if !cfg!(unix) || !settings.tighten_permissions {
         return;
     }
-    let config_path = config_path.to_path_buf();
-    let _ = std::thread::Builder::new().name("tighten-permissions".into()).spawn(move || {
-        let changed = tighten_existing(&config_path);
-        if changed > 0 {
-            crate::event_log::log_event(
-                "PERMISSIONS_TIGHTENED",
-                &format!("Removed other users' access from {} MailBackup files and folders", changed),
-            );
-        }
-    });
+    log_tightened(tighten(&sensitive_targets(config_path)));
+    if include_archive {
+        let config_path = config_path.to_path_buf();
+        let _ = std::thread::Builder::new()
+            .name("tighten-archive".into())
+            .spawn(move || log_tightened(tighten(&archive_targets(&config_path))));
+    }
+}
+
+fn log_tightened(changed: usize) {
+    if changed > 0 {
+        crate::event_log::log_event(
+            "PERMISSIONS_TIGHTENED",
+            &format!("Removed other users' access from {} MailBackup files and folders", changed),
+        );
+    }
 }
 
 #[cfg(all(test, unix))]

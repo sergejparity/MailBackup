@@ -135,11 +135,11 @@ A service installed by version 0.2.12 or earlier runs with administrator rights.
 
 **Files on disk are private to your user account (Linux/macOS).** MailBackup creates its folders as `0700` and its files as `0600`: the archived mail, the catalog database with its `-wal`/`-shm` files, `config.yaml`, the credential store, the event logs and `.mbox` exports. Existing folders it writes into, such as Documents or a custom database folder, are left as they are.
 
-At startup, files left readable by older versions are tightened too. Only MailBackup's own paths are changed:
+At startup, files left readable by older versions are tightened too: the sensitive files below before any command runs, and the archive in the background by the server and `mailbackup daemon`. Only MailBackup's own paths are changed:
 - the config, the credential store and key, the catalog and its sidecar files, `~/.mailbackup` and its logs;
 - archive entries that follow MailBackup's exact layout. A data folder that also holds other files keeps its own permissions, but the archive inside it is tightened.
 
-Only files you own are changed, and symlinks are never followed. To share an archive with a group on purpose, set `settings.tighten_permissions: false` and manage the permissions yourself; new files are still created owner-only. On Windows, the permissions of your user profile folder apply.
+Only files you own are changed, and symlinks are never followed, not even one swapped in while MailBackup is working. To share an archive with a group on purpose, set `settings.tighten_permissions: false` and manage the permissions yourself; new files are still created owner-only. On Windows, the permissions of your user profile folder apply.
 
 ### 4. Running the Desktop GUI
 
