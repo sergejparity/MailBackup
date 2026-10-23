@@ -11,7 +11,9 @@ use std::collections::HashMap;
 
 /// Largest single image inlined as a `data:` URI.
 pub const MAX_INLINE_IMAGE_BYTES: usize = 5 * 1024 * 1024;
-/// Largest total of inlined images per message.
+/// Largest total of inlined image data per message, counted for every
+/// reference: an image referenced twice counts twice, so the generated HTML
+/// stays bounded however often a mail repeats a reference.
 pub const MAX_INLINE_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 
 /// `html` with `cid:` references to `message`'s image parts replaced by
@@ -47,7 +49,8 @@ pub fn inline_cid_images(html: &str, message: &Message) -> String {
 fn inline_with<'a>(html: &str, lookup: impl Fn(&str) -> Option<(&'a str, &'a [u8])>) -> String {
     let mut out = String::with_capacity(html.len());
     let mut total = 0usize;
-    let mut encoded: HashMap<String, String> = HashMap::new();
+    // id -> (data: URI, size of the image it holds)
+    let mut encoded: HashMap<String, (String, usize)> = HashMap::new();
     let mut rest = html;
     while let Some(pos) = find_cid(rest) {
         out.push_str(&rest[..pos]);
@@ -57,21 +60,19 @@ fn inline_with<'a>(html: &str, lookup: impl Fn(&str) -> Option<(&'a str, &'a [u8
             .unwrap_or(after.len());
         let raw_id = &after[..end];
         let id = percent_decode(raw_id);
-        let replacement = match encoded.get(&id) {
-            Some(uri) => Some(uri.clone()),
-            None => lookup(&id).and_then(|(mime, bytes)| {
-                if bytes.len() > MAX_INLINE_IMAGE_BYTES || total + bytes.len() > MAX_INLINE_TOTAL_BYTES {
-                    return None;
-                }
-                total += bytes.len();
+        if !encoded.contains_key(&id) {
+            if let Some((mime, bytes)) = lookup(&id).filter(|(_, b)| b.len() <= MAX_INLINE_IMAGE_BYTES) {
                 let uri = format!("data:{};base64,{}", mime, base64::engine::general_purpose::STANDARD.encode(bytes));
-                encoded.insert(id.clone(), uri.clone());
-                Some(uri)
-            }),
-        };
-        match replacement {
-            Some(uri) => out.push_str(&uri),
-            None => out.push_str(&rest[pos..pos + 4 + end]),
+                encoded.insert(id.clone(), (uri, bytes.len()));
+            }
+        }
+        // Every reference, repeated ones included, is charged to the budget
+        match encoded.get(&id) {
+            Some((uri, size)) if total + size <= MAX_INLINE_TOTAL_BYTES => {
+                total += size;
+                out.push_str(uri);
+            }
+            _ => out.push_str(&rest[pos..pos + 4 + end]),
         }
         rest = &after[end..];
     }
@@ -165,8 +166,21 @@ mod tests {
         let chunk = vec![1u8; MAX_INLINE_IMAGE_BYTES * 9 / 10];
         let html = r#"<img src="cid:a"><img src="cid:b"><img src="cid:c"><img src="cid:d"><img src="cid:e"><img src="cid:a">"#;
         let out = inline_with(html, |_| Some(("image/png", chunk.as_slice())));
-        assert_eq!(out.matches("data:image/png").count(), 5, "a (twice, encoded once), b, c, d");
+        assert_eq!(out.matches("data:image/png").count(), 4, "a, b, c, d");
         assert!(out.contains(r#"src="cid:e""#), "over the total");
+        assert!(out.ends_with(r#"<img src="cid:a">"#), "a repeated reference counts toward the total too");
+    }
+
+    #[test]
+    fn many_references_to_one_image_stay_bounded() {
+        let image = vec![7u8; MAX_INLINE_IMAGE_BYTES];
+        let html = r#"<img src="cid:one">"#.repeat(1000);
+        let out = inline_with(&html, |_| Some(("image/png", image.as_slice())));
+        let inlined = out.matches("data:image/png").count();
+        assert_eq!(inlined, MAX_INLINE_TOTAL_BYTES / MAX_INLINE_IMAGE_BYTES);
+        // Output stays within the budget (base64 is 4/3 of the raw size) plus the original HTML
+        assert!(out.len() <= MAX_INLINE_TOTAL_BYTES / 3 * 4 + 64 * inlined + html.len(), "{} bytes", out.len());
+        assert_eq!(out.matches(r#"src="cid:one""#).count(), 1000 - inlined);
     }
 
     #[test]
