@@ -30,6 +30,7 @@ rustls-pki-types.workspace = true
 webpki-roots.workspace = true
 futures-util.workspace = true
 aes-gcm.workspace = true
+argon2.workspace = true
 csv.workspace = true
 
 [target.'cfg(unix)'.dependencies]

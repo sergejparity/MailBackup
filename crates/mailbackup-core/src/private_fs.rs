@@ -74,18 +74,125 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     if std::fs::symlink_metadata(path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
         return write(path, data);
     }
+    write_atomic_verified(path, data, |_| Ok(()))
+}
+
+/// [`write_atomic`] that runs `verify` on the fully written temp file before
+/// it replaces `path`. If writing or verifying fails, `path` is untouched and
+/// the temp file is removed. Symlinked targets are replaced, not followed.
+pub fn write_atomic_verified(
+    path: &Path,
+    data: &[u8],
+    verify: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let temp = temp_path_for(path)?;
     let result = (|| {
         let mut file = options().write(true).create_new(true).open(&temp)?;
         file.write_all(data)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temp, path)
+        verify(&temp)?;
+        std::fs::rename(&temp, path)?;
+        sync_parent(path);
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+/// Creates `path` with `data` only if it doesn't exist yet, and never leaves a
+/// partially written file at `path`: the data is written and flushed to a temp
+/// file first, then hard-linked into place, which fails with `AlreadyExists`
+/// if another writer got there first. If writing the temp file fails, `path`
+/// is never created.
+///
+/// On file systems without hard links (FAT/exFAT) the complete temp file is
+/// renamed into place if `path` is still missing. That check isn't atomic, so
+/// there exclusivity relies on the caller's lock (the credential store holds
+/// its writers' lock while creating the key file); the file is still never
+/// partial.
+pub fn create_new_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    create_new_atomic_with(path, data, |file, data| file.write_all(data), |temp, path| std::fs::hard_link(temp, path))
+}
+
+fn create_new_atomic_with(
+    path: &Path,
+    data: &[u8],
+    write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let temp = temp_path_for(path)?;
+    let result = (|| {
+        let mut file = options().write(true).create_new(true).open(&temp)?;
+        write(&mut file, data)?;
+        file.sync_all()?;
+        drop(file);
+        match link(&temp, path) {
+            Err(e) if links_unsupported(&e) => {
+                if std::fs::symlink_metadata(path).is_ok() {
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("'{}' exists", path.display())));
+                }
+                std::fs::rename(&temp, path)
+            }
+            other => other,
+        }
+    })();
+    let _ = std::fs::remove_file(&temp);
+    result?;
+    sync_parent(path);
+    Ok(())
+}
+
+/// The file system can't hard-link (FAT/exFAT report EPERM or "unsupported").
+fn links_unsupported(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EOPNOTSUPP)) {
+        return true;
+    }
+    #[cfg(windows)]
+    if e.raw_os_error() == Some(1) {
+        return true; // ERROR_INVALID_FUNCTION
+    }
+    false
+}
+
+/// Temp files left next to `path` by an interrupted [`write_atomic`] (a crash
+/// between writing and renaming). Only safe to delete while holding whatever
+/// lock serializes writers of `path`.
+pub fn stale_temp_files(path: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return Vec::new() };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let prefix = format!(".{}.", name.to_string_lossy());
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    n.starts_with(&prefix) && n.ends_with(".tmp")
+                })
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Flushes the rename/link of `path` itself to disk (best effort, unix).
+fn sync_parent(path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let dir = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+        if let Ok(dir) = File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Copies `src` to `dst`. Unlike `std::fs::copy`, which gives the copy the
@@ -469,6 +576,51 @@ mod tests {
         write_atomic(&link, b"via link").unwrap();
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read(&real).unwrap(), b"via link");
+    }
+
+    #[test]
+    fn create_new_atomic_never_leaves_a_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("key");
+        // The write fails halfway (disk full, file size limit)
+        let err = create_new_atomic_with(
+            &path,
+            &[7u8; 64],
+            |file, data| {
+                file.write_all(&data[..16])?;
+                Err(io::Error::other("disk full"))
+            },
+            |temp, path| std::fs::hard_link(temp, path),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "disk full");
+        assert!(!path.exists(), "no destination after a failed write");
+        assert!(stale_temp_files(&path).is_empty());
+
+        // Afterwards the key can be created normally
+        create_new_atomic(&path, &[7u8; 64]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; 64]);
+    }
+
+    #[test]
+    fn create_new_atomic_without_hard_links_renames_a_complete_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("key");
+        let no_links = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(libc::EPERM));
+        create_new_atomic_with(&path, &[1u8; 64], |f, d| f.write_all(d), no_links).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1u8; 64]);
+        assert_eq!(mode(&path), 0o600);
+
+        let err = create_new_atomic_with(&path, &[2u8; 64], |f, d| f.write_all(d), no_links).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1u8; 64], "the existing key is kept");
+        assert!(stale_temp_files(&path).is_empty());
+
+        // Other link errors are reported, not worked around
+        let other = tmp.path().join("other");
+        let err = create_new_atomic_with(&other, b"x", |f, d| f.write_all(d), |_, _| Err(io::Error::other("io"))).unwrap_err();
+        assert_eq!(err.to_string(), "io");
+        assert!(!other.exists());
     }
 
     #[test]
