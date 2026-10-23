@@ -1,5 +1,6 @@
 // Browser test for issue #8: opening an HTML mail must not contact any remote
-// server until "Load remote content" is clicked.
+// server until "Load remote content" is clicked. Also checks (issue #10) that
+// the UI itself loads nothing but the local server's files.
 //
 // Needs Node 18+, Playwright and a Chromium for it, and a built server:
 //   cargo build -p mailbackup-server
@@ -71,8 +72,20 @@ for (let i = 0; ; i++) {
 const browser = await chromium.launch();
 try {
   const page = await browser.newPage();
+  const pageRequests = [];
+  page.on('request', (req) => pageRequests.push(req.url()));
   await page.goto(appUrl);
   await page.waitForFunction(() => typeof selectMessage === 'function');
+  await page.evaluate(() => document.fonts.ready);
+
+  // Issue #10: the UI itself only talks to the local server (bundled fonts)
+  const external = pageRequests.filter((u) => !u.startsWith(appUrl) && !u.startsWith('data:'));
+  check(external.length === 0, `loading the UI makes no external requests (got ${JSON.stringify(external)})`);
+  const fontsOk = await page.evaluate(() =>
+    ['400 12px "Plus Jakarta Sans"', '700 12px "Plus Jakarta Sans"', '400 12px "JetBrains Mono"'].every((f) => document.fonts.check(f)),
+  );
+  const fontLoads = pageRequests.filter((u) => u.includes('/fonts/') && u.endsWith('.woff2'));
+  check(fontsOk && fontLoads.length > 0, `bundled fonts load from the server (${fontLoads.length} font files)`);
   tracker.connections = 0;
   tracker.requests = [];
 
