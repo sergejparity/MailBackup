@@ -11,6 +11,7 @@ use mailbackup_core::mbox::MboxExporter;
 use mailbackup_core::retention::RetentionManager;
 use mailbackup_core::scheduler::BackupScheduler;
 use mailbackup_core::storage::StorageEngine;
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -99,8 +100,17 @@ struct AddAccountArgs {
     port: Option<u16>,
     #[arg(long)]
     username: Option<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Deprecated: visible to other users in the process list and kept in shell history; use --password-stdin or MAILBACKUP_PASSWORD"
+    )]
     password: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "password",
+        help = "Read the password from stdin (one line, at most 4 KiB); every other setting must then be given as a flag"
+    )]
+    password_stdin: bool,
     #[arg(long)]
     schedule: Option<String>,
     #[arg(long)]
@@ -208,6 +218,90 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Longest password read from stdin, counting its line ending.
+const MAX_STDIN_PASSWORD_BYTES: usize = 4096;
+const PASSWORD_ENV: &str = "MAILBACKUP_PASSWORD";
+
+/// The flags `account add` would otherwise prompt for, plus the password when
+/// no source gives it.
+fn missing_add_flags(args: &AddAccountArgs) -> Vec<&'static str> {
+    let mut missing: Vec<&'static str> = [
+        ("--provider", args.provider.is_none()),
+        ("--email", args.email.is_none()),
+        ("--name", args.name.is_none()),
+        ("--server", args.server.is_none()),
+        ("--port", args.port.is_none()),
+        ("--username", args.username.is_none()),
+        ("--retention-days", args.retention_days.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(flag, absent)| absent.then_some(flag))
+    .collect();
+    if !args.password_stdin && args.password.is_none() && std::env::var_os(PASSWORD_ENV).is_none() {
+        missing.push("a password (--password-stdin or MAILBACKUP_PASSWORD)");
+    }
+    missing
+}
+
+/// The password from `--password-stdin`, `--password` or `MAILBACKUP_PASSWORD`,
+/// in that order; `None` means prompt for it. A source that is given but
+/// invalid is an error, never a fall-through to the next one.
+fn resolve_password(args: &AddAccountArgs) -> Result<Option<String>> {
+    if args.password_stdin {
+        return read_password(std::io::stdin().lock()).map(Some);
+    }
+    if let Some(password) = &args.password {
+        eprintln!(
+            "{} --password is deprecated: other users can see it in the process list, and it stays in your shell history. \
+             Use --password-stdin or MAILBACKUP_PASSWORD instead.",
+            WARN_EMOJI
+        );
+        return check_password(password.clone(), "--password").map(Some);
+    }
+    match std::env::var_os(PASSWORD_ENV) {
+        None => Ok(None),
+        Some(value) => {
+            let value = value.into_string().map_err(|_| anyhow::anyhow!("{} is not valid UTF-8", PASSWORD_ENV))?;
+            let password = check_password(value, PASSWORD_ENV)?;
+            eprintln!("Using the password from {}", PASSWORD_ENV);
+            Ok(Some(password))
+        }
+    }
+}
+
+/// One line of `input`: at most [`MAX_STDIN_PASSWORD_BYTES`] including one
+/// final `\n` or `\r\n`, which is removed. Anything else is kept as typed.
+fn read_password(input: impl Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    input
+        .take(MAX_STDIN_PASSWORD_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("could not read the password from stdin")?;
+    if bytes.len() > MAX_STDIN_PASSWORD_BYTES {
+        bail!("the password on stdin is longer than {} bytes", MAX_STDIN_PASSWORD_BYTES);
+    }
+    let mut text = String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("the password on stdin is not valid UTF-8"))?;
+    if text.ends_with("\r\n") {
+        text.truncate(text.len() - 2);
+    } else if text.ends_with('\n') {
+        text.truncate(text.len() - 1);
+    }
+    check_password(text, "stdin")
+}
+
+fn check_password(password: String, source: &str) -> Result<String> {
+    if password.is_empty() {
+        bail!("the password from {} is empty", source);
+    }
+    if password.contains(['\r', '\n']) {
+        bail!("the password from {} spans more than one line", source);
+    }
+    if password.len() > MAX_STDIN_PASSWORD_BYTES {
+        bail!("the password from {} is longer than {} bytes", source, MAX_STDIN_PASSWORD_BYTES);
+    }
+    Ok(password)
+}
+
 fn handle_account_add(
     config: &mut AppConfig,
     config_path: Option<&std::path::Path>,
@@ -215,6 +309,19 @@ fn handle_account_add(
     args: AddAccountArgs,
 ) -> Result<()> {
     println!("\n{} {}", MAIL_EMOJI, style("Add Email Account").bold());
+
+    // Prompts read from stdin, so they can't share it with the password, and
+    // without a terminal there is nobody to answer them
+    let interactive = !args.password_stdin && std::io::stdin().is_terminal();
+    if !interactive {
+        let missing = missing_add_flags(&args);
+        if !missing.is_empty() {
+            bail!("missing {} (there is no terminal to prompt for them)", missing.join(", "));
+        }
+    }
+    // Resolved before anything is prompted for or saved, so invalid input
+    // changes nothing
+    let given_password = resolve_password(&args)?;
 
     let provider_choice = if let Some(p) = args.provider {
         match p.to_lowercase().as_str() {
@@ -272,7 +379,7 @@ fn handle_account_add(
         None => Input::new().with_prompt("IMAP Username").default(email.clone()).interact_text()?,
     };
 
-    let password = match args.password {
+    let password = match given_password {
         Some(p) => p,
         None => Password::new().with_prompt("Password / App Password").interact()?,
     };
@@ -680,4 +787,42 @@ async fn handle_daemon(
     tokio::signal::ctrl_c().await?;
     println!("\nReceived shutdown signal. Exiting gracefully...");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read(input: &[u8]) -> Result<String> {
+        read_password(input)
+    }
+
+    #[test]
+    fn one_line_ending_is_removed_and_everything_else_kept() {
+        assert_eq!(read(b"secret\n").unwrap(), "secret");
+        assert_eq!(read(b"secret\r\n").unwrap(), "secret");
+        assert_eq!(read(b"secret").unwrap(), "secret");
+        assert_eq!(read(b"  pass word \t\n").unwrap(), "  pass word \t");
+    }
+
+    #[test]
+    fn empty_and_multi_line_input_is_rejected() {
+        for input in [&b""[..], b"\n", b"\r\n", b"secret\n\n", b"secret\r\n\r\n", b"a\nb", b"a\rb\n", b"secret\r"] {
+            assert!(read(input).is_err(), "{:?}", String::from_utf8_lossy(input));
+        }
+        assert!(read(b"\xff\xfe\n").is_err(), "not UTF-8");
+    }
+
+    #[test]
+    fn the_limit_counts_the_line_ending() {
+        let max = MAX_STDIN_PASSWORD_BYTES;
+        assert_eq!(read(&vec![b'x'; max]).unwrap().len(), max);
+        let mut with_newline = vec![b'x'; max - 1];
+        with_newline.push(b'\n');
+        assert_eq!(read(&with_newline).unwrap().len(), max - 1);
+        with_newline.insert(0, b'x');
+        assert!(read(&with_newline).is_err(), "limit + 1 with the newline");
+        assert!(read(&vec![b'x'; max + 1]).is_err());
+        assert!(read(&vec![b'x'; 10 * max]).is_err(), "rejected, not truncated");
+    }
 }
