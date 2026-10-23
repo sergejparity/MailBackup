@@ -75,6 +75,28 @@ cargo run -p mailbackup-cli -- daemon
 cargo run -p mailbackup-cli -- serve --port 8765
 ```
 
+#### Scripted account setup
+
+Without a terminal, `account add` can't prompt. Give every setting as a flag and pass the password in one of two ways. Neither way puts it on the command line, where other users could see it in the process list and where it would stay in your shell history.
+
+```bash
+# From stdin: a file, a secret manager, or anything else that prints it
+mailbackup account add --id work --name Work --email me@example.com --provider generic \
+  --server imap.example.com --port 993 --username me@example.com --retention-days 0 \
+  --password-stdin < ~/.secrets/imap-work
+pass show mail/work | mailbackup account add ... --password-stdin
+
+# From the environment (read -s keeps the password off the screen and out of history)
+read -rs MAILBACKUP_PASSWORD && export MAILBACKUP_PASSWORD
+mailbackup account add ...
+unset MAILBACKUP_PASSWORD
+```
+
+- `--password-stdin` reads one line of at most 4 KiB. A final newline is removed, and empty or multi-line input is rejected.
+- `MAILBACKUP_PASSWORD` is used only when neither `--password-stdin` nor `--password` is given. The CLI prints a notice on stderr when it uses the variable.
+- If any setting is missing, the CLI names all the missing flags at once and saves nothing.
+- `--password <PW>` still works but is deprecated, for the reason above.
+
 ### 3. Launching the Web Studio
 
 ```bash
