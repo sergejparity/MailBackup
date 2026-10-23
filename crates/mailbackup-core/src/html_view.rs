@@ -60,19 +60,30 @@ fn inline_with<'a>(html: &str, lookup: impl Fn(&str) -> Option<(&'a str, &'a [u8
             .unwrap_or(after.len());
         let raw_id = &after[..end];
         let id = percent_decode(raw_id);
-        if !encoded.contains_key(&id) {
-            if let Some((mime, bytes)) = lookup(&id).filter(|(_, b)| b.len() <= MAX_INLINE_IMAGE_BYTES) {
-                let uri = format!("data:{};base64,{}", mime, base64::engine::general_purpose::STANDARD.encode(bytes));
-                encoded.insert(id.clone(), (uri, bytes.len()));
-            }
-        }
-        // Every reference, repeated ones included, is charged to the budget
-        match encoded.get(&id) {
-            Some((uri, size)) if total + size <= MAX_INLINE_TOTAL_BYTES => {
+        // Keyed like the lookup, so case variants of one id share an entry and
+        // the cache never holds more than one copy per image part
+        let key = normalize_content_id(&id);
+        // Every reference, repeated ones included, is charged to the budget,
+        // and an image is only encoded once a reference to it fits
+        let replacement = match encoded.get(&key) {
+            Some((uri, size)) => (total + size <= MAX_INLINE_TOTAL_BYTES).then(|| {
                 total += size;
-                out.push_str(uri);
-            }
-            _ => out.push_str(&rest[pos..pos + 4 + end]),
+                uri.as_str()
+            }),
+            None => match lookup(&id) {
+                Some((mime, bytes))
+                    if bytes.len() <= MAX_INLINE_IMAGE_BYTES && total + bytes.len() <= MAX_INLINE_TOTAL_BYTES =>
+                {
+                    total += bytes.len();
+                    let uri = format!("data:{};base64,{}", mime, base64::engine::general_purpose::STANDARD.encode(bytes));
+                    Some(encoded.entry(key).or_insert((uri, bytes.len())).0.as_str())
+                }
+                _ => None,
+            },
+        };
+        match replacement {
+            Some(uri) => out.push_str(uri),
+            None => out.push_str(&rest[pos..pos + 4 + end]),
         }
         rest = &after[end..];
     }
@@ -169,6 +180,46 @@ mod tests {
         assert_eq!(out.matches("data:image/png").count(), 4, "a, b, c, d");
         assert!(out.contains(r#"src="cid:e""#), "over the total");
         assert!(out.ends_with(r#"<img src="cid:a">"#), "a repeated reference counts toward the total too");
+    }
+
+    #[test]
+    fn case_variants_of_one_id_share_one_cached_copy() {
+        let image = vec![7u8; MAX_INLINE_IMAGE_BYTES];
+        // 1,000 differently cased spellings of the same Content-ID
+        let html: String = (0..1000)
+            .map(|i| {
+                let id: String = format!("logo{}", "x".repeat(10))
+                    .chars()
+                    .enumerate()
+                    .map(|(j, c)| if (i >> (j % 10)) & 1 == 1 { c.to_ascii_uppercase() } else { c })
+                    .collect();
+                format!(r#"<img src="cid:{}">"#, id)
+            })
+            .collect();
+        let encodings = std::cell::Cell::new(0);
+        let out = inline_with(&html, |id| {
+            (normalize_content_id(id) == "logoxxxxxxxxxx").then(|| {
+                encodings.set(encodings.get() + 1);
+                ("image/png", image.as_slice())
+            })
+        });
+        assert_eq!(out.matches("data:image/png").count(), MAX_INLINE_TOTAL_BYTES / MAX_INLINE_IMAGE_BYTES);
+        assert_eq!(encodings.get(), 1, "looked up and encoded once, not per spelling");
+    }
+
+    #[test]
+    fn over_budget_images_are_never_encoded() {
+        let image = vec![1u8; MAX_INLINE_IMAGE_BYTES];
+        let html: String = (0..100).map(|i| format!(r#"<img src="cid:img{}">"#, i)).collect();
+        let lookups = std::cell::Cell::new(0);
+        let out = inline_with(&html, |_| {
+            lookups.set(lookups.get() + 1);
+            Some(("image/png", image.as_slice()))
+        });
+        assert_eq!(out.matches("data:image/png").count(), 4);
+        // Lookups are cheap (no copy); only the 4 that fit were encoded
+        assert!(out.len() <= MAX_INLINE_TOTAL_BYTES / 3 * 4 + 64 * 4 + html.len());
+        assert_eq!(lookups.get(), 100);
     }
 
     #[test]
