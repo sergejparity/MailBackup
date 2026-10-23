@@ -63,8 +63,11 @@ pub struct AppState {
 pub const API_TOKEN_HEADER: &str = "x-mailbackup-token";
 
 /// Scripts may only come from this server's own files: no inline or injected
-/// scripts. Styles/fonts/images stay permissive so archived HTML mail (rendered
-/// in a srcdoc iframe, which inherits this policy) keeps its look.
+/// scripts. Remote styles/fonts/images are allowed here only because the
+/// sandboxed srcdoc iframe showing archived HTML mail inherits this policy and
+/// "Load remote content" needs them. By default the viewer adds a stricter
+/// per-message policy that blocks all remote content (see `renderEmailBody` in
+/// `app.js`).
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
     script-src 'self'; \
     style-src 'self' 'unsafe-inline' https:; \
@@ -891,7 +894,8 @@ async fn api_get_message_detail(
 
     let parsed = MessageParser::default().parse(&eml_bytes);
     let (html, text, attachments) = if let Some(p) = parsed {
-        let html_content = p.body_html(0).map(|s| s.to_string());
+        // Inline images (`cid:`) as data: URIs; the viewer blocks remote content
+        let html_content = p.body_html(0).map(|s| mailbackup_core::html_view::inline_cid_images(&s, &p));
         let text_content = p.body_text(0).map(|s| s.to_string());
 
         let mut atts = Vec::new();

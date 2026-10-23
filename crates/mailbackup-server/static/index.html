@@ -380,9 +380,15 @@
                 </div>
               </div>
 
-              <!-- Email Body Frame/Text -->
+              <!-- Remote content notice (shown when a mail references remote images/styles) -->
+              <div id="view-remote-banner" class="remote-content-banner" style="display: none;">
+                <span>Remote images and styles are blocked to protect your privacy.</span>
+                <button id="btn-load-remote" type="button" class="btn-secondary btn-sm">Load remote content</button>
+              </div>
+
+              <!-- Email Body Frame/Text: sandboxed with no permissions at all -->
               <div class="email-body-container">
-                <iframe id="view-body-frame" class="email-body-frame" sandbox="allow-same-origin"></iframe>
+                <iframe id="view-body-frame" class="email-body-frame" sandbox="" referrerpolicy="no-referrer"></iframe>
                 <div id="view-body-plain" class="email-body-plain" style="display: none;"></div>
               </div>
             </div>

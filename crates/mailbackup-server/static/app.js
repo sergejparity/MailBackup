@@ -94,6 +94,8 @@ const el = {
   viewAttachmentsList: document.getElementById('view-attachments-list'),
   viewBodyFrame: document.getElementById('view-body-frame'),
   viewBodyPlain: document.getElementById('view-body-plain'),
+  viewRemoteBanner: document.getElementById('view-remote-banner'),
+  btnLoadRemote: document.getElementById('btn-load-remote'),
   btnDownloadRawEml: document.getElementById('btn-download-raw-eml'),
   modalAccountsList: document.getElementById('modal-accounts-list'),
   addAccountForm: document.getElementById('add-account-form'),
@@ -1352,8 +1354,9 @@ async function selectMessage(messageId) {
     if (msg.body_html) {
       el.viewBodyFrame.style.display = 'block';
       el.viewBodyPlain.style.display = 'none';
-      el.viewBodyFrame.srcdoc = msg.body_html;
+      renderEmailBody(msg.body_html, false);
     } else {
+      el.viewRemoteBanner.style.display = 'none';
       el.viewBodyFrame.style.display = 'none';
       el.viewBodyPlain.style.display = 'block';
       el.viewBodyPlain.textContent = msg.body_text || '(Empty Message Body)';
@@ -2130,6 +2133,83 @@ function handleDownloadMboxBrowser() {
   a.click();
   document.body.removeChild(a);
   closeModal(el.exportModal);
+}
+
+// ---------------------------------------------------------------------------
+// HTML mail rendering: remote content is blocked unless the user asks for it
+// ---------------------------------------------------------------------------
+
+// Added to every mail's <head>. A <meta> CSP can only add restrictions to the
+// page policy the srcdoc frame inherits, and the mail can't remove it.
+const MAIL_CSP_BLOCKED = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; media-src data:";
+const MAIL_CSP_REMOTE = "default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline' https: http:; font-src data: https: http:; media-src data:";
+// Resource hints are not reliably covered by CSP
+const HINT_RELS = ['prefetch', 'preconnect', 'dns-prefetch', 'prerender', 'preload', 'modulepreload'];
+const REMOTE_URL = /^\s*(https?:)?\/\//i;
+const REMOTE_CSS_URL = /(url\(\s*['"]?\s*(https?:)?\/\/|@import\s+(url\(\s*)?['"]?\s*(https?:)?\/\/)/i;
+
+let currentMailHtml = null;
+
+/// Parses mail HTML into an inert document (DOMParser loads nothing) and
+/// removes what CSP can't stop: refresh redirects, <base>, resource hints.
+/// Returns the document and whether it references remote content.
+function sanitizeMailDocument(html) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  doc.querySelectorAll('meta[http-equiv]').forEach((m) => {
+    const name = (m.getAttribute('http-equiv') || '').trim().toLowerCase();
+    if (name === 'refresh' || name === 'set-cookie' || name === 'x-dns-prefetch-control') m.remove();
+  });
+  doc.querySelectorAll('base').forEach((b) => b.remove());
+  doc.querySelectorAll('link[rel]').forEach((link) => {
+    const rels = (link.getAttribute('rel') || '').toLowerCase().split(/\s+/);
+    if (rels.some((r) => HINT_RELS.includes(r))) link.remove();
+  });
+
+  let remote = false;
+  doc.querySelectorAll('[src], [background], [poster], [srcset]').forEach((node) => {
+    ['src', 'background', 'poster'].forEach((attr) => {
+      if (REMOTE_URL.test(node.getAttribute(attr) || '')) remote = true;
+    });
+    (node.getAttribute('srcset') || '').split(',').forEach((candidate) => {
+      if (REMOTE_URL.test(candidate)) remote = true;
+    });
+  });
+  doc.querySelectorAll('link[href]').forEach((link) => {
+    if (REMOTE_URL.test(link.getAttribute('href') || '')) remote = true;
+  });
+  doc.querySelectorAll('[style]').forEach((node) => {
+    if (REMOTE_CSS_URL.test(node.getAttribute('style') || '')) remote = true;
+  });
+  doc.querySelectorAll('style').forEach((style) => {
+    if (REMOTE_CSS_URL.test(style.textContent || '')) remote = true;
+  });
+  return { doc, remote };
+}
+
+/// Shows `html` in the sandboxed frame. Remote images, styles and fonts load
+/// only with `allowRemote` (the per-message "Load remote content" button).
+function renderEmailBody(html, allowRemote) {
+  currentMailHtml = html;
+  const { doc, remote } = sanitizeMailDocument(html);
+  const metas = [
+    ['http-equiv', 'Content-Security-Policy', allowRemote ? MAIL_CSP_REMOTE : MAIL_CSP_BLOCKED],
+    ['http-equiv', 'x-dns-prefetch-control', 'off'],
+    ['name', 'referrer', 'no-referrer'],
+  ];
+  metas.reverse().forEach(([attr, name, content]) => {
+    const meta = doc.createElement('meta');
+    meta.setAttribute(attr, name);
+    meta.setAttribute('content', content);
+    doc.head.prepend(meta);
+  });
+  el.viewRemoteBanner.style.display = remote && !allowRemote ? 'flex' : 'none';
+  el.viewBodyFrame.srcdoc = '<!DOCTYPE html>' + doc.documentElement.outerHTML;
+}
+
+if (el.btnLoadRemote) {
+  el.btnLoadRemote.addEventListener('click', () => {
+    if (currentMailHtml !== null) renderEmailBody(currentMailHtml, true);
+  });
 }
 
 function escapeHtml(str) {
