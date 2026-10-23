@@ -211,3 +211,72 @@ fn an_exiting_instance_only_removes_its_own_file() {
     drop(guard);
     assert_eq!(runtime_of(dir.path(), 4243).instance_id, "newer");
 }
+
+/// A server on its own thread that runs `serve` on each connection.
+fn raw_server(serve: impl Fn(std::net::TcpStream) + Send + Sync + 'static) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let serve = std::sync::Arc::new(serve);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let serve = serve.clone();
+            std::thread::spawn(move || serve(stream));
+        }
+    });
+    port
+}
+
+fn read_request(stream: &mut std::net::TcpStream) -> String {
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    String::from_utf8_lossy(&buf[..n]).to_string()
+}
+
+#[test]
+fn a_squatter_trickling_bytes_is_cut_off_at_the_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let genuine = start_server(dir.path(), 0).unwrap();
+    let info = runtime_of(dir.path(), genuine);
+
+    // One byte every 300 ms, forever: never trips a per-read timeout
+    let trickle = raw_server(|mut stream| {
+        read_request(&mut stream);
+        for byte in b"HTTP/1.1 200 OK\r\nX-Padding: ".iter().chain(std::iter::repeat(&b'a')) {
+            if stream.write_all(&[*byte]).is_err() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    });
+    stale_file_for(dir.path(), &info, trickle);
+    let started = std::time::Instant::now();
+    assert!(runtime::verify_genuine(dir.path(), trickle).is_none());
+    assert!(started.elapsed() < std::time::Duration::from_secs(4), "took {:?}", started.elapsed());
+}
+
+#[test]
+fn a_complete_answer_is_accepted_without_waiting_for_the_connection_to_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let genuine = start_server(dir.path(), 0).unwrap();
+    let info = runtime_of(dir.path(), genuine);
+    let secret = hex::decode(&info.secret).unwrap();
+
+    // Holds the secret, answers in full, then keeps the connection open
+    let lingering = raw_server(move |mut stream| {
+        use hmac::{Hmac, Mac};
+        let request = read_request(&mut stream);
+        let port = stream.local_addr().unwrap().port();
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&secret).unwrap();
+        mac.update(format!("mailbackup-handshake:v1:{}:{}", port, nonce_of(&request)).as_bytes());
+        let body = format!(r#"{{"proof":"{}","port":{}}}"#, hex::encode(mac.finalize().into_bytes()), port);
+        let _ = stream.write_all(
+            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body)
+                .as_bytes(),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    });
+    stale_file_for(dir.path(), &info, lingering);
+    let started = std::time::Instant::now();
+    assert!(runtime::verify_genuine(dir.path(), lingering).is_some());
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "took {:?}", started.elapsed());
+}

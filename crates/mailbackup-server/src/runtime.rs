@@ -20,12 +20,14 @@ use sha2::Sha256;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PROOF_CONTEXT: &str = "mailbackup-handshake:v1:";
 const NONCE_HEX_LEN: usize = 64;
-const MAX_RESPONSE_BYTES: u64 = 16 * 1024;
-const TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_RESPONSE_BYTES: usize = 16 * 1024;
+/// The whole handshake (connect, request, response) must finish within this,
+/// however the other end paces its bytes.
+const DEADLINE: Duration = Duration::from_secs(2);
 
 /// What a running server publishes about itself.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -153,12 +155,17 @@ pub fn verify_genuine(config_dir: &Path, port: u16) -> Option<RuntimeInfo> {
 }
 
 /// `GET /api/handshake?nonce=…` over a plain TCP connection; the body of a
-/// `200` response with a `Content-Length`, else `None`.
+/// `200` response with a `Content-Length`, else `None`. Gives up at
+/// [`DEADLINE`] and stops reading once the declared body has arrived.
 fn handshake_request(port: u16, nonce: &str) -> Option<Vec<u8>> {
+    handshake_request_by(port, nonce, Instant::now() + DEADLINE)
+}
+
+fn handshake_request_by(port: u16, nonce: &str, deadline: Instant) -> Option<Vec<u8>> {
+    let remaining = || deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero());
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let mut stream = TcpStream::connect_timeout(&addr, TIMEOUT).ok()?;
-    stream.set_read_timeout(Some(TIMEOUT)).ok()?;
-    stream.set_write_timeout(Some(TIMEOUT)).ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, remaining()?).ok()?;
+    stream.set_write_timeout(Some(remaining()?)).ok()?;
     let request = format!(
         "GET /api/handshake?nonce={} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
         nonce, port
@@ -166,12 +173,42 @@ fn handshake_request(port: u16, nonce: &str) -> Option<Vec<u8>> {
     stream.write_all(request.as_bytes()).ok()?;
 
     let mut response = Vec::new();
-    stream.take(MAX_RESPONSE_BYTES).read_to_end(&mut response).ok()?;
-    let header_end = response.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let head = std::str::from_utf8(&response[..header_end]).ok()?;
+    let mut buf = [0u8; 4096];
+    // (end of headers, body length) once the headers are in
+    let mut framing: Option<(usize, usize)> = None;
+    loop {
+        if let Some((header_end, length)) = framing {
+            if response.len() >= header_end + 4 + length {
+                break;
+            }
+        }
+        // Each read may only wait for what is left of the deadline
+        stream.set_read_timeout(Some(remaining()?)).ok()?;
+        let n = stream.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..n]);
+        if response.len() > MAX_RESPONSE_BYTES {
+            return None;
+        }
+        if framing.is_none() {
+            if let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+                framing = Some((header_end, parse_head(&response[..header_end])?));
+            }
+        }
+    }
+    let (header_end, length) = framing?;
+    let body = response.get(header_end + 4..)?;
+    (body.len() == length).then(|| body.to_vec())
+}
+
+/// The `Content-Length` of a plain `200` response head; `None` for any other
+/// status (redirects included), chunked bodies or a missing length.
+fn parse_head(head: &[u8]) -> Option<usize> {
+    let head = std::str::from_utf8(head).ok()?;
     let mut lines = head.split("\r\n");
     let status = lines.next()?;
-    // Only a plain 200; redirects and everything else fail
     if !(status.starts_with("HTTP/1.1 200 ") || status.starts_with("HTTP/1.0 200 ")) {
         return None;
     }
@@ -185,8 +222,7 @@ fn handshake_request(port: u16, nonce: &str) -> Option<Vec<u8>> {
             length = Some(value.trim().parse::<usize>().ok()?);
         }
     }
-    let body = &response[header_end + 4..];
-    (body.len() == length?).then(|| body.to_vec())
+    length.filter(|&l| l <= MAX_RESPONSE_BYTES)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
