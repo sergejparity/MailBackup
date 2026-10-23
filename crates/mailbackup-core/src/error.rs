@@ -43,6 +43,14 @@ pub enum Error {
     #[error("{0}")]
     InvalidPath(String),
 
+    /// A request parameter is malformed (reported to API clients as 400).
+    #[error("{0}")]
+    InvalidInput(String),
+
+    /// The requested item doesn't exist (reported to API clients as 404).
+    #[error("{0}")]
+    NotFound(String),
+
     #[error("The saved password for account '{0}' belongs to a different server, port or username. Enter the password again.")]
     CredentialMismatch(String),
 

@@ -62,6 +62,39 @@ pub struct AppState {
 
 pub const API_TOKEN_HEADER: &str = "x-mailbackup-token";
 
+/// `Content-Disposition: attachment` for `filename`, valid for any input:
+/// `filename=` carries an ASCII-only copy (quotes, backslashes, control and
+/// non-ASCII characters replaced with `_`), `filename*=` the exact name
+/// percent-encoded as UTF-8 (RFC 6266 / RFC 5987).
+fn attachment_disposition(filename: &str) -> HeaderValue {
+    let ascii: String = filename
+        .chars()
+        .map(|c| if c.is_ascii_graphic() && c != '"' && c != '\\' || c == ' ' { c } else { '_' })
+        .collect();
+    let encoded: String = filename
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{:02X}", b)
+            }
+        })
+        .collect();
+    HeaderValue::from_str(&format!("attachment; filename=\"{}\"; filename*=UTF-8''{}", ascii, encoded))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment"))
+}
+
+/// HTTP status for an error from the core library: bad input is the
+/// client's (400), a missing item 404, anything else the server's (500).
+fn error_status(e: &mailbackup_core::Error) -> StatusCode {
+    match e {
+        mailbackup_core::Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        mailbackup_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 /// Scripts may only come from this server's own files: no inline or injected
 /// scripts. Remote styles/fonts/images are allowed here only because the
 /// sandboxed srcdoc iframe showing archived HTML mail inherits this policy and
@@ -391,7 +424,7 @@ fn serve_file(path: &str, api_token: &str) -> Response {
             let mut res = Response::new(body);
             res.headers_mut().insert(
                 header::CONTENT_TYPE,
-                HeaderValue::from_str(mime.as_ref()).unwrap(),
+                HeaderValue::from_str(mime.as_ref()).unwrap_or(HeaderValue::from_static("application/octet-stream")),
             );
             if clean_path == "index.html" {
                 res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -946,7 +979,7 @@ async fn api_download_eml(
             );
             res.headers_mut().insert(
                 header::CONTENT_DISPOSITION,
-                HeaderValue::from_str(&format!("attachment; filename=\"{}\"", filename)).unwrap(),
+                attachment_disposition(&filename),
             );
             res
         }
@@ -1001,7 +1034,7 @@ async fn api_search(
 
     match state.db.search_advanced(&filter) {
         Ok(results) => Json(results).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (error_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -1468,15 +1501,10 @@ async fn api_download_mbox(
         &format!("Downloaded .mbox archive containing {} message(s)", count),
     );
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "application/mbox")
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .body(Body::from(buffer))
-        .unwrap()
-        .into_response()
+    let mut res = Response::new(Body::from(buffer));
+    res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/mbox"));
+    res.headers_mut().insert(header::CONTENT_DISPOSITION, attachment_disposition(&filename));
+    res.into_response()
 }
 
 #[derive(Serialize)]
@@ -1970,23 +1998,16 @@ async fn api_download_logs(Query(query): Query<DownloadLogQuery>) -> impl IntoRe
     let (filename, content) = if let Some(ref name) = query.file {
         match mailbackup_core::event_log::get_log_file_content(name) {
             Ok(c) => (name.clone(), c),
-            Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("Invalid log file: {}", e)).into_response();
-            }
+            Err(e) => return (error_status(&e), e.to_string()).into_response(),
         }
     } else {
         ("mailbackup-events.log".to_string(), mailbackup_core::event_log::get_raw_log().unwrap_or_default())
     };
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .body(Body::from(content))
-        .unwrap()
-        .into_response()
+    let mut res = Response::new(Body::from(content));
+    res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+    res.headers_mut().insert(header::CONTENT_DISPOSITION, attachment_disposition(&filename));
+    res.into_response()
 }
 
 async fn api_rotate_logs(State(state): State<AppState>) -> impl IntoResponse {
@@ -2283,6 +2304,80 @@ mod tests {
         assert!(!html.contains(" onclick="));
         let app_js = Assets::get("app.js").unwrap();
         assert!(!String::from_utf8_lossy(&app_js.data).contains(" onclick="));
+    }
+
+    fn authed_get(uri: &str) -> HttpRequest<Body> {
+        get(uri, "127.0.0.1:8765").header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn malformed_search_dates_are_rejected_not_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+        // Byte 10 of "123456789é" is inside the 'é'
+        for query in [
+            "date_from=123456789%C3%A9",
+            "date_to=123456789%C3%A9",
+            "date_to=2026-13-45",
+            "date_from=yesterday",
+            "date_from=2026-01-01junk",
+        ] {
+            let res = router.clone().oneshot(authed_get(&format!("/api/search?{}", query))).await.unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{}", query);
+        }
+        for query in ["date_from=2026-01-01", "date_to=2026-01-01T12:00:00Z", "date_from="] {
+            let res = router.clone().oneshot(authed_get(&format!("/api/search?{}", query))).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{}", query);
+        }
+    }
+
+    #[tokio::test]
+    async fn log_download_names_are_validated_not_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+        for name in ["%0d%0aevil.log", "evil%0A.log", "events.log%0d%0aSet-Cookie:%20x", "..%2Fsecret", "notes.txt"] {
+            let res = router.clone().oneshot(authed_get(&format!("/api/logs/download?file={}", name))).await.unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{}", name);
+        }
+        let missing = router.clone().oneshot(authed_get("/api/logs/download?file=events-2000-01-01.log")).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        // Service logs listed by the viewer stay downloadable
+        let service_log = mailbackup_core::event_log::log_dir().join("service_err.log");
+        let created = !service_log.exists();
+        if created {
+            std::fs::create_dir_all(service_log.parent().unwrap()).unwrap();
+            std::fs::write(&service_log, "warning").unwrap();
+        }
+        let res = router.clone().oneshot(authed_get("/api/logs/download?file=service_err.log")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        if created {
+            let _ = std::fs::remove_file(&service_log);
+        }
+
+        let active = router.clone().oneshot(authed_get("/api/logs/download")).await.unwrap();
+        assert_eq!(active.status(), StatusCode::OK);
+        let disposition = active.headers().get(header::CONTENT_DISPOSITION).unwrap().to_str().unwrap();
+        assert!(disposition.starts_with("attachment; filename=\"mailbackup-events.log\""), "{}", disposition);
+    }
+
+    #[test]
+    fn attachment_disposition_is_valid_for_any_name() {
+        for name in ["a\r\nSet-Cookie: x", "quote\"and\\slash", "zürich 📬.mbox", "\u{7f}\u{0}", ""] {
+            let value = attachment_disposition(name);
+            let text = value.to_str().expect("visible ASCII only");
+            assert!(text.starts_with("attachment; filename=\""), "{}", text);
+            assert!(!text.contains('\r') && !text.contains('\n'));
+            // filename= holds exactly one quoted string
+            let quoted = text.trim_start_matches("attachment; filename=\"");
+            let end = quoted.find('"').unwrap();
+            assert!(!quoted[..end].contains('\\'));
+        }
+        let value = attachment_disposition("zürich.mbox");
+        assert_eq!(
+            value.to_str().unwrap(),
+            "attachment; filename=\"z_rich.mbox\"; filename*=UTF-8''z%C3%BCrich.mbox"
+        );
     }
 
     fn json_request(method: &str, uri: &str, body: serde_json::Value) -> HttpRequest<Body> {

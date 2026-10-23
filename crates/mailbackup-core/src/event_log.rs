@@ -268,7 +268,8 @@ pub fn list_log_files() -> Result<Vec<LogFileInfo>> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".log") && !name.contains(".log.") {
+        // Only files the viewer can also download (see `is_log_file_name`)
+        if !is_log_file_name(&name) {
             continue;
         }
 
@@ -302,14 +303,33 @@ pub fn list_log_files() -> Result<Vec<LogFileInfo>> {
 
 /// Safely reads the specified log file from log_dir()
 pub fn get_log_file_content(filename: &str) -> Result<String> {
-    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
-        return Err(Error::Other("Invalid log filename path".to_string()));
+    if !is_log_file_name(filename) {
+        return Err(Error::InvalidInput(format!("Invalid log file name '{}'", filename.escape_debug())));
     }
     let path = log_dir().join(filename);
-    if !path.exists() {
-        return Ok(String::new());
+    if !path.is_file() {
+        return Err(Error::NotFound(format!("Log file '{}' not found", filename)));
     }
     Ok(fs::read_to_string(&path)?)
+}
+
+/// Names MailBackup gives its log files: `events.log`, rotated
+/// `events-YYYY-MM-DD.log` / `events-YYYY-MM-DD.N.log`, and the background
+/// service's `service.log` / `service_err.log`.
+pub fn is_log_file_name(name: &str) -> bool {
+    if matches!(name, "events.log" | "service.log" | "service_err.log") {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix("events-").and_then(|r| r.strip_suffix(".log")) else {
+        return false;
+    };
+    let (date, counter) = match rest.split_once('.') {
+        Some((date, counter)) => (date, Some(counter)),
+        None => (rest, None),
+    };
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
+        && date.len() == 10
+        && counter.is_none_or(|c| !c.is_empty() && c.len() <= 4 && c.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Parses entries from a given log file

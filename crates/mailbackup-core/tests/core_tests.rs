@@ -1020,3 +1020,72 @@ fn test_legacy_password_is_bound_on_first_use() {
 
     store.delete_password(&id).unwrap();
 }
+
+#[test]
+fn search_date_filters_are_validated_by_character() {
+    use mailbackup_core::db::parse_date_filter;
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+    assert_eq!(parse_date_filter("2026-10-01").unwrap(), day);
+    assert_eq!(parse_date_filter(" 2026-10-01 ").unwrap(), day);
+    assert_eq!(parse_date_filter("2026-10-01T23:59:59Z").unwrap(), day);
+    assert_eq!(parse_date_filter("2026-10-01 08:00").unwrap(), day);
+    for bad in ["123456789é", "é", "2026-13-45", "2026-02-30", "yesterday", "2026-10-01junk", "", "２０２６-10-01"] {
+        assert!(
+            matches!(parse_date_filter(bad), Err(mailbackup_core::Error::InvalidInput(_))),
+            "{:?}",
+            bad
+        );
+    }
+}
+
+#[test]
+fn search_with_a_multibyte_date_is_an_input_error() {
+    let db = Database::open_in_memory().unwrap();
+    let filter = mailbackup_core::db::AdvancedSearchFilter {
+        date_from: Some("123456789é".to_string()),
+        ..Default::default()
+    };
+    assert!(matches!(db.search_advanced(&filter), Err(mailbackup_core::Error::InvalidInput(_))));
+}
+
+#[test]
+fn only_mailbackup_log_names_are_served() {
+    use mailbackup_core::event_log::{get_log_file_content, is_log_file_name};
+    for good in ["events.log", "events-2026-10-01.log", "events-2026-10-01.3.log", "service.log", "service_err.log"] {
+        assert!(is_log_file_name(good), "{}", good);
+    }
+    for bad in ["\r\nevil.log", "events.log\r\n", "events-2026-13-01.log", "events-2026-10-01..log", "events-2026-10-01.x.log", "notes.txt", "../events.log", "events-2026-1-1.log"] {
+        assert!(!is_log_file_name(bad), "{:?}", bad);
+        assert!(matches!(get_log_file_content(bad), Err(mailbackup_core::Error::InvalidInput(_))));
+    }
+    assert!(matches!(
+        get_log_file_content("events-2000-01-01.log"),
+        Err(mailbackup_core::Error::NotFound(_))
+    ));
+}
+
+#[test]
+fn every_listed_log_file_can_be_downloaded() {
+    use mailbackup_core::event_log::{get_log_file_content, list_log_files, log_dir};
+    let dir = log_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    // Written by the background service; "notes.log" is someone else's
+    let mut created = Vec::new();
+    for (name, body) in [("service.log", "started"), ("service_err.log", "warning"), ("notes.log", "other")] {
+        let path = dir.join(name);
+        if !path.exists() {
+            std::fs::write(&path, body).unwrap();
+            created.push(path);
+        }
+    }
+    let listed = list_log_files().unwrap();
+    let names: Vec<&str> = listed.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"service.log") && names.contains(&"service_err.log"), "{:?}", names);
+    assert!(!names.contains(&"notes.log"), "only files the viewer can download are listed");
+    for file in &listed {
+        assert!(get_log_file_content(&file.name).is_ok(), "{}", file.name);
+    }
+    for path in created {
+        let _ = std::fs::remove_file(path);
+    }
+}
