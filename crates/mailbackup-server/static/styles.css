@@ -610,6 +610,37 @@ body.is-modal-resizing * {
   overflow: hidden;
 }
 
+.archive-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  vertical-align: middle;
+  color: var(--text-dim);
+  border: 1px solid var(--text-dim);
+}
+
+.archive-choice {
+  border: 1px solid var(--border-color, rgba(127, 127, 127, 0.3));
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.archive-option {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 6px 0;
+  cursor: pointer;
+}
+
+.archive-note {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
 .account-email {
   font-size: 0.72rem;
   color: var(--text-dim);

@@ -194,6 +194,8 @@ const el = {
   editRetention: document.getElementById('edit-retention'),
   editSchedule: document.getElementById('edit-schedule'),
   editEnabled: document.getElementById('edit-enabled'),
+  editArchiveChoice: document.getElementById('edit-archive-choice'),
+  editArchiveNote: document.getElementById('edit-archive-note'),
 
   // Settings Tab Elements
   settingsStorageForm: document.getElementById('settings-storage-form'),
@@ -1025,9 +1027,10 @@ function renderAccounts() {
     const info = document.createElement('div');
     info.className = 'account-info';
     info.innerHTML = `
-      <span class="account-title">${escapeHtml(acc.name)}</span>
+      <span class="account-title">${escapeHtml(acc.name)}${acc.archive ? '<span class="archive-badge">Archived</span>' : ''}</span>
       <span class="account-email">${escapeHtml(acc.email)}</span>
     `;
+    if (acc.archive) info.title = archiveDescription(acc.archive);
 
     const statusDot = document.createElement('span');
     statusDot.className = 'account-status-dot';
@@ -1126,9 +1129,38 @@ window.openEditAccount = function(accountId) {
   el.editRetention.value = acc.retention_days || 0;
   el.editSchedule.value = acc.schedule || '0 0 * * *';
   el.editEnabled.checked = acc.enabled !== false;
+  const rescan = el.editAccountForm.querySelector('input[name="on-connection-change"][value="rescan"]');
+  if (rescan) rescan.checked = true;
+
+  // A read-only archive can only be renamed
+  const archived = Boolean(acc.archive);
+  [el.editServer, el.editPort, el.editUsername, el.editPassword, el.editRetention, el.editSchedule, el.editEnabled]
+    .forEach(input => { input.disabled = archived; });
+  if (el.editArchiveNote) {
+    el.editArchiveNote.style.display = archived ? '' : 'none';
+    el.editArchiveNote.textContent = archived ? `Read-only archive. ${archiveDescription(acc.archive)} Only its name can be changed.` : '';
+  }
+  updateEditPasswordRequirement();
 
   openModal(el.editAccountModal);
 };
+
+// What is actually known about an archive: when it was archived and, if the
+// catalog recorded one, the connection it was last synced from.
+function archiveDescription(archive) {
+  const when = new Date(archive.archived_at).toLocaleDateString();
+  let text = `Archived ${when}`;
+  if (archive.last_source) {
+    const [server, port, ...user] = archive.last_source.split(':');
+    text += `, last synced from ${server}${port && port !== '993' ? ':' + port : ''} as ${user.join(':')}`;
+  }
+  return `${text}.`;
+}
+
+function editingArchive() {
+  const acc = state.accounts.find(a => a.id === el.editAccountId.value);
+  return Boolean(acc && acc.archive);
+}
 
 // Same comparison as the server: server (trimmed, case-insensitive), port, username (trimmed).
 function connectionKey(server, port, username) {
@@ -1142,7 +1174,9 @@ function editConnectionChanged() {
 // The stored password belongs to the current server, so changing the server,
 // port or username requires entering it again.
 function updateEditPasswordRequirement() {
-  const required = editConnectionChanged();
+  const required = editConnectionChanged() && !editingArchive();
+  // Only a changed connection raises the question of the archive so far
+  if (el.editArchiveChoice) el.editArchiveChoice.style.display = required ? '' : 'none';
   el.editPassword.required = required;
   el.editPassword.placeholder = required ? 'Required: enter the password for the new connection' : '(Leave blank to keep current password)';
   const hint = document.getElementById('edit-password-hint');
@@ -1156,6 +1190,10 @@ function updateEditPasswordRequirement() {
 async function handleSaveAccountEdit(e) {
   e.preventDefault();
   const accountId = el.editAccountId.value;
+  if (editingArchive()) {
+    await saveAccountEdit(accountId, { name: el.editName.value.trim() });
+    return;
+  }
   if (editConnectionChanged() && !el.editPassword.value) {
     showToast('Enter the account password to change the server, port or username.');
     el.editPassword.focus();
@@ -1171,7 +1209,14 @@ async function handleSaveAccountEdit(e) {
     schedule: el.editSchedule.value.trim() || '0 0 * * *',
     enabled: el.editEnabled.checked,
   };
+  if (editConnectionChanged()) {
+    const choice = el.editAccountForm.querySelector('input[name="on-connection-change"]:checked');
+    payload.on_connection_change = choice ? choice.value : 'rescan';
+  }
+  await saveAccountEdit(accountId, payload);
+}
 
+async function saveAccountEdit(accountId, payload) {
   try {
     const res = await fetch(`/api/accounts/${accountId}`, {
       method: 'PUT',
@@ -1689,7 +1734,8 @@ async function handleSyncAll() {
   el.btnSyncAll.innerHTML = `<span class="stats-dot" style="animation: pulse 1s infinite;"></span> Syncing...`;
   showToast('Initiating background sync...');
 
-  for (const acc of state.accounts) {
+  // Read-only archives are never synced
+  for (const acc of state.accounts.filter(a => !a.archive)) {
     try {
       await fetch(`/api/sync/${acc.id}`, { method: 'POST' });
     } catch (err) {

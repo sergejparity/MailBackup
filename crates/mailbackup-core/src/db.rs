@@ -50,8 +50,8 @@ fn folder_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FolderRecord> {
 }
 
 /// Catalog schema version (`PRAGMA user_version`). 1 added UID generations
-/// (issue #17).
-const SCHEMA_VERSION: i64 = 1;
+/// (issue #17), 2 the account transitions of "start a new archive" (#31).
+const SCHEMA_VERSION: i64 = 2;
 
 /// `messages` as of schema version 1. `uid_generation` deliberately has no
 /// default: binaries older than 0.4.0 don't know about generations, and their
@@ -267,6 +267,37 @@ fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
         r.get::<_, i64>(0)
     })
     .map(|n| n > 0)
+}
+
+/// Moves an account's folders, messages and search entries to another
+/// account id, starting a new UID generation in each moved folder.
+fn move_account_rows(tx: &Connection, from: &str, to: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE folders SET account_id = ?2, uid_generation = uid_generation + 1 WHERE account_id = ?1",
+        params![from, to],
+    )?;
+    tx.execute("UPDATE messages SET account_id = ?2 WHERE account_id = ?1", params![from, to])?;
+    tx.execute("UPDATE messages_fts SET account_id = ?2 WHERE account_id = ?1", params![from, to])?;
+    Ok(())
+}
+
+/// What [`Database::prepare_account_transition`] records.
+pub struct NewTransition<'a> {
+    pub live_id: &'a str,
+    pub archive_id: &'a str,
+    pub seq: u32,
+    pub old_credential_ref: &'a str,
+    pub staged_credential_ref: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionRecord {
+    pub id: i64,
+    pub live_id: String,
+    pub archive_id: String,
+    pub seq: u32,
+    pub old_credential_ref: String,
+    pub staged_credential_ref: String,
 }
 
 /// `Error::StaleSync` unless `generation` is still the folder's current one.
@@ -490,6 +521,21 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_sync_history_account ON sync_history(account_id);
+
+            -- "Start a new archive" (see `Database::prepare_account_transition`).
+            -- Rows are never deleted, so `seq` numbers are never handed out twice.
+            -- Holds credential *names* only, never secrets.
+            CREATE TABLE IF NOT EXISTS account_transitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                live_id TEXT NOT NULL,
+                archive_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                old_credential_ref TEXT NOT NULL,
+                staged_credential_ref TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_account_transitions_live ON account_transitions(live_id);
             "#
         .replace("{messages}", &messages_ddl("messages"))
         .replace("{indexes}", MESSAGES_INDEXES);
@@ -501,7 +547,100 @@ impl Database {
         migrate_to_v1(&mut conn)?;
         // Tables added later than `messages` (no-ops when present)
         conn.execute_batch(&schema)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
+    }
+
+    /// Highest transition number ever recorded for `live_id` (0 if none),
+    /// aborted attempts included.
+    pub fn last_transition_seq(&self, live_id: &str) -> Result<u32> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM account_transitions WHERE live_id = ?1",
+            params![live_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The connection the account's folders were last synced from: the most
+    /// common recorded `remote_identity` among them, if any was recorded.
+    pub fn last_remote_identity(&self, account_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                r#"SELECT remote_identity FROM folders
+                   WHERE account_id = ?1 AND remote_identity IS NOT NULL
+                   GROUP BY remote_identity ORDER BY COUNT(*) DESC, MAX(updated_at) DESC LIMIT 1"#,
+                params![account_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// First step of "start a new archive": in one transaction, records the
+    /// transition as prepared and moves all of `live_id`'s folders, messages
+    /// and search entries to `archive_id`. The moved folders start a new UID
+    /// generation, so a sync session still holding one of them can't write
+    /// to it (`Error::StaleSync`). Returns the transition id.
+    pub fn prepare_account_transition(&self, t: &NewTransition<'_>) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"INSERT INTO account_transitions
+                   (live_id, archive_id, seq, old_credential_ref, staged_credential_ref, state, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, 'prepared', ?6)"#,
+            params![t.live_id, t.archive_id, t.seq, t.old_credential_ref, t.staged_credential_ref, Utc::now().to_rfc3339()],
+        )?;
+        let id = tx.last_insert_rowid();
+        move_account_rows(&tx, t.live_id, t.archive_id)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn finish_account_transition(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE account_transitions SET state = 'done' WHERE id = ?1 AND state = 'prepared'", params![id])?;
+        Ok(())
+    }
+
+    /// Undoes a prepared transition: the rows go back to the live account. The
+    /// record stays (as `aborted`), so its number is never reused.
+    pub fn abort_account_transition(&self, id: i64) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT live_id, archive_id FROM account_transitions WHERE id = ?1 AND state = 'prepared'",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((live_id, archive_id)) = row {
+            move_account_rows(&tx, &archive_id, &live_id)?;
+            tx.execute("UPDATE account_transitions SET state = 'aborted' WHERE id = ?1", params![id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Transitions left `prepared` by a crash or a failure.
+    pub fn prepared_transitions(&self) -> Result<Vec<TransitionRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, live_id, archive_id, seq, old_credential_ref, staged_credential_ref
+               FROM account_transitions WHERE state = 'prepared' ORDER BY id"#,
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(TransitionRecord {
+                id: r.get(0)?,
+                live_id: r.get(1)?,
+                archive_id: r.get(2)?,
+                seq: r.get(3)?,
+                old_credential_ref: r.get(4)?,
+                staged_credential_ref: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn upsert_account(&self, id: &str, name: &str, email: &str, provider: &str) -> Result<()> {

@@ -120,7 +120,7 @@ fn a_v0_catalog_is_migrated_with_everything_intact() {
     assert_eq!(user_version(&path), 0);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(user_version(&path), 1);
+    assert_eq!(user_version(&path), 2);
 
     let folder = &db.get_folders("acc").unwrap()[0];
     assert_eq!((folder.uidvalidity, folder.last_synced_uid, folder.uid_generation), (Some(7), 42, 0));
@@ -188,18 +188,18 @@ fn inserts_from_older_versions_are_refused() {
 }
 
 #[test]
-fn reopening_is_a_no_op_and_fresh_catalogs_start_at_v1() {
+fn reopening_is_a_no_op_and_fresh_catalogs_start_at_the_current_version() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("catalog.db");
     v0_catalog(&path);
     Database::open(&path).unwrap();
     let db = Database::open(&path).unwrap();
     assert_eq!(db.get_messages_for_folder("f1").unwrap().len(), 1);
-    assert_eq!(user_version(&path), 1);
+    assert_eq!(user_version(&path), 2);
 
     let fresh = dir.path().join("fresh.db");
     Database::open(&fresh).unwrap();
-    assert_eq!(user_version(&fresh), 1);
+    assert_eq!(user_version(&fresh), 2);
 }
 
 #[test]
@@ -211,4 +211,21 @@ fn catalogs_from_newer_versions_are_refused() {
     let err = Database::open(&path).err().expect("refused");
     assert!(err.to_string().contains("newer MailBackup"), "{}", err);
     assert_eq!(user_version(&path), 99, "left as it was");
+}
+
+#[test]
+fn a_v1_catalog_gains_the_account_transitions_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    v0_catalog(&path);
+    Database::open(&path).unwrap();
+    // Back to what 0.4.x left: schema 1 without the transitions table
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE account_transitions; PRAGMA user_version = 1;").unwrap();
+    drop(conn);
+
+    let db = Database::open(&path).unwrap();
+    assert_eq!(user_version(&path), 2);
+    assert_eq!(db.last_transition_seq("acc").unwrap(), 0);
+    assert_eq!(db.get_messages_for_folder("f1").unwrap().len(), 1, "data untouched");
 }

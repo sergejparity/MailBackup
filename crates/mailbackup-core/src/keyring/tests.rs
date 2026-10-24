@@ -294,6 +294,9 @@ fn binding_is_only_created_when_certainly_missing() {
         folder_filter: Default::default(),
         gmail_smart_labels: true,
         enabled: true,
+        storage_namespace: None,
+        credential_ref: None,
+        archive: None,
     };
     // The password is readable, the binding sits in a locked keyring
     let mut keyring = FailingKeyring::new(Kind::Locked);

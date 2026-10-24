@@ -31,7 +31,7 @@ pub enum AuthType {
     OAuth2,   // XOAUTH2 with refresh token
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FolderFilter {
     #[serde(default)]
     pub include: Vec<String>,
@@ -54,7 +54,7 @@ impl Default for FolderFilter {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountConfig {
     pub id: String,
     pub name: String,
@@ -77,9 +77,50 @@ pub struct AccountConfig {
     pub gmail_smart_labels: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Directory under the data dir that new message files of this account go
+    /// to; `None` means the account id. A fresh namespace after "start a new
+    /// archive" keeps new files apart from the retired archive's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_namespace: Option<String>,
+    /// Name the account's password (and its connection binding) is stored
+    /// under; `None` means the account id. Switching it at a config commit
+    /// lets a new password be staged without touching the old one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+    /// Set on read-only archives retired by "start a new archive".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<ArchiveInfo>,
+}
+
+/// A read-only archive: the mail an account had archived when it moved to
+/// another server and the user chose to start a new archive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveInfo {
+    pub archived_at: chrono::DateTime<chrono::Utc>,
+    /// The live account it was retired from.
+    pub retired_from: String,
+    /// The connection (`server:port:username`) the archive's folders were
+    /// last synced from, when the catalog recorded one. Nothing is known about
+    /// earlier sources, so nothing more is claimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_source: Option<String>,
 }
 
 impl AccountConfig {
+    pub fn storage_namespace(&self) -> &str {
+        self.storage_namespace.as_deref().unwrap_or(&self.id)
+    }
+
+    pub fn credential_ref(&self) -> &str {
+        self.credential_ref.as_deref().unwrap_or(&self.id)
+    }
+
+    /// Read-only archives are never synced, edited (except the name) or
+    /// pruned by retention.
+    pub fn is_archive(&self) -> bool {
+        self.archive.is_some()
+    }
+
     /// Which remote mailbox store this account's UIDs come from: server
     /// (case-insensitive), port and username, normalized the way the API
     /// decides that an account's connection changed.
@@ -314,6 +355,19 @@ impl AppConfig {
 
         config.ensure_dirs()?;
         Ok(config)
+    }
+
+    /// The config at `path` as it is on disk, without creating anything;
+    /// `None` if there is no config file.
+    pub fn load_existing(path: &Path) -> Result<Option<Self>> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::Config(format!("Failed to read config file {}: {}", path.display(), e))),
+        };
+        serde_yaml::from_str(&content)
+            .map(Some)
+            .map_err(|e| Error::Serialization(format!("Failed to parse config {}: {}", path.display(), e)))
     }
 
     /// Creates the data folder and the catalog's folder (owner-only) if missing,

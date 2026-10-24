@@ -35,6 +35,9 @@ impl ValidImportAccount {
             folder_filter: FolderFilter::default(),
             gmail_smart_labels: true,
             enabled: true,
+            storage_namespace: None,
+            credential_ref: None,
+            archive: None,
         }
     }
 }

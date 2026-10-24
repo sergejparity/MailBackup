@@ -603,7 +603,8 @@ impl ImapSyncEngine {
         };
 
         // Store atomic raw .eml
-        let stored = self.storage.store_eml_in_generation(&account.id, folder_name, uid, generation, date, raw_body)?;
+        let stored =
+            self.storage.store_eml_in_generation(account.storage_namespace(), folder_name, uid, generation, date, raw_body)?;
 
         let rel_path_str = stored.relative_path.to_string_lossy().to_string();
         let att_refs: Vec<(&str, &str, u64)> = attachments

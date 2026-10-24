@@ -342,6 +342,12 @@ async fn serve(
     let storage = StorageEngine::new(&config.data_dir);
     // Same store as the CLI and the background service for this config
     let credentials = Arc::new(CredentialStore::for_config(&config_path, &config.settings));
+    // Settle "start a new archive" switches a crash left half-done
+    match mailbackup_core::archive::recover(&db, &credentials, &config_path) {
+        Ok(0) => {}
+        Ok(n) => info!("Settled {} interrupted account archive switch(es)", n),
+        Err(e) => error!("Couldn't check for interrupted account archive switches: {}", e),
+    }
     let port = port_override.unwrap_or(config.settings.web_port);
     let bind_ip = resolve_bind_ip(&config.settings.bind_address);
     // Bind before anything else starts, so a taken port fails fast and
@@ -362,7 +368,8 @@ async fn serve(
         storage.clone(),
         credentials.clone(),
     )
-    .await?;
+    .await?
+    .with_config_path(&config_path);
 
     let active_syncs_for_sched = active_syncs.clone();
     scheduler.set_status_listener(Some(Arc::new(
@@ -631,6 +638,9 @@ async fn api_add_account(
         folder_filter: FolderFilter::default(),
         gmail_smart_labels: true,
         enabled: true,
+        storage_namespace: None,
+        credential_ref: None,
+        archive: None,
     };
 
     if let Err(e) = state.credentials.set_account_password(&account, &payload.password) {
@@ -831,6 +841,11 @@ struct UpdateAccountPayload {
     retention_days: Option<u32>,
     schedule: Option<String>,
     enabled: Option<bool>,
+    /// What a changed server, port or username does to the mail archived so
+    /// far: `"rescan"` (default) keeps it in this account and re-scans,
+    /// `"new_archive"` retires it as a read-only archive account.
+    #[serde(default)]
+    on_connection_change: Option<String>,
 }
 
 async fn api_update_account(
@@ -843,6 +858,28 @@ async fn api_update_account(
         Some(a) => a,
         None => return (StatusCode::NOT_FOUND, "Account not found").into_response(),
     };
+
+    // A read-only archive can only be renamed
+    if acc.is_archive() {
+        let changes_more = payload.server.as_deref().is_some_and(|s| !s.trim().eq_ignore_ascii_case(acc.imap_server.trim()))
+            || payload.port.is_some_and(|p| p != acc.imap_port)
+            || payload.username.as_deref().is_some_and(|u| u.trim() != acc.username.trim())
+            || payload.password.as_deref().is_some_and(|p| !p.is_empty())
+            || payload.schedule.is_some()
+            || payload.retention_days.is_some()
+            || payload.enabled == Some(true);
+        if changes_more {
+            return (StatusCode::BAD_REQUEST, "This account is a read-only archive; only its name can be changed.")
+                .into_response();
+        }
+        if let Some(n) = payload.name {
+            acc.name = n;
+        }
+        if let Err(e) = cfg.save(&state.config_path) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save config: {}", e)).into_response();
+        }
+        return (StatusCode::OK, "Account updated").into_response();
+    }
 
     // The UI always sends server/port/username, so compare values rather than
     // presence. A change of connection needs the password again: the stored one
@@ -869,13 +906,64 @@ async fn api_update_account(
         )
             .into_response();
     }
+    let new_archive = match payload.on_connection_change.as_deref() {
+        None | Some("rescan") => false,
+        Some("new_archive") => connection_changed,
+        Some(other) => {
+            return (StatusCode::BAD_REQUEST, format!("Unknown on_connection_change '{}'", other)).into_response();
+        }
+    };
 
+    // Start a new archive: retire the archive as it is, then apply the rest
+    // of the edit to the live account. The gate stays held until the
+    // scheduler runs with the new config.
+    let mut archived = None;
+    if new_archive {
+        let busy = state.active_syncs.read().map(|s| s.get(&account_id).is_some_and(|st| st.is_syncing)).unwrap_or(false);
+        if busy {
+            return (StatusCode::CONFLICT, "A sync of this account is running; try again when it has finished.")
+                .into_response();
+        }
+        let conn = mailbackup_core::archive::NewConnection {
+            server: &new_server,
+            port: new_port,
+            username: &new_username,
+            password: new_password.as_deref().unwrap_or_default(),
+        };
+        match mailbackup_core::archive::start_new_archive(
+            &state.db,
+            &state.credentials,
+            &mut cfg,
+            &state.config_path,
+            &account_id,
+            &conn,
+        ) {
+            Ok(switched) => archived = Some(switched),
+            Err(e) => {
+                let status = match e {
+                    mailbackup_core::Error::AccountBusy(_) => StatusCode::CONFLICT,
+                    mailbackup_core::Error::InvalidInput(_) | mailbackup_core::Error::AccountArchived(_) => {
+                        StatusCode::BAD_REQUEST
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                return (status, format!("Couldn't start a new archive: {}", e)).into_response();
+            }
+        }
+    }
+
+    let acc = match cfg.get_account_mut(&account_id) {
+        Some(a) => a,
+        None => return (StatusCode::NOT_FOUND, "Account not found").into_response(),
+    };
     if let Some(n) = payload.name {
         acc.name = n;
     }
-    acc.imap_server = new_server;
-    acc.imap_port = new_port;
-    acc.username = new_username;
+    if archived.is_none() {
+        acc.imap_server = new_server;
+        acc.imap_port = new_port;
+        acc.username = new_username;
+    }
     acc.retention_days = payload.retention_days;
     if let Some(sch) = payload.schedule {
         acc.schedule = Some(sch);
@@ -884,9 +972,11 @@ async fn api_update_account(
         acc.enabled = e;
     }
 
-    if let Some(pw) = new_password {
-        if let Err(e) = state.credentials.set_account_password(acc, &pw) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update secret: {}", e)).into_response();
+    if archived.is_none() {
+        if let Some(pw) = new_password {
+            if let Err(e) = state.credentials.set_account_password(acc, &pw) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update secret: {}", e)).into_response();
+            }
         }
     }
 
@@ -897,20 +987,25 @@ async fn api_update_account(
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save config: {}", e)).into_response();
     }
 
-    // Reload scheduler
+    // Reload scheduler (still holding the gate after a switch)
     let _ = state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await;
 
+    let message = match &archived {
+        Some(switched) => format!(
+            "Account '{}' ({}) moved to a new connection; the mail archived so far is now the read-only archive '{}' ({})",
+            updated_name, updated_email, switched.archive.name, switched.archive.id
+        ),
+        None if connection_changed => format!(
+            "Account '{}' ({}) configuration updated; connection changed and password re-entered",
+            updated_name, updated_email
+        ),
+        None => format!("Account '{}' ({}) configuration updated", updated_name, updated_email),
+    };
     mailbackup_core::event_log::log_event(
-        "ACCOUNT_MODIFIED",
-        &if connection_changed {
-            format!(
-                "Account '{}' ({}) configuration updated; connection changed and password re-entered",
-                updated_name, updated_email
-            )
-        } else {
-            format!("Account '{}' ({}) configuration updated", updated_name, updated_email)
-        },
+        if archived.is_some() { "ACCOUNT_ARCHIVED" } else { "ACCOUNT_MODIFIED" },
+        &message,
     );
+    drop(archived);
 
     (StatusCode::OK, "Account updated").into_response()
 }
@@ -920,9 +1015,13 @@ async fn api_delete_account(
     Path(account_id): Path<String>,
 ) -> impl IntoResponse {
     let mut cfg = state.config.write().await;
-    let target_name = cfg.get_account(&account_id).map(|a| a.name.clone()).unwrap_or_else(|| account_id.clone());
+    let target = cfg.accounts.iter().find(|a| a.id == account_id).cloned();
+    let target_name = target.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| account_id.clone());
     cfg.accounts.retain(|a| a.id != account_id);
-    let _ = state.credentials.delete_password(&account_id);
+    // Archives have no password of their own
+    if let Some(acc) = target.as_ref().filter(|a| !a.is_archive()) {
+        let _ = state.credentials.delete_password(acc.credential_ref());
+    }
     let _ = cfg.save(&state.config_path);
 
     // Reload scheduler
@@ -961,6 +1060,9 @@ async fn api_test_direct(Json(payload): Json<TestDirectPayload>) -> impl IntoRes
         folder_filter: FolderFilter::default(),
         gmail_smart_labels: true,
         enabled: true,
+        storage_namespace: None,
+        credential_ref: None,
+        archive: None,
     };
 
     let connect = ImapSyncEngine::connect(&dummy_acc, &payload.password);
@@ -1184,12 +1286,18 @@ async fn api_sync_account(
         Some(a) => a.clone(),
         None => return (StatusCode::NOT_FOUND, "Account not found").into_response(),
     };
+    drop(cfg);
+    if acc.is_archive() {
+        return (StatusCode::CONFLICT, "This account is a read-only archive and isn't synced").into_response();
+    }
 
-    let password = match state.credentials.get_account_password(&acc) {
-        Ok(p) => p,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("No credentials: {}", e)).into_response(),
-    };
+    // Early feedback; the sync itself reads the password again under the gate
+    if let Err(e) = state.credentials.get_account_password(&acc) {
+        return (StatusCode::BAD_REQUEST, format!("No credentials: {}", e)).into_response();
+    }
 
+    let config_path = state.config_path.clone();
+    let credentials = state.credentials.clone();
     let db = state.db.clone();
     let storage = state.storage.clone();
     let active_syncs = state.active_syncs.clone();
@@ -1219,6 +1327,40 @@ async fn api_sync_account(
     );
 
     tokio::spawn(async move {
+        // Hold the account's sync gate for the whole sync, and sync the
+        // account as the config on disk has it once the gate is ours: a change
+        // of its connection may have finished while this request waited
+        let gated = match mailbackup_core::sync_gate::begin_account_sync(&config_path, &acc.id).await {
+            Ok((gate, current)) => credentials.get_account_password(&current).map(|pw| (gate, current, pw)),
+            Err(e) => Err(e),
+        };
+        let (_gate, acc, password) = match gated {
+            Ok(g) => g,
+            Err(e) => {
+                let err_msg = e.to_string();
+                mailbackup_core::event_log::log_event(
+                    "SYNC_ERROR",
+                    &format!("Account '{}' sync not started: {}", acc.name, err_msg),
+                );
+                if let Ok(mut syncs) = active_syncs.write() {
+                    syncs.insert(
+                        acc.id.clone(),
+                        SyncStatus {
+                            account_id: acc.id.clone(),
+                            account_name: acc.name.clone(),
+                            is_syncing: false,
+                            current_folder: "Failed".to_string(),
+                            total_messages: 0,
+                            processed_messages: 0,
+                            downloaded_bytes: 0,
+                            status: "failed".to_string(),
+                            error: Some(err_msg),
+                        },
+                    );
+                }
+                return;
+            }
+        };
         let sync_engine = ImapSyncEngine::new(db.clone(), storage.clone());
         let active_syncs_cb = active_syncs.clone();
         let acc_id_cb = acc.id.clone();
@@ -2768,6 +2910,9 @@ mod tests {
             folder_filter: FolderFilter::default(),
             gmail_smart_labels: true,
             enabled: true,
+            storage_namespace: None,
+            credential_ref: None,
+            archive: None,
         };
         use mailbackup_core::Error as E;
         let generic = "Could not connect to imap.example.com:993. Check the host and port, and that the server accepts TLS (IMAPS).";
@@ -3054,5 +3199,185 @@ mod tests {
         }
         let req = authed("POST", "/api/download-ticket", Some(serde_json::json!({ "url": "/api/logs/download" })));
         assert_eq!(status(&router, req).await, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // --- Start a new archive (issue #31) --------------------------------------
+
+    /// A state whose config (on disk too) has account `acc` on
+    /// `imap.old.example` with password "old" and one archived message.
+    async fn archive_state(dir: &std::path::Path) -> AppState {
+        let state = test_state(dir, Vec::new()).await;
+        let acc = AccountConfig {
+            id: "acc".into(),
+            name: "Acc".into(),
+            email: "a@example.com".into(),
+            provider: ProviderType::GenericImap,
+            imap_server: "imap.old.example".into(),
+            imap_port: 993,
+            use_tls: true,
+            auth_type: AuthType::Password,
+            username: "user".into(),
+            schedule: None,
+            retention_days: None,
+            folder_filter: FolderFilter::default(),
+            gmail_smart_labels: false,
+            enabled: true,
+            storage_namespace: None,
+            credential_ref: None,
+            archive: None,
+        };
+        state.config.write().await.accounts.push(acc.clone());
+        state.config.read().await.save(&state.config_path).unwrap();
+        state.credentials.set_account_password(&acc, "old").unwrap();
+        let raw = b"From: a@example.com\r\nSubject: Archived one\r\n\r\nbody\r\n";
+        let stored = state.storage.store_eml("acc", "INBOX", 1, None, raw).unwrap();
+        let folder = state.db.begin_folder_sync("acc", "INBOX", "INBOX", Some(1), &acc.remote_identity()).unwrap().folder;
+        state
+            .db
+            .insert_message(
+                "acc", &folder.id, 1, None, Some("Archived one"), None, None, None, None, raw.len() as u64,
+                &stored.relative_path.to_string_lossy(), &stored.sha256, Some("body"), &[],
+            )
+            .unwrap();
+        state
+    }
+
+    fn edit(server: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "name": "Acc", "server": server, "port": 993, "username": "user", "password": "new",
+            "retention_days": null, "schedule": "0 0 * * *", "enabled": true
+        });
+        if let (Some(obj), Some(more)) = (body.as_object_mut(), extra.as_object()) {
+            obj.extend(more.clone());
+        }
+        body
+    }
+
+    async fn archived_ids(state: &AppState) -> Vec<String> {
+        state.config.read().await.accounts.iter().filter(|a| a.is_archive()).map(|a| a.id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn starting_a_new_archive_retires_the_mail_so_far() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = archive_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let body = edit("imap.new.example", serde_json::json!({ "on_connection_change": "new_archive" }));
+        let res = router.clone().oneshot(authed("PUT", "/api/accounts/acc", Some(body))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let archives = archived_ids(&state).await;
+        assert_eq!(archives.len(), 1);
+        let archive_id = &archives[0];
+        assert!(archive_id.starts_with("acc~archive-") && archive_id.ends_with("-1"), "{}", archive_id);
+        // The mail moved to the archive; the live account is empty on the new server
+        assert_eq!(state.db.get_folders(archive_id).unwrap().len(), 1);
+        assert!(state.db.get_folders("acc").unwrap().is_empty());
+        let cfg = state.config.read().await.clone();
+        let live = cfg.get_account("acc").unwrap();
+        assert_eq!((live.imap_server.as_str(), live.storage_namespace()), ("imap.new.example", "acc~1"));
+        assert_eq!(state.credentials.get_account_password(live).unwrap(), "new");
+        // Saved: the config on disk is the same
+        let disk = AppConfig::load_existing(&state.config_path).unwrap().unwrap();
+        assert_eq!(disk.accounts, cfg.accounts);
+
+        // Listed with its archive info
+        let res = router.clone().oneshot(authed("GET", "/api/accounts", None)).await.unwrap();
+        let list: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let entry = list.as_array().unwrap().iter().find(|a| a["id"] == archive_id.as_str()).unwrap();
+        assert_eq!(entry["archive"]["retired_from"], "acc");
+        assert_eq!(entry["archive"]["last_source"], "imap.old.example:993:user");
+        assert_eq!(entry["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn keep_and_rescan_stays_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = archive_state(dir.path()).await;
+        let router = create_router(state.clone());
+        for extra in [serde_json::json!({}), serde_json::json!({ "on_connection_change": "rescan" })] {
+            let res = router.clone().oneshot(authed("PUT", "/api/accounts/acc", Some(edit("imap.new.example", extra)))).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+        assert!(archived_ids(&state).await.is_empty());
+        assert_eq!(state.db.get_folders("acc").unwrap().len(), 1, "the archive stays in the account");
+        let bad = edit("imap.other.example", serde_json::json!({ "on_connection_change": "explode" }));
+        assert_eq!(status(&router, authed("PUT", "/api/accounts/acc", Some(bad))).await, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_running_sync_blocks_the_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = archive_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let body = || edit("imap.new.example", serde_json::json!({ "on_connection_change": "new_archive" }));
+
+        // Reported as running
+        state.active_syncs.write().unwrap().insert(
+            "acc".into(),
+            SyncStatus {
+                account_id: "acc".into(),
+                account_name: "Acc".into(),
+                is_syncing: true,
+                current_folder: "INBOX".into(),
+                total_messages: 0,
+                processed_messages: 0,
+                downloaded_bytes: 0,
+                status: "syncing".into(),
+                error: None,
+            },
+        );
+        assert_eq!(status(&router, authed("PUT", "/api/accounts/acc", Some(body()))).await, StatusCode::CONFLICT);
+        state.active_syncs.write().unwrap().clear();
+
+        // Holding the gate (e.g. another process syncing it)
+        let held = mailbackup_core::sync_gate::SyncGate::try_acquire(&state.config_path, "acc").unwrap().unwrap();
+        assert_eq!(status(&router, authed("PUT", "/api/accounts/acc", Some(body()))).await, StatusCode::CONFLICT);
+        drop(held);
+        assert!(archived_ids(&state).await.is_empty());
+        assert_eq!(state.db.get_folders("acc").unwrap().len(), 1, "nothing moved");
+        assert_eq!(status(&router, authed("PUT", "/api/accounts/acc", Some(body()))).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn archives_are_read_only_but_searchable_exportable_and_survive_their_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = archive_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let body = edit("imap.new.example", serde_json::json!({ "on_connection_change": "new_archive" }));
+        assert_eq!(status(&router, authed("PUT", "/api/accounts/acc", Some(body))).await, StatusCode::OK);
+        let archive_id = archived_ids(&state).await.remove(0);
+
+        // Never synced, only renamed
+        assert_eq!(status(&router, authed("POST", &format!("/api/sync/{}", archive_id), None)).await, StatusCode::CONFLICT);
+        for change in [
+            serde_json::json!({ "server": "imap.x.example", "port": 993, "username": "user", "password": "p" }),
+            serde_json::json!({ "retention_days": 30 }),
+            serde_json::json!({ "schedule": "0 1 * * *" }),
+            serde_json::json!({ "enabled": true }),
+        ] {
+            let res = authed("PUT", &format!("/api/accounts/{}", archive_id), Some(change.clone()));
+            assert_eq!(status(&router, res).await, StatusCode::BAD_REQUEST, "{}", change);
+        }
+        let rename = authed("PUT", &format!("/api/accounts/{}", archive_id), Some(serde_json::json!({ "name": "Old mailbox" })));
+        assert_eq!(status(&router, rename).await, StatusCode::OK);
+        assert_eq!(state.config.read().await.accounts.iter().find(|a| a.id == archive_id).unwrap().name, "Old mailbox");
+
+        // Exported like any account
+        let res = router
+            .clone()
+            .oneshot(authed("GET", &format!("/api/export/mbox/download?account_id={}&folder_id=ALL", archive_id), None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mbox = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&mbox).contains("Subject: Archived one"));
+        // Searchable
+        assert_eq!(state.db.search_fts("body", 10).unwrap().len(), 1);
+
+        // Deleting the live account leaves the archive alone
+        assert_eq!(status(&router, authed("DELETE", "/api/accounts/acc", None)).await, StatusCode::NO_CONTENT);
+        assert!(state.config.read().await.accounts.iter().any(|a| a.id == archive_id));
+        assert_eq!(state.db.get_folders(&archive_id).unwrap().len(), 1);
     }
 }

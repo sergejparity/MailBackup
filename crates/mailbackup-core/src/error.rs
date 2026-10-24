@@ -63,6 +63,14 @@ pub enum Error {
     #[error("Sync of folder '{0}' was superseded by a newer sync; stopping it")]
     StaleSync(String),
 
+    /// The account is a read-only archive (see `config::ArchiveInfo`).
+    #[error("Account '{0}' is a read-only archive")]
+    AccountArchived(String),
+
+    /// Another sync of, or a change to, this account holds its sync gate.
+    #[error("Account '{0}' is busy: a sync or a change of it is in progress")]
+    AccountBusy(String),
+
     #[error("Generic error: {0}")]
     Other(String),
 }
