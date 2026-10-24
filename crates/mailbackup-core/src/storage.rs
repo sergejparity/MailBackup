@@ -93,10 +93,8 @@ impl StorageEngine {
         for c in input.chars() {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
                 slug.push(c);
-            } else if c == '/' || c == '.' || c == ' ' {
-                if !slug.ends_with('_') {
-                    slug.push('_');
-                }
+            } else if (c == '/' || c == '.' || c == ' ') && !slug.ends_with('_') {
+                slug.push('_');
             }
         }
         let trimmed = slug.trim_matches('_');

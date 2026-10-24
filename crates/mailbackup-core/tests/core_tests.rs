@@ -594,6 +594,9 @@ fn test_service_status_and_config() {
 }
 
 #[tokio::test]
+// The guard serializes the tests sharing the global event log; this test's
+// runtime is its own, so holding it across awaits can't deadlock
+#[allow(clippy::await_holding_lock)]
 async fn test_scheduler_event_logging_and_listener() {
     let _lock = LOG_TEST_MUTEX.lock().unwrap();
     use mailbackup_core::config::{AccountConfig, AuthType, FolderFilter, ProviderType};
@@ -609,8 +612,8 @@ async fn test_scheduler_event_logging_and_listener() {
     clear_log().unwrap();
 
     let dir = tempdir().unwrap();
-    let db = Database::open(&dir.path().join("test.db")).unwrap();
-    let storage = StorageEngine::new(&dir.path().join("storage"));
+    let db = Database::open(dir.path().join("test.db")).unwrap();
+    let storage = StorageEngine::new(dir.path().join("storage"));
     let creds = Arc::new(CredentialStore::new().with_keyring(Arc::new(mailbackup_core::keyring::NoKeyring)));
 
     let mut config = AppConfig::default();

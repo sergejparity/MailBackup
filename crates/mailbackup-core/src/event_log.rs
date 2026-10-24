@@ -47,7 +47,7 @@ pub fn log_file_path() -> PathBuf {
 fn detect_log_file_date(path: &Path) -> Option<NaiveDate> {
     if let Ok(file) = File::open(path) {
         let reader = BufReader::new(file);
-        for line in reader.lines().flatten() {
+        for line in reader.lines().map_while(std::result::Result::ok) {
             let trimmed = line.trim();
             if trimmed.starts_with('[') {
                 if let Some(end) = trimmed.find(']') {
@@ -343,7 +343,7 @@ pub fn parse_log_entries_from_file(path: &Path) -> Vec<LogEntry> {
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
 
-    for line in reader.lines().flatten() {
+    for line in reader.lines().map_while(std::result::Result::ok) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -399,7 +399,7 @@ pub fn get_recent_logs(limit: usize) -> Result<Vec<LogEntry>> {
     }
 
     // Return newest first, sorted by timestamp
-    entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
     if entries.len() > limit {
         entries.truncate(limit);
     }
@@ -424,4 +424,23 @@ pub fn clear_log() -> Result<()> {
     }
     log_event("LOGS_CLEARED", "Event logs cleared by user");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A read error ends the scan instead of being retried forever: on Unix a
+    /// directory opens fine but every read fails.
+    #[test]
+    fn unreadable_log_files_are_skipped_not_spun_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send((parse_log_entries_from_file(&path).len(), detect_log_file_date(&path).is_some()));
+        });
+        let (entries, _) = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("returned instead of looping");
+        assert_eq!(entries, 0);
+    }
 }

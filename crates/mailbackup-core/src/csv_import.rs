@@ -161,9 +161,7 @@ pub fn parse_accounts_csv(content: &str) -> CsvImportReport {
         .from_reader(content.as_bytes());
 
     let mut records: Vec<(usize, csv::StringRecord)> = Vec::new();
-    let mut line_num = 1;
-
-    for result in rdr.records() {
+    for (line_num, result) in (1..).zip(rdr.records()) {
         match result {
             Ok(rec) => {
                 if !rec.is_empty() && rec.iter().any(|field| !field.trim().is_empty()) {
@@ -178,7 +176,6 @@ pub fn parse_accounts_csv(content: &str) -> CsvImportReport {
                 });
             }
         }
-        line_num += 1;
     }
 
     if records.is_empty() {
