@@ -97,6 +97,17 @@ unset MAILBACKUP_PASSWORD
 - If any setting is missing, the CLI names all the missing flags at once and saves nothing.
 - `--password <PW>` still works but is deprecated, for the reason above.
 
+#### When the mail server changes
+
+Sync only downloads messages it hasn't seen, by their IMAP UID. Those UIDs only mean something for one mailbox on one server, so a folder is **re-scanned from the start** when:
+- the server reports a new `UIDVALIDITY` (the mailbox was renumbered);
+- you change the account's server, port or username;
+- the folder was archived by a version before 0.4.0. This happens once after upgrading, because those versions didn't record which server the UIDs came from.
+
+A re-scan downloads the folder's messages again, but keeps everything already archived. Messages that are already in the archive are recognized by their exact content and not stored twice. Messages that no longer exist on the new server stay in the archive. Each re-scan is noted in the event log (`SYNC_RESCAN`).
+
+**Upgrading to 0.4.0:** the catalog database is migrated once, on first start. **Back up the catalog file first** (see `db_path` in the config), and don't sync it with an older version afterwards: older versions don't know about re-scans, so they refuse to add messages to a migrated catalog. To go back, restore the backup. A catalog from a newer version is refused rather than migrated backwards.
+
 ### 3. Launching the Web Studio
 
 ```bash

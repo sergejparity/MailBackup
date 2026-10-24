@@ -57,6 +57,12 @@ pub enum Error {
     #[error("Parsing error: {0}")]
     Parse(String),
 
+    /// A folder sync tried to write after a newer sync of that folder had
+    /// started over (the server, account or UIDVALIDITY changed); nothing was
+    /// written.
+    #[error("Sync of folder '{0}' was superseded by a newer sync; stopping it")]
+    StaleSync(String),
+
     #[error("Generic error: {0}")]
     Other(String),
 }
