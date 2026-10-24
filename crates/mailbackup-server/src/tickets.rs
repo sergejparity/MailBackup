@@ -71,7 +71,9 @@ impl Target {
                 if ticket.is_some() {
                     return None;
                 }
-                ticket = Some(pair[TICKET_PARAM.len() + 1..].to_string());
+                // A bare `ticket` or an empty `ticket=` carries no ticket
+                let value = pair.split_once('=').map(|(_, v)| v).filter(|v| !v.is_empty())?;
+                ticket = Some(value.to_string());
             } else {
                 rest.push(pair);
             }
@@ -243,6 +245,9 @@ mod tests {
         assert!(!redeem_url(&tickets, &format!("/api/logs/download?ticket={}&ticket={}", t, t), now));
         assert!(!redeem_url(&tickets, "/api/logs/download", now));
         assert!(!redeem_url(&tickets, "/api/logs/download?ticket=", now));
+        assert!(!redeem_url(&tickets, "/api/logs/download?ticket", now));
+        assert!(!redeem_url(&tickets, "/api/logs/download?file=events.log&ticket", now));
+        assert!(!redeem_url(&tickets, &format!("/api/logs/download?ticket&ticket={}", t), now));
         assert!(redeem_url(&tickets, &format!("/api/logs/download?ticket={}", t), now), "untouched by the attempts");
     }
 

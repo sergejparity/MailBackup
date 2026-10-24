@@ -2970,6 +2970,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_ticket_parameters_are_rejected_not_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, id) = router_with_message(dir.path(), tickets::TICKET_TTL).await;
+        for uri in [
+            "/api/logs/download?ticket".to_string(),
+            "/api/logs/download?file=events.log&ticket".to_string(),
+            "/api/logs/download?ticket=".to_string(),
+            "/api/logs/download?file=events.log&ticket=".to_string(),
+            "/api/accounts/csv-template?ticket".to_string(),
+            "/api/export/mbox/download?account_id=acc1&ticket".to_string(),
+            format!("/api/messages/{}/download?ticket", id),
+        ] {
+            assert_eq!(status(&router, anonymous("GET", &uri)).await, StatusCode::UNAUTHORIZED, "{}", uri);
+        }
+    }
+
+    #[tokio::test]
     async fn tickets_expire() {
         let dir = tempfile::tempdir().unwrap();
         let (router, _) = router_with_message(dir.path(), std::time::Duration::from_millis(50)).await;
