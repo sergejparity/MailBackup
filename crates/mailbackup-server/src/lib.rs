@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::{
     body::Body,
     extract::{Path, Query, Request, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -55,15 +55,18 @@ pub struct AppState {
     pub credentials: Arc<CredentialStore>,
     pub scheduler: Arc<Mutex<BackupScheduler>>,
     pub active_syncs: Arc<StdRwLock<HashMap<String, SyncStatus>>>,
-    /// Per-process secret that every `/api/*` request must present, either in the
-    /// `X-MailBackup-Token` header or (for plain downloads) the `token` query parameter.
+    /// Per-process secret that every `/api/*` request must present in the
+    /// `X-MailBackup-Token` header (plain download links use a `ticket` instead).
     pub api_token: Arc<str>,
+    /// Single-use tickets for download links (see `tickets`).
+    pub download_tickets: Arc<tickets::DownloadTickets>,
     /// Handshake secret proving to the desktop GUI that this is a genuine
     /// server (see `runtime`). Never sent to clients.
     pub identity: Arc<runtime::ServerIdentity>,
 }
 
 pub mod runtime;
+pub mod tickets;
 
 pub const API_TOKEN_HEADER: &str = "x-mailbackup-token";
 
@@ -130,6 +133,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/", get(serve_index))
         .route("/api/stats", get(api_stats))
         .route("/api/handshake", get(api_handshake))
+        .route("/api/download-ticket", post(api_download_ticket))
         .route("/api/accounts", get(api_get_accounts).post(api_add_account))
         .route("/api/accounts/import-csv", post(api_import_accounts_csv))
         .route("/api/accounts/csv-template", get(api_accounts_csv_template))
@@ -172,7 +176,9 @@ pub fn create_router(state: AppState) -> Router {
 ///   which defeats DNS rebinding.
 /// - `Origin`, when sent, must be `http(s)://<Host>` (no cross-origin callers; CORS is
 ///   not enabled). `https` covers a TLS-terminating reverse proxy.
-/// - `/api/*` requests must carry the per-process API token.
+/// - `/api/*` requests must carry the per-process API token in the header, or
+///   (only `GET` of a download route) a single-use ticket issued for exactly
+///   that request (see `tickets`).
 async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let headers = req.headers();
 
@@ -205,11 +211,11 @@ async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> R
     // The handshake proves the server's identity to a client that has no
     // credentials yet (see `runtime`); Host/Origin checks above still apply
     if req.uri().path().starts_with("/api/") && req.uri().path() != "/api/handshake" {
-        let presented = request_token(headers, req.uri().query());
-        let valid = presented
-            .map(|t| constant_time_eq(t.as_bytes(), state.api_token.as_bytes()))
-            .unwrap_or(false);
-        if !valid {
+        let valid = headers
+            .get(API_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|t| constant_time_eq(t.as_bytes(), state.api_token.as_bytes()));
+        if !valid && !ticket_authorizes(&state, &req) {
             return (StatusCode::UNAUTHORIZED, "Missing or invalid API token").into_response();
         }
     }
@@ -222,14 +228,41 @@ async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> R
     res
 }
 
-fn request_token<'a>(headers: &'a HeaderMap, query: Option<&'a str>) -> Option<&'a str> {
-    if let Some(t) = headers.get(API_TOKEN_HEADER).and_then(|v| v.to_str().ok()) {
-        return Some(t);
+/// Whether `req` is a `GET` of a download route carrying a live ticket issued
+/// for exactly this path and query. The ticket is used up either way.
+fn ticket_authorizes(state: &AppState, req: &Request) -> bool {
+    let path = req.uri().path();
+    if req.method() != axum::http::Method::GET || !tickets::is_download_path(path) {
+        return false;
     }
-    // Tokens are hex, so no percent-decoding is needed.
-    query?
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("token="))
+    match tickets::Target::of_request(path, req.uri().query()) {
+        Some((target, ticket)) => state.download_tickets.redeem(&ticket, &target),
+        None => false,
+    }
+}
+
+#[derive(Deserialize)]
+struct DownloadTicketRequest {
+    /// Relative URL of the download, exactly as it will be requested.
+    url: String,
+}
+
+/// Issues a single-use ticket for one download (see `tickets`).
+async fn api_download_ticket(State(state): State<AppState>, Json(req): Json<DownloadTicketRequest>) -> Response {
+    let Some(target) = tickets::Target::for_url(&req.url) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Not a download URL" }))).into_response();
+    };
+    match state.download_tickets.mint(target) {
+        Ok(ticket) => Json(serde_json::json!({
+            "ticket": ticket,
+            "expires_in": state.download_tickets.ttl().as_secs(),
+        }))
+        .into_response(),
+        Err(tickets::MintError::TooMany) => {
+            (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "Too many pending downloads" })))
+                .into_response()
+        }
+    }
 }
 
 fn is_allowed_host(host: &str, extra_hosts: &[String]) -> bool {
@@ -427,6 +460,7 @@ async fn serve(
         scheduler: scheduler_arc,
         active_syncs,
         api_token: Arc::from(generate_api_token()),
+        download_tickets: Arc::new(tickets::DownloadTickets::default()),
         identity: identity.clone(),
     };
 
@@ -2192,6 +2226,7 @@ mod tests {
             scheduler: Arc::new(Mutex::new(scheduler)),
             active_syncs: Arc::new(StdRwLock::new(HashMap::new())),
             api_token: Arc::from(TOKEN),
+            download_tickets: Arc::new(tickets::DownloadTickets::default()),
             identity: Arc::new(runtime::ServerIdentity::new(8765)),
         }
     }
@@ -2316,10 +2351,15 @@ mod tests {
             .unwrap();
         assert_eq!(status(&router, header_ok).await, StatusCode::OK);
 
-        let query_ok = get(&format!("/api/version?token={}", TOKEN), "localhost:8765")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(status(&router, query_ok).await, StatusCode::OK);
+        // The token is never accepted from the URL, on any route
+        for uri in [
+            format!("/api/version?token={}", TOKEN),
+            format!("/api/logs/download?token={}", TOKEN),
+            format!("/api/accounts/csv-template?token={}", TOKEN),
+        ] {
+            let query = get(&uri, "localhost:8765").body(Body::empty()).unwrap();
+            assert_eq!(status(&router, query).await, StatusCode::UNAUTHORIZED, "{}", uri);
+        }
     }
 
     #[tokio::test]
@@ -2766,5 +2806,253 @@ mod tests {
     fn bind_address_defaults_to_loopback() {
         assert!(resolve_bind_ip(&AppConfig::default().settings.bind_address).is_loopback());
         assert!(resolve_bind_ip("not-an-ip").is_loopback());
+    }
+
+    // --- Download tickets (issue #15) ---------------------------------------
+
+    fn authed(method: &str, uri: &str, body: Option<serde_json::Value>) -> HttpRequest<Body> {
+        let builder = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:8765")
+            .header(API_TOKEN_HEADER, TOKEN);
+        match body {
+            Some(json) => builder
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json.to_string()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        }
+    }
+
+    fn anonymous(method: &str, uri: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:8765")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Mints a ticket for `url` (with the header token) and returns it.
+    async fn ticket_for(router: &Router, url: &str) -> String {
+        let res = router
+            .clone()
+            .oneshot(authed("POST", "/api/download-ticket", Some(serde_json::json!({ "url": url }))))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "minting for {}", url);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["expires_in"], 60);
+        json["ticket"].as_str().unwrap().to_string()
+    }
+
+    fn with_ticket(url: &str, ticket: &str) -> String {
+        format!("{}{}ticket={}", url, if url.contains('?') { "&" } else { "?" }, ticket)
+    }
+
+    async fn get_with_ticket(router: &Router, url: &str, ticket: &str) -> Response {
+        router.clone().oneshot(anonymous("GET", &with_ticket(url, ticket))).await.unwrap()
+    }
+
+    /// A router with one archived message; returns the router and its id.
+    async fn router_with_message(dir: &std::path::Path, ttl: std::time::Duration) -> (Router, String) {
+        let mut state = test_state(dir, Vec::new()).await;
+        state.download_tickets = Arc::new(tickets::DownloadTickets::with_ttl(ttl));
+        let raw = b"From: a@example.com\r\nSubject: ticketed\r\n\r\nbody\r\n";
+        let stored = state.storage.store_eml("acc1", "INBOX", 1, None, raw).unwrap();
+        state.db.upsert_account("acc1", "A", "a@example.com", "generic_imap").unwrap();
+        let folder = state.db.get_or_create_folder("acc1", "INBOX", "inbox", Some(1)).unwrap();
+        let id = state
+            .db
+            .insert_message(
+                "acc1",
+                &folder.id,
+                1,
+                None,
+                Some("ticketed"),
+                Some("a@example.com"),
+                None,
+                None,
+                None,
+                raw.len() as u64,
+                &stored.relative_path.to_string_lossy(),
+                &stored.sha256,
+                None,
+                &[],
+            )
+            .unwrap();
+        (create_router(state), id)
+    }
+
+    #[tokio::test]
+    async fn a_ticket_downloads_its_target_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, id) = router_with_message(dir.path(), tickets::TICKET_TTL).await;
+        let eml = format!("/api/messages/{}/download", id);
+
+        let ticket = ticket_for(&router, &eml).await;
+        let res = get_with_ticket(&router, &eml, &ticket).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert!(body.starts_with(b"From: a@example.com"), "the handler's own output");
+        assert_eq!(get_with_ticket(&router, &eml, &ticket).await.status(), StatusCode::UNAUTHORIZED, "reused");
+
+        for url in ["/api/accounts/csv-template", "/api/logs/download"] {
+            let ticket = ticket_for(&router, url).await;
+            assert_eq!(get_with_ticket(&router, url, &ticket).await.status(), StatusCode::OK, "{}", url);
+        }
+        // mbox: the handler runs (an unknown account is the handler's 404, not 401)
+        let mbox = "/api/export/mbox/download?account_id=acc1&folder_id=";
+        let ticket = ticket_for(&router, mbox).await;
+        assert_ne!(get_with_ticket(&router, mbox, &ticket).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_ticket_is_bound_to_the_complete_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, id) = router_with_message(dir.path(), tickets::TICKET_TTL).await;
+        let eml = format!("/api/messages/{}/download", id);
+        let mbox = "/api/export/mbox/download?account_id=acc1&folder_id=f1".to_string();
+        let log = "/api/logs/download?file=events.log".to_string();
+        let cases: Vec<(String, String)> = vec![
+            (eml.clone(), "/api/messages/other-id/download".into()),
+            (mbox.clone(), "/api/export/mbox/download?account_id=acc2&folder_id=f1".into()),
+            (mbox.clone(), "/api/export/mbox/download?account_id=acc1&folder_id=f2".into()),
+            (mbox.clone(), "/api/export/mbox/download?account_id=acc1".into()),
+            (mbox.clone(), format!("{}&extra=1", mbox)),
+            (mbox.clone(), "/api/export/mbox/download?folder_id=f1&account_id=acc1".into()),
+            (log.clone(), "/api/logs/download?file=service.log".into()),
+            (log.clone(), "/api/logs/download".into()),
+            ("/api/accounts/csv-template".into(), "/api/logs/download".into()),
+        ];
+        for (issued_for, used_on) in cases {
+            let ticket = ticket_for(&router, &issued_for).await;
+            assert_eq!(
+                get_with_ticket(&router, &used_on, &ticket).await.status(),
+                StatusCode::UNAUTHORIZED,
+                "ticket for {} used on {}",
+                issued_for,
+                used_on
+            );
+            assert_eq!(
+                get_with_ticket(&router, &issued_for, &ticket).await.status(),
+                StatusCode::UNAUTHORIZED,
+                "a mismatched use burns the ticket for {}",
+                issued_for
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tickets_never_authorize_other_routes_or_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, id) = router_with_message(dir.path(), tickets::TICKET_TTL).await;
+        let eml = format!("/api/messages/{}/download", id);
+        // A ticket for a real download, presented elsewhere
+        for (method, uri) in [
+            ("GET", "/api/version"),
+            ("GET", "/api/settings"),
+            ("PUT", "/api/settings"),
+            ("POST", "/api/logs/clear"),
+            ("POST", "/api/sync/acc1"),
+            ("POST", "/api/download-ticket"),
+            ("HEAD", eml.as_str()),
+            ("POST", eml.as_str()),
+        ] {
+            let ticket = ticket_for(&router, &eml).await;
+            let res = router.clone().oneshot(anonymous(method, &with_ticket(uri, &ticket))).await.unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{} {}", method, uri);
+            // Not consumed by those attempts: they never reach the store
+            assert_eq!(get_with_ticket(&router, &eml, &ticket).await.status(), StatusCode::OK, "{} {}", method, uri);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_ticket_parameters_are_rejected_not_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, id) = router_with_message(dir.path(), tickets::TICKET_TTL).await;
+        for uri in [
+            "/api/logs/download?ticket".to_string(),
+            "/api/logs/download?file=events.log&ticket".to_string(),
+            "/api/logs/download?ticket=".to_string(),
+            "/api/logs/download?file=events.log&ticket=".to_string(),
+            "/api/accounts/csv-template?ticket".to_string(),
+            "/api/export/mbox/download?account_id=acc1&ticket".to_string(),
+            format!("/api/messages/{}/download?ticket", id),
+        ] {
+            assert_eq!(status(&router, anonymous("GET", &uri)).await, StatusCode::UNAUTHORIZED, "{}", uri);
+        }
+    }
+
+    #[tokio::test]
+    async fn tickets_expire() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, _) = router_with_message(dir.path(), std::time::Duration::from_millis(50)).await;
+        let res = router
+            .clone()
+            .oneshot(authed("POST", "/api/download-ticket", Some(serde_json::json!({ "url": "/api/logs/download" }))))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let ticket = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["ticket"].as_str().unwrap().to_string();
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(get_with_ticket(&router, "/api/logs/download", &ticket).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn concurrent_uses_of_one_ticket_succeed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, id) = router_with_message(dir.path(), tickets::TICKET_TTL).await;
+        let eml = format!("/api/messages/{}/download", id);
+        let ticket = ticket_for(&router, &eml).await;
+        let uri = with_ticket(&eml, &ticket);
+        let requests = (0..16).map(|_| {
+            let (router, uri) = (router.clone(), uri.clone());
+            tokio::spawn(async move { router.oneshot(anonymous("GET", &uri)).await.unwrap().status() })
+        });
+        let statuses: Vec<StatusCode> = futures_util::future::join_all(requests).await.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(statuses.iter().filter(|s| **s == StatusCode::OK).count(), 1, "{:?}", statuses);
+        assert!(statuses.iter().all(|s| *s == StatusCode::OK || *s == StatusCode::UNAUTHORIZED));
+    }
+
+    #[tokio::test]
+    async fn minting_needs_the_header_and_a_download_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+        let anonymous_mint = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/download-ticket")
+            .header(header::HOST, "127.0.0.1:8765")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"url":"/api/logs/download"}"#))
+            .unwrap();
+        assert_eq!(status(&router, anonymous_mint).await, StatusCode::UNAUTHORIZED);
+
+        for url in [
+            "/api/version",
+            "/api/settings",
+            "/api/download-ticket",
+            "//evil.example/api/logs/download",
+            "http://127.0.0.1:8765/api/logs/download",
+            "/api/logs/download#frag",
+            "/api/logs/download?ticket=x",
+            "/",
+        ] {
+            let req = authed("POST", "/api/download-ticket", Some(serde_json::json!({ "url": url })));
+            assert_eq!(status(&router, req).await, StatusCode::BAD_REQUEST, "{}", url);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_tickets_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+        for _ in 0..tickets::MAX_LIVE_TICKETS {
+            ticket_for(&router, "/api/logs/download").await;
+        }
+        let req = authed("POST", "/api/download-ticket", Some(serde_json::json!({ "url": "/api/logs/download" })));
+        assert_eq!(status(&router, req).await, StatusCode::TOO_MANY_REQUESTS);
     }
 }

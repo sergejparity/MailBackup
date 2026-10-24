@@ -105,7 +105,7 @@ cargo run -p mailbackup-server
 
 Open your browser at `http://127.0.0.1:8765` to access the full offline email browser, attachment previewer, and account manager.
 
-**API access:** the server listens on `127.0.0.1` only. Every `/api/*` request must carry a random per-process token, which the server embeds in the page it serves, so other websites and DNS-rebinding attacks can't call the API. The token changes whenever the server restarts, so reload open browser tabs after a restart.
+**API access:** the server listens on `127.0.0.1` only. Every `/api/*` request must carry a random per-process token, which the server embeds in the page it serves, so other websites and DNS-rebinding attacks can't call the API. The token changes whenever the server restarts, so reload open browser tabs after a restart. The token is only ever sent in the `X-MailBackup-Token` header, never in a URL. Download links instead carry a ticket that the page requests right before each download: it works once, for that one file, within a minute.
 
 **Desktop app and the server it shows:** the desktop app only displays a MailBackup server that proves it was started by your account.
 - **The runtime file:** every server writes a private runtime file next to its `config.yaml`, `.server-<port>.json`. It is owner-only, and on Windows it inherits the permissions of your user profile.

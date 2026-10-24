@@ -1,6 +1,7 @@
 // Browser test for issue #8: opening an HTML mail must not contact any remote
 // server until "Load remote content" is clicked. Also checks (issue #10) that
-// the UI itself loads nothing but the local server's files.
+// the UI itself loads nothing but the local server's files, and (issue #15)
+// that downloads carry a single-use ticket instead of the API token.
 //
 // Needs Node 18+, Playwright and a Chromium for it, and a built server:
 //   cargo build -p mailbackup-server
@@ -12,7 +13,7 @@
 
 import { createRequire } from 'node:module';
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import http from 'node:http';
@@ -115,6 +116,18 @@ try {
   check(!loaded.includes('/refresh') && !loaded.includes('/prefetch'), 'refresh and prefetch still never fire');
   check(!(await page.isVisible('#view-remote-banner')), 'the banner hides after loading remote content');
   check((await frameHandle.contentFrame()).url() === 'about:srcdoc', 'still no navigation after loading remote content');
+
+  // Issue #15: a download link carries a one-time ticket, never the API token
+  const [download] = await Promise.all([page.waitForEvent('download'), page.click('#btn-download-raw-eml')]);
+  const downloadUrl = download.url();
+  check(/[?&]ticket=[0-9a-f]{64}$/.test(downloadUrl) && !downloadUrl.includes('token='),
+    `the .eml download URL has a ticket and no token (${downloadUrl})`);
+  const saved = readFileSync(await download.path(), 'utf8');
+  check(/^Subject:/m.test(saved), `the downloaded .eml arrives (${saved.length} bytes)`);
+  const reuse = (await fetch(downloadUrl)).status;
+  check(reuse === 401, `the ticket can't be used a second time (${reuse})`);
+  const withToken = pageRequests.filter((u) => /[?&]token=/.test(u));
+  check(withToken.length === 0, `no request URL carries the API token (${JSON.stringify(withToken)})`);
 } finally {
   await browser.close();
   server.kill();
