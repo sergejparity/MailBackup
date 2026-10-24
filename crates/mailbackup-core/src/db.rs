@@ -617,6 +617,19 @@ impl Database {
             .optional()?;
         if let Some((live_id, archive_id)) = row {
             move_account_rows(&tx, &archive_id, &live_id)?;
+            // Prepare and this undo each started a new generation, which keeps
+            // any session from before the switch fenced. The messages that
+            // were current before the switch (two generations back) become
+            // current again, so the checkpoint and the UIDs they hold stay
+            // valid and they aren't mistaken for older copies to re-bind.
+            // Messages from even older generations stay where they were.
+            tx.execute(
+                r#"UPDATE messages
+                   SET uid_generation = (SELECT f.uid_generation FROM folders f WHERE f.id = messages.folder_id)
+                   WHERE account_id = ?1
+                     AND uid_generation = (SELECT f.uid_generation - 2 FROM folders f WHERE f.id = messages.folder_id)"#,
+                params![live_id],
+            )?;
             tx.execute("UPDATE account_transitions SET state = 'aborted' WHERE id = ?1", params![id])?;
         }
         tx.commit()?;
@@ -625,12 +638,21 @@ impl Database {
 
     /// Transitions left `prepared` by a crash or a failure.
     pub fn prepared_transitions(&self) -> Result<Vec<TransitionRecord>> {
+        self.prepared_transitions_where(None)
+    }
+
+    /// [`Self::prepared_transitions`] of one live account.
+    pub fn prepared_transitions_of(&self, live_id: &str) -> Result<Vec<TransitionRecord>> {
+        self.prepared_transitions_where(Some(live_id))
+    }
+
+    fn prepared_transitions_where(&self, live_id: Option<&str>) -> Result<Vec<TransitionRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT id, live_id, archive_id, seq, old_credential_ref, staged_credential_ref
-               FROM account_transitions WHERE state = 'prepared' ORDER BY id"#,
+               FROM account_transitions WHERE state = 'prepared' AND (?1 IS NULL OR live_id = ?1) ORDER BY id"#,
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(params![live_id], |r| {
             Ok(TransitionRecord {
                 id: r.get(0)?,
                 live_id: r.get(1)?,

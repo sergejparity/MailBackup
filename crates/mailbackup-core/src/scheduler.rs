@@ -126,7 +126,7 @@ impl BackupScheduler {
                     // Hold the account's gate for the whole job and sync the
                     // account as it is now, not as it was when scheduled
                     let (_gate, acc) = match &config_path {
-                        Some(path) => match crate::sync_gate::begin_account_sync(path, &snapshot.id).await {
+                        Some(path) => match crate::sync_gate::begin_account_sync(&db, &creds, path, &snapshot.id).await {
                             Ok((gate, acc)) if acc.enabled => (Some(gate), acc),
                             Ok(_) => {
                                 info!("Skipping scheduled backup of '{}': disabled since it was scheduled", snapshot.id);

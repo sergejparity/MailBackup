@@ -14,7 +14,7 @@ struct Setup {
     a: Archive,
     config_path: PathBuf,
     config: AppConfig,
-    creds: CredentialStore,
+    creds: Arc<CredentialStore>,
 }
 
 fn setup(server: &FakeImap, password: &str) -> Setup {
@@ -28,9 +28,11 @@ fn setup(server: &FakeImap, password: &str) -> Setup {
         ..Default::default()
     };
     config.save(&config_path).unwrap();
-    let creds = CredentialStore::with_paths(dir.join(".credentials_store.json"), dir.join(".credentials_key"))
-        .with_passphrase(None)
-        .with_keyring(Arc::new(NoKeyring));
+    let creds = Arc::new(
+        CredentialStore::with_paths(dir.join(".credentials_store.json"), dir.join(".credentials_key"))
+            .with_passphrase(None)
+            .with_keyring(Arc::new(NoKeyring)),
+    );
     creds.set_account_password(&config.accounts[0], password).unwrap();
     Setup { a, config_path, config, creds }
 }
@@ -210,6 +212,91 @@ async fn a_crash_after_the_commit_is_finished_with_the_new_password() {
 }
 
 #[tokio::test]
+async fn a_process_already_running_settles_a_switch_another_one_crashed_in() {
+    for commit_first in [false, true] {
+        let (server_a, server_b) = (FakeImap::start().await, FakeImap::start().await);
+        server_a.set(Some(1), &[(1, &mail("A1")), (2, &mail("A2"))]);
+        server_b.set(Some(1), &[(1, &mail("B1"))]);
+        let mut s = setup(&server_a, "pw-old");
+        sync(&s.a, &server_a, &live(&s)).await;
+        let snapshot = live(&s);
+        // Another process crashes mid-switch; its lock dies with it, and no
+        // restart (recovery) happens in this one
+        crash_at_save(&mut s, &server_b, "pw-new", commit_first);
+
+        // This process's next sync of the account settles the switch first
+        let (gate, acc) = sync_gate::begin_account_sync(&s.a.db, &s.creds, &s.config_path, "acc").await.unwrap();
+        assert!(s.a.db.prepared_transitions().unwrap().is_empty(), "commit_first={}: settled", commit_first);
+        let password = s.creds.get_account_password(&acc).unwrap();
+        drop(gate);
+        let disk = on_disk(&s.config_path);
+        if commit_first {
+            assert_eq!((acc.imap_port, password.as_str()), (server_b.port, "pw-new"));
+            sync(&s.a, &server_b, &acc).await;
+            let archive_id = disk.accounts.iter().find(|a| a.is_archive()).unwrap().id.clone();
+            assert_eq!(subjects_of(&s, &archive_id), ["A1", "A2"]);
+            assert_eq!(subjects_of(&s, "acc"), ["B1"]);
+        } else {
+            assert_eq!(acc, snapshot, "the old account, as before the switch");
+            assert_eq!(password, "pw-old");
+            server_a.take_fetched();
+            sync(&s.a, &server_a, &acc).await;
+            assert!(server_a.take_fetched().is_empty(), "nothing downloaded again");
+            assert_eq!(s.a.db.get_folders("acc").unwrap().len(), 1, "one INBOX, no duplicate folder");
+            assert_eq!(subjects_of(&s, "acc"), ["A1", "A2"]);
+            assert!(disk.accounts.iter().all(|a| !a.is_archive()));
+        }
+        // And a later switch starts clean
+        s.config = disk;
+        let next = switch(&mut s, if commit_first { &server_a } else { &server_b }, "pw-later");
+        assert!(next.archive.id.ends_with("-2"), "{}", next.archive.id);
+    }
+}
+
+#[tokio::test]
+async fn a_switch_settles_one_another_process_crashed_in_first() {
+    let (server_a, server_b) = (FakeImap::start().await, FakeImap::start().await);
+    server_a.set(Some(1), &[(1, &mail("A1"))]);
+    let mut s = setup(&server_a, "pw-old");
+    sync(&s.a, &server_a, &live(&s)).await;
+    crash_at_save(&mut s, &server_b, "pw-new", false);
+
+    let retried = switch(&mut s, &server_b, "pw-new");
+    assert!(s.a.db.prepared_transitions().unwrap().is_empty());
+    assert!(retried.archive.id.ends_with("-2"), "{}", retried.archive.id);
+    assert_eq!(subjects_of(&s, &retried.archive.id), ["A1"]);
+    assert!(subjects_of(&s, "acc").is_empty());
+    assert!(s.creds.get_password("acc~cred-1").unwrap_err().is_not_found(), "the crashed attempt's secret is gone");
+    assert_eq!(s.creds.get_account_password(&retried.live).unwrap(), "pw-new");
+}
+
+#[tokio::test]
+async fn after_a_failed_switch_an_identical_new_copy_is_archived_as_well() {
+    let (server_a, server_b) = (FakeImap::start().await, FakeImap::start().await);
+    server_a.set(Some(1), &[(1, &mail("A"))]);
+    let mut s = setup(&server_a, "pw-old");
+    sync(&s.a, &server_a, &live(&s)).await;
+    let c = conn(&server_b, "pw-new");
+    archive::start_new_archive_with(
+        &s.a.db, &s.creds, &mut s.config, &s.config_path, "acc", &c, chrono::Utc::now(),
+        |_| Err(Error::Other("disk full".into())),
+    )
+    .err()
+    .expect("fails");
+
+    // The server gains a second, byte-identical copy at UID 2
+    server_a.set(Some(1), &[(1, &mail("A")), (2, &mail("A"))]);
+    server_a.take_fetched();
+    sync(&s.a, &server_a, &live(&s)).await;
+    assert_eq!(server_a.take_fetched(), [2], "only the new UID is downloaded");
+    let rows = s.a.db.get_messages_for_folder(&inbox(&s.a).id).unwrap();
+    let mut uids: Vec<u32> = rows.iter().map(|m| m.uid).collect();
+    uids.sort();
+    assert_eq!(uids, [1, 2], "both copies kept: UID 1 isn't re-bound to UID 2");
+    assert_eq!(inbox(&s.a).last_synced_uid, 2);
+}
+
+#[tokio::test]
 async fn a_sync_queued_behind_the_switch_uses_the_new_connection() {
     let (server_a, server_b) = (FakeImap::start().await, FakeImap::start().await);
     server_a.set(Some(1), &[(1, &mail("A1"))]);
@@ -221,15 +308,16 @@ async fn a_sync_queued_behind_the_switch_uses_the_new_connection() {
     // While the switch holds the gate, a sync of the account starts and waits
     let c = conn(&server_b, "pw-b");
     let config_path = s.config_path.clone();
+    let (db, creds) = (s.a.db.clone(), s.creds.clone());
     let (tx, rx) = std::sync::mpsc::channel();
     let switched = archive::start_new_archive_with(
         &s.a.db, &s.creds, &mut s.config, &s.config_path, "acc", &c, chrono::Utc::now(),
         |next| {
             let path = config_path.clone();
-            let tx = tx.clone();
+            let (tx, db, creds) = (tx.clone(), db.clone(), creds.clone());
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
-                let got = rt.block_on(sync_gate::begin_account_sync(&path, "acc")).map(|(_, acc)| acc);
+                let got = rt.block_on(sync_gate::begin_account_sync(&db, &creds, &path, "acc")).map(|(_, acc)| acc);
                 tx.send(got).unwrap();
             });
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -262,9 +350,9 @@ async fn syncs_of_archives_or_removed_accounts_are_refused_and_a_running_sync_bl
     let switched = switch(&mut s, &server_b, "pw-b");
     let archive_id = switched.archive.id.clone();
     drop(switched.gate);
-    let refused = sync_gate::begin_account_sync(&s.config_path, &archive_id).await.err().unwrap();
+    let refused = sync_gate::begin_account_sync(&s.a.db, &s.creds, &s.config_path, &archive_id).await.err().unwrap();
     assert!(matches!(refused, Error::AccountArchived(_)), "{}", refused);
-    let gone = sync_gate::begin_account_sync(&s.config_path, "nobody").await.err().unwrap();
+    let gone = sync_gate::begin_account_sync(&s.a.db, &s.creds, &s.config_path, "nobody").await.err().unwrap();
     assert!(matches!(gone, Error::AccountNotFound(_)), "{}", gone);
 }
 

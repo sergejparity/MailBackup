@@ -14,8 +14,10 @@
 //! 4. **finish**: mark the transition done and delete the old password.
 //!
 //! A failure before the commit undoes 1–2; after it, the switch stands.
-//! [`recover`] settles transitions a crash left half-done the same way: the
-//! config on disk decides.
+//! A crash leaves the transition `prepared`; it is settled the same way (the
+//! config on disk decides) by [`recover`] at startup and by [`settle_pending`]
+//! under the gate before any later sync or switch of the account, so a
+//! process that was already running never syncs over a half-done switch.
 
 use crate::config::{AccountConfig, AppConfig, ArchiveInfo};
 use crate::db::{Database, NewTransition};
@@ -70,6 +72,9 @@ pub fn start_new_archive_with(
     save: impl FnOnce(&AppConfig) -> Result<()>,
 ) -> Result<Switched> {
     let gate = SyncGate::try_acquire(config_path, account_id)?.ok_or_else(|| Error::AccountBusy(account_id.to_string()))?;
+    // A switch that crashed half-way is settled before this one starts (if
+    // it had committed, the check below sees the account changed on disk)
+    settle_pending(db, credentials, config_path, account_id)?;
 
     // Revalidate under the gate: the account as the caller sees it must be
     // the one on disk, live, and actually changing connection
@@ -154,20 +159,41 @@ pub fn start_new_archive_with(
 /// still running (e.g. in the server while the CLI starts) and is left alone.
 pub fn recover(db: &Database, credentials: &CredentialStore, config_path: &Path) -> Result<usize> {
     let mut settled = 0;
-    for t in db.prepared_transitions()? {
-        let Some(_gate) = SyncGate::try_acquire(config_path, &t.live_id)? else {
+    let mut accounts: Vec<String> = db.prepared_transitions()?.into_iter().map(|t| t.live_id).collect();
+    accounts.sort();
+    accounts.dedup();
+    for account_id in accounts {
+        let Some(_gate) = SyncGate::try_acquire(config_path, &account_id)? else {
             continue;
         };
-        let committed = AppConfig::load_existing(config_path)?
-            .is_some_and(|c| c.accounts.iter().any(|a| a.id == t.archive_id));
+        settled += settle_pending(db, credentials, config_path, &account_id)?;
+    }
+    Ok(settled)
+}
+
+/// Settles `account_id`'s transitions left `prepared` by a crash: finished if
+/// the config on disk has the archive (the commit happened), undone
+/// otherwise. The caller must hold the account's gate, so none of them is
+/// still running. Fails if one couldn't be settled: syncing or switching the
+/// account on top of it isn't safe.
+pub fn settle_pending(db: &Database, credentials: &CredentialStore, config_path: &Path, account_id: &str) -> Result<usize> {
+    let pending = db.prepared_transitions_of(account_id)?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let config = AppConfig::load_existing(config_path)?;
+    for t in &pending {
+        let committed = config.as_ref().is_some_and(|c| c.accounts.iter().any(|a| a.id == t.archive_id));
         if committed {
             finish(db, credentials, t.id, &t.old_credential_ref);
         } else {
             undo(db, credentials, t.id, &t.staged_credential_ref);
         }
-        settled += 1;
     }
-    Ok(settled)
+    if !db.prepared_transitions_of(account_id)?.is_empty() {
+        return Err(Error::Other(format!("A change of account '{}' couldn't be completed or undone; see the log", account_id)));
+    }
+    Ok(pending.len())
 }
 
 fn undo(db: &Database, credentials: &CredentialStore, transition: i64, staged_ref: &str) {

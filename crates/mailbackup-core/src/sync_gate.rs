@@ -12,7 +12,9 @@
 //! removed. It never connects with a stale snapshot.
 
 use crate::config::{AccountConfig, AppConfig};
+use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::keyring::CredentialStore;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -77,11 +79,20 @@ pub async fn acquire_async(config_path: PathBuf, account_id: String) -> Result<S
         .map_err(|e| Error::Other(format!("sync gate task failed: {}", e)))?
 }
 
-/// Starts a sync of `account_id`: waits for its gate, then reads the account
-/// from the config on disk. Refused if the account is gone or a read-only
-/// archive; the caller decides what else to check (e.g. `enabled`).
-pub async fn begin_account_sync(config_path: &Path, account_id: &str) -> Result<(SyncGate, AccountConfig)> {
+/// Starts a sync of `account_id`: waits for its gate, settles a change of
+/// the account's connection that crashed half-way (another process may have
+/// died mid-switch while this one was running), then reads the account from
+/// the config on disk. Refused if the account is gone, a read-only archive,
+/// or has a change that couldn't be settled; the caller decides what else to
+/// check (e.g. `enabled`).
+pub async fn begin_account_sync(
+    db: &Database,
+    credentials: &CredentialStore,
+    config_path: &Path,
+    account_id: &str,
+) -> Result<(SyncGate, AccountConfig)> {
     let gate = acquire_async(config_path.to_path_buf(), account_id.to_string()).await?;
+    crate::archive::settle_pending(db, credentials, config_path, account_id)?;
     let account = current_account(config_path, account_id)?;
     Ok((gate, account))
 }

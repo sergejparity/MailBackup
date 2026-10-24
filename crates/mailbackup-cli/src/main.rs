@@ -633,7 +633,7 @@ async fn handle_sync(
     for snapshot in accounts_to_sync {
         // Hold the account's sync gate, and sync it as the config on disk has
         // it once the gate is ours (a change may have finished meanwhile)
-        let (_gate, acc) = match mailbackup_core::sync_gate::begin_account_sync(config_path, &snapshot.id).await {
+        let (_gate, acc) = match mailbackup_core::sync_gate::begin_account_sync(db, credentials, config_path, &snapshot.id).await {
             Ok(gated) => gated,
             Err(e) => {
                 println!("{} Skipping {}: {}", WARN_EMOJI, snapshot.id, e);

@@ -1330,7 +1330,7 @@ async fn api_sync_account(
         // Hold the account's sync gate for the whole sync, and sync the
         // account as the config on disk has it once the gate is ours: a change
         // of its connection may have finished while this request waited
-        let gated = match mailbackup_core::sync_gate::begin_account_sync(&config_path, &acc.id).await {
+        let gated = match mailbackup_core::sync_gate::begin_account_sync(&db, &credentials, &config_path, &acc.id).await {
             Ok((gate, current)) => credentials.get_account_password(&current).map(|pw| (gate, current, pw)),
             Err(e) => Err(e),
         };
