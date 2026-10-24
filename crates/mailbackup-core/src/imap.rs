@@ -350,10 +350,11 @@ impl ImapSyncEngine {
                 };
 
                 // Store atomic raw .eml
-                let stored = self.storage.store_eml(
+                let stored = self.storage.store_eml_in_generation(
                     &account.id,
                     folder_name,
                     uid,
+                    generation,
                     date,
                     raw_body,
                 )?;

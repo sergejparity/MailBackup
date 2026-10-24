@@ -23,6 +23,8 @@ struct Mailbox {
     fetched: Vec<u32>,
     /// Drop the connection instead of answering a fetch of this UID (once)
     fail_fetch_of: Option<u32>,
+    /// INTERNALDATE per UID (default 24-Oct-2026)
+    internal_dates: std::collections::HashMap<u32, String>,
 }
 
 #[derive(Clone)]
@@ -54,6 +56,10 @@ impl FakeImap {
 
     fn take_fetched(&self) -> Vec<u32> {
         std::mem::take(&mut self.mailbox.lock().unwrap().fetched)
+    }
+
+    fn set_internal_dates(&self, dates: &[(u32, &str)]) {
+        self.mailbox.lock().unwrap().internal_dates = dates.iter().map(|(u, d)| (*u, d.to_string())).collect();
     }
 
     fn fail_fetch_of(&self, uid: u32) {
@@ -110,17 +116,19 @@ async fn serve(stream: TcpStream, mailbox: Arc<Mutex<Mailbox>>) {
                     None
                 } else {
                     mb.fetched.push(uid);
-                    Some(mb.messages.iter().position(|(u, _)| *u == uid).map(|i| (i + 1, mb.messages[i].1.clone())))
+                    let date = mb.internal_dates.get(&uid).cloned().unwrap_or_else(|| "24-Oct-2026 10:00:00 +0000".into());
+                    Some(mb.messages.iter().position(|(u, _)| *u == uid).map(|i| (i + 1, mb.messages[i].1.clone(), date)))
                 }
             };
             match found {
                 None => return, // connection drops mid-sync
-                Some(Some((seq, body))) => {
+                Some(Some((seq, body, date))) => {
                     out.extend(
                         format!(
-                            "* {} FETCH (UID {} INTERNALDATE \"24-Oct-2026 10:00:00 +0000\" BODY[] {{{}}}\r\n",
+                            "* {} FETCH (UID {} INTERNALDATE \"{}\" BODY[] {{{}}}\r\n",
                             seq,
                             uid,
+                            date,
                             body.len()
                         )
                         .bytes(),
@@ -442,4 +450,66 @@ async fn a_superseded_session_cannot_write() {
     let folder = inbox(&a);
     assert_eq!((folder.uid_generation, folder.last_synced_uid), (second.generation, 5), "B's state untouched");
     assert_eq!(subjects(&a), ["A"], "nothing written by the old session");
+}
+
+#[tokio::test]
+async fn copies_never_share_a_file_that_retention_could_delete() {
+    use mailbackup_core::retention::RetentionManager;
+    let (a, server) = (archive(), FakeImap::start().await);
+    let acc = account(&server, "user");
+    // A (no Date header, so dated by INTERNALDATE) archived at UID 2, early March
+    server.set(Some(1), &[(2, &mail("A"))]);
+    server.set_internal_dates(&[(2, "03-Mar-2026 10:00:00 +0000")]);
+    sync(&a, &server, &acc).await;
+
+    // Renumbered: identical A at UIDs 1 and 2, received later the same month.
+    // UID 1 re-binds the archived copy (file named after the old UID 2);
+    // UID 2 is a second copy and must get a file of its own
+    server.set(Some(2), &[(1, &mail("A")), (2, &mail("A"))]);
+    server.set_internal_dates(&[(1, "20-Mar-2026 10:00:00 +0000"), (2, "20-Mar-2026 10:00:00 +0000")]);
+    sync(&a, &server, &acc).await;
+    let rows = archived(&a);
+    assert_eq!(rows.len(), 2);
+    assert_ne!(rows[0].0.relative_path, rows[1].0.relative_path, "each copy has its own file");
+
+    // Retention as of 25 March, 10 days: the early-March row expires, the
+    // later one is kept and must stay readable
+    let report = RetentionManager::new(&a.db, &a.storage)
+        .enforce_retention_as_of("acc", Some(10), chrono::DateTime::parse_from_rfc3339("2026-03-25T00:00:00Z").unwrap().into())
+        .unwrap();
+    assert_eq!(report.pruned_count, 1);
+    let kept = archived(&a);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].1, mail("A"), "the kept copy's file is still there");
+}
+
+#[test]
+fn retention_keeps_a_file_another_row_still_uses() {
+    use mailbackup_core::retention::RetentionManager;
+    // Two rows sharing one file (a safety net: nothing should create this
+    // any more): only the expired row goes, and the file stays
+    let a = archive();
+    let folder = a.db.get_or_create_folder("acc", "INBOX", "INBOX", Some(1)).unwrap();
+    let stored = a.storage.store_eml("acc", "INBOX", 2, None, &mail("A")).unwrap();
+    let path = stored.relative_path.to_string_lossy().to_string();
+    let date = |s: &str| Some(chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc));
+    for (uid, when) in [(1, "2026-03-03T10:00:00Z"), (2, "2026-03-20T10:00:00Z")] {
+        a.db.insert_message(
+            "acc", &folder.id, uid, None, Some("A"), None, None, None, date(when), stored.size_bytes, &path,
+            &stored.sha256, None, &[],
+        )
+        .unwrap();
+    }
+    let report = RetentionManager::new(&a.db, &a.storage)
+        .enforce_retention_as_of("acc", Some(10), date("2026-03-25T00:00:00Z").unwrap())
+        .unwrap();
+    assert_eq!((report.pruned_count, report.reclaimed_bytes), (1, 0), "row pruned, file kept");
+    assert_eq!(archived(&a)[0].1, mail("A"));
+
+    // Once the last row using it expires, the file goes too
+    let report = RetentionManager::new(&a.db, &a.storage)
+        .enforce_retention_as_of("acc", Some(1), date("2026-04-30T00:00:00Z").unwrap())
+        .unwrap();
+    assert_eq!((report.pruned_count, report.reclaimed_bytes), (1, stored.size_bytes));
+    assert!(!stored.absolute_path.exists());
 }

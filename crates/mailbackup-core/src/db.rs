@@ -1231,6 +1231,16 @@ impl Database {
         Ok(list)
     }
 
+    /// Whether any catalog row still points at this archived file.
+    pub fn is_path_referenced(&self, relative_path: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE relative_path = ?1)",
+            params![relative_path],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn delete_message_record(&self, message_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM messages_fts WHERE message_id = ?1", params![message_id])?;

@@ -120,6 +120,23 @@ impl StorageEngine {
         date: Option<DateTime<Utc>>,
         raw_bytes: &[u8],
     ) -> Result<StoredMessageInfo> {
+        self.store_eml_in_generation(account_id, folder_name, uid, 0, date, raw_bytes)
+    }
+
+    /// Like [`Self::store_eml`] for a message fetched as `uid` of a folder's
+    /// UID `generation`. Later generations put the generation in the file
+    /// name: archived copies re-bound to a new UID keep their old file, which
+    /// may already carry this UID's name, and two catalog rows must never
+    /// share a file (retention deletes each row's file).
+    pub fn store_eml_in_generation(
+        &self,
+        account_id: &str,
+        folder_name: &str,
+        uid: u32,
+        generation: u32,
+        date: Option<DateTime<Utc>>,
+        raw_bytes: &[u8],
+    ) -> Result<StoredMessageInfo> {
         let folder_slug = Self::sanitize_slug(folder_name);
         let date_time = date.unwrap_or_else(Utc::now);
         let year_str = date_time.format("%Y").to_string();
@@ -128,8 +145,13 @@ impl StorageEngine {
         let sha256 = Self::compute_sha256(raw_bytes);
         let size_bytes = raw_bytes.len() as u64;
 
-        // Target file name: <uid>_<sha256_prefix>.eml
-        let file_name = format!("{}_{}.eml", uid, &sha256[..12]);
+        // Target file name: <uid>_<sha256_prefix>.eml, or
+        // <uid>_g<generation>_<sha256_prefix>.eml after a re-scan
+        let file_name = if generation == 0 {
+            format!("{}_{}.eml", uid, &sha256[..12])
+        } else {
+            format!("{}_g{}_{}.eml", uid, generation, &sha256[..12])
+        };
         let relative_path = PathBuf::from(account_id)
             .join(&folder_slug)
             .join(&year_str)

@@ -28,6 +28,16 @@ impl<'a> RetentionManager<'a> {
         account_id: &str,
         retention_days: Option<u32>,
     ) -> Result<RetentionReport> {
+        self.enforce_retention_as_of(account_id, retention_days, Utc::now())
+    }
+
+    /// [`Self::enforce_retention`] with `now` as the current time.
+    pub fn enforce_retention_as_of(
+        &self,
+        account_id: &str,
+        retention_days: Option<u32>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<RetentionReport> {
         let mut report = RetentionReport {
             account_id: account_id.to_string(),
             pruned_count: 0,
@@ -39,21 +49,25 @@ impl<'a> RetentionManager<'a> {
             _ => return Ok(report), // Retain forever
         };
 
-        let cutoff_date = Utc::now() - Duration::days(days as i64);
+        let cutoff_date = now - Duration::days(days as i64);
         let expired_messages = self.db.get_messages_older_than(account_id, cutoff_date)?;
 
         for msg in expired_messages {
-            // Delete file from storage
-            if let Err(e) = self.storage.delete_eml(&msg.relative_path) {
-                tracing::warn!("Failed to delete expired file {}: {}", msg.relative_path, e);
-            }
-
             // Delete database record and FTS index
             if let Err(e) = self.db.delete_message_record(&msg.id) {
                 tracing::warn!("Failed to delete DB record {}: {}", msg.id, e);
-            } else {
-                report.pruned_count += 1;
-                report.reclaimed_bytes += msg.size_bytes;
+                continue;
+            }
+            report.pruned_count += 1;
+
+            // Then the file, unless another (retained) row still uses it
+            match self.db.is_path_referenced(&msg.relative_path) {
+                Ok(false) => match self.storage.delete_eml(&msg.relative_path) {
+                    Ok(()) => report.reclaimed_bytes += msg.size_bytes,
+                    Err(e) => tracing::warn!("Failed to delete expired file {}: {}", msg.relative_path, e),
+                },
+                Ok(true) => tracing::debug!("Keeping {}: still referenced", msg.relative_path),
+                Err(e) => tracing::warn!("Keeping {}: couldn't check references: {}", msg.relative_path, e),
             }
         }
 
