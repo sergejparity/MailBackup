@@ -1,5 +1,5 @@
 use crate::config::AccountConfig;
-use crate::db::Database;
+use crate::db::{Database, FolderSync};
 use crate::error::{Error, Result};
 use crate::storage::StorageEngine;
 use chrono::{DateTime, Utc};
@@ -97,22 +97,52 @@ impl ImapSyncEngine {
         F: Fn(&SyncProgress) + Send + Sync + 'static,
     {
         let history_id = self.db.record_sync_start(&account.id)?;
-        let mut progress = SyncProgress {
-            account_id: account.id.clone(),
-            current_folder: String::new(),
-            total_messages: 0,
-            processed_messages: 0,
-            downloaded_bytes: 0,
-        };
 
         // Connect
-        let mut session = match Self::connect(account, password).await {
+        let session = match Self::connect(account, password).await {
             Ok(s) => s,
             Err(e) => {
                 let err_str = e.to_string();
                 let _ = self.db.record_sync_finish(&history_id, "failed", 0, 0, Some(&err_str));
                 return Err(e);
             }
+        };
+        self.run_session(session, account, &history_id, progress_callback).await
+    }
+
+    /// Like [`Self::sync_account`] over an already logged-in session, e.g. a
+    /// transport other than TLS.
+    pub async fn sync_session<S, F>(
+        &self,
+        session: async_imap::Session<S>,
+        account: &AccountConfig,
+        progress_callback: Option<F>,
+    ) -> Result<SyncProgress>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::fmt::Debug,
+        F: Fn(&SyncProgress) + Send + Sync + 'static,
+    {
+        let history_id = self.db.record_sync_start(&account.id)?;
+        self.run_session(session, account, &history_id, progress_callback).await
+    }
+
+    async fn run_session<S, F>(
+        &self,
+        mut session: async_imap::Session<S>,
+        account: &AccountConfig,
+        history_id: &str,
+        progress_callback: Option<F>,
+    ) -> Result<SyncProgress>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::fmt::Debug,
+        F: Fn(&SyncProgress) + Send + Sync + 'static,
+    {
+        let mut progress = SyncProgress {
+            account_id: account.id.clone(),
+            current_folder: String::new(),
+            total_messages: 0,
+            processed_messages: 0,
+            downloaded_bytes: 0,
         };
 
         let mut folder_names = Vec::new();
@@ -154,7 +184,7 @@ impl ImapSyncEngine {
 
         let status = if sync_error.is_some() { "partial_or_failed" } else { "success" };
         let _ = self.db.record_sync_finish(
-            &history_id,
+            history_id,
             status,
             progress.processed_messages,
             progress.downloaded_bytes,
@@ -203,15 +233,31 @@ impl ImapSyncEngine {
 
         let uidvalidity = mailbox.uid_validity;
         let local_slug = StorageEngine::sanitize_slug(folder_name);
-        let folder_rec = self.db.get_or_create_folder(
+        // This session reads and writes only `generation`; if a newer sync
+        // starts a new one meanwhile, this session's writes are refused
+        let FolderSync { folder: folder_rec, generation, rescan_reason } = self.db.begin_folder_sync(
             &account.id,
             folder_name,
             &local_slug,
             uidvalidity,
+            &account.remote_identity(),
         )?;
+        if let Some(reason) = &rescan_reason {
+            warn!("Re-scanning folder '{}' of {}: {}", folder_name, account.id, reason);
+            crate::event_log::log_event(
+                "SYNC_RESCAN",
+                &format!(
+                    "Re-scanning folder '{}' of account '{}' because {}. Archived messages are kept; messages already archived are recognized by content.",
+                    folder_name, account.id, reason
+                ),
+            );
+        }
 
         let last_uid = folder_rec.last_synced_uid;
-        debug!("Folder '{}' (ID: {}): last_synced_uid={}, uidvalidity={:?}", folder_name, folder_rec.id, last_uid, uidvalidity);
+        debug!(
+            "Folder '{}' (ID: {}): generation={}, last_synced_uid={}, uidvalidity={:?}",
+            folder_name, folder_rec.id, generation, last_uid, uidvalidity
+        );
 
         // Search for new UIDs: (last_uid + 1):*
         let search_query = format!("UID {}:*", last_uid + 1);
@@ -235,7 +281,7 @@ impl ImapSyncEngine {
         // Fetch messages sequentially to allow smooth progress and backoff
         for &uid in &uids {
             // Check if already in DB
-            if self.db.message_exists_by_uid(&folder_rec.id, uid)? {
+            if self.db.message_exists_in_generation(&folder_rec.id, generation, uid)? {
                 max_synced_uid = max_synced_uid.max(uid);
                 continue;
             }
@@ -262,6 +308,18 @@ impl ImapSyncEngine {
                         continue;
                     }
                 };
+
+                // Already archived under an earlier generation: bind that copy
+                // to this UID instead of storing the message again
+                let sha256 = StorageEngine::compute_sha256(raw_body);
+                if self.db.rebind_message(&folder_rec.id, generation, uid, &sha256)?.is_some() {
+                    progress.processed_messages += 1;
+                    max_synced_uid = max_synced_uid.max(uid);
+                    if let Some(ref cb) = progress_callback {
+                        cb(progress);
+                    }
+                    continue;
+                }
 
                 let internal_date = msg.internal_date().map(|dt| {
                     DateTime::from_timestamp(dt.timestamp(), 0).unwrap_or_else(Utc::now)
@@ -309,9 +367,10 @@ impl ImapSyncEngine {
                 let message_id_str = parsed.as_ref().and_then(|p| p.message_id()).map(|s| s.to_string());
 
                 // Save to SQLite
-                self.db.insert_message(
+                self.db.insert_message_in_generation(
                     &account.id,
                     &folder_rec.id,
+                    generation,
                     uid,
                     message_id_str.as_deref(),
                     subject.as_deref(),
@@ -336,7 +395,7 @@ impl ImapSyncEngine {
             }
 
             // Update folder state checkpoint
-            self.db.update_folder_sync_state(&folder_rec.id, max_synced_uid)?;
+            self.db.update_folder_checkpoint(&folder_rec.id, generation, max_synced_uid)?;
         }
 
         Ok(())

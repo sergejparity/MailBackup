@@ -16,6 +16,99 @@ pub struct FolderRecord {
     pub last_synced_uid: u32,
     pub message_count: u32,
     pub updated_at: DateTime<Utc>,
+    /// Which remote mailbox (server, port, username) the folder's current
+    /// UIDs come from; `None` for folders last synced before 0.4.0.
+    #[serde(default)]
+    pub remote_identity: Option<String>,
+    /// Bumped whenever the remote UIDs stop being comparable (see
+    /// [`Database::begin_folder_sync`]); each message records the generation
+    /// its UID belongs to.
+    #[serde(default)]
+    pub uid_generation: u32,
+}
+
+const FOLDER_COLUMNS: &str =
+    "id, account_id, remote_name, local_slug, uidvalidity, last_synced_uid, message_count, updated_at, remote_identity, uid_generation";
+
+fn folder_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FolderRecord> {
+    let updated_at_str: String = row.get(7)?;
+    let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    Ok(FolderRecord {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        remote_name: row.get(2)?,
+        local_slug: row.get(3)?,
+        uidvalidity: row.get(4)?,
+        last_synced_uid: row.get(5)?,
+        message_count: row.get(6)?,
+        updated_at,
+        remote_identity: row.get(8)?,
+        uid_generation: row.get(9)?,
+    })
+}
+
+/// Catalog schema version (`PRAGMA user_version`). 1 added UID generations
+/// (issue #17).
+const SCHEMA_VERSION: i64 = 1;
+
+/// `messages` as of schema version 1. `uid_generation` deliberately has no
+/// default: binaries older than 0.4.0 don't know about generations, and their
+/// inserts fail instead of mixing UIDs of different remote mailboxes.
+fn messages_ddl(table: &str) -> String {
+    format!(
+        r#"CREATE TABLE IF NOT EXISTS {} (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                folder_id TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                message_id TEXT,
+                subject TEXT,
+                from_addr TEXT,
+                to_addrs TEXT,
+                cc_addrs TEXT,
+                date TEXT,
+                size_bytes INTEGER NOT NULL,
+                relative_path TEXT NOT NULL,
+                sha256_hash TEXT NOT NULL,
+                is_remote_deleted INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                uid_generation INTEGER NOT NULL,
+                FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE,
+                UNIQUE(folder_id, uid_generation, uid)
+            );"#,
+        table
+    )
+}
+
+const MESSAGES_INDEXES: &str = r#"
+            CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_hash ON messages(sha256_hash);
+            CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(message_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);
+"#;
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// What [`Database::begin_folder_sync`] decided for a folder.
+#[derive(Debug, Clone)]
+pub struct FolderSync {
+    pub folder: FolderRecord,
+    /// The generation this sync session writes to; every write checks it is
+    /// still the folder's current one.
+    pub generation: u32,
+    /// Why a new generation (a full re-scan) was started, if one was.
+    pub rescan_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +262,74 @@ fn prepare_private_db_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [table], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|n| n > 0)
+}
+
+/// `Error::StaleSync` unless `generation` is still the folder's current one.
+fn ensure_generation(conn: &Connection, folder_id: &str, generation: u32) -> Result<()> {
+    let current: Option<u32> = conn
+        .query_row("SELECT uid_generation FROM folders WHERE id = ?1", params![folder_id], |r| r.get(0))
+        .optional()?;
+    if current != Some(generation) {
+        return Err(crate::Error::StaleSync(folder_id.to_string()));
+    }
+    Ok(())
+}
+
+/// Schema 0 → 1: UID generations. `folders` gains columns in place; `messages`
+/// is rebuilt (SQLite can't change a UNIQUE constraint) following SQLite's
+/// documented procedure: foreign keys off, one transaction, foreign key check
+/// before commit. Existing rows become generation 0.
+fn migrate_to_v1(conn: &mut Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 1 {
+        return Ok(());
+    }
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = (|| -> Result<()> {
+        let tx = conn.transaction()?;
+        if !has_column(&tx, "folders", "remote_identity")? {
+            tx.execute_batch("ALTER TABLE folders ADD COLUMN remote_identity TEXT;")?;
+        }
+        if !has_column(&tx, "folders", "uid_generation")? {
+            tx.execute_batch("ALTER TABLE folders ADD COLUMN uid_generation INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        if !has_column(&tx, "messages", "uid_generation")? {
+            tx.execute_batch(&messages_ddl("messages_v1"))?;
+            tx.execute_batch(
+                r#"
+                INSERT INTO messages_v1 (
+                    id, account_id, folder_id, uid, message_id, subject, from_addr, to_addrs, cc_addrs,
+                    date, size_bytes, relative_path, sha256_hash, is_remote_deleted, created_at, uid_generation
+                )
+                SELECT id, account_id, folder_id, uid, message_id, subject, from_addr, to_addrs, cc_addrs,
+                    date, size_bytes, relative_path, sha256_hash, is_remote_deleted, created_at, 0
+                FROM messages;
+                DROP TABLE messages;
+                ALTER TABLE messages_v1 RENAME TO messages;
+                "#,
+            )?;
+            tx.execute_batch(MESSAGES_INDEXES)?;
+        }
+        let violations: i64 = tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
+        if violations > 0 {
+            return Err(crate::Error::Other(format!(
+                "Catalog migration found {} broken references; the database was left unchanged",
+                violations
+            )));
+        }
+        tx.pragma_update(None, "user_version", 1)?;
+        tx.commit()?;
+        Ok(())
+    })();
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    result
+}
+
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -261,9 +422,16 @@ impl Database {
     }
 
     fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch(
-            r#"
+        let mut conn = self.conn.lock().unwrap();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(crate::Error::Other(format!(
+                "The catalog database was created by a newer MailBackup (schema {}, this version knows {}). Update MailBackup, or restore a backup of the catalog made before upgrading.",
+                version, SCHEMA_VERSION
+            )));
+        }
+        let fresh = !table_exists(&conn, "messages")?;
+        let schema = r#"
             CREATE TABLE IF NOT EXISTS accounts (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -282,34 +450,13 @@ impl Database {
                 last_synced_uid INTEGER NOT NULL DEFAULT 0,
                 message_count INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL,
+                remote_identity TEXT,
+                uid_generation INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(account_id, remote_name)
             );
 
-            CREATE TABLE IF NOT EXISTS messages (
-                id TEXT PRIMARY KEY,
-                account_id TEXT NOT NULL,
-                folder_id TEXT NOT NULL,
-                uid INTEGER NOT NULL,
-                message_id TEXT,
-                subject TEXT,
-                from_addr TEXT,
-                to_addrs TEXT,
-                cc_addrs TEXT,
-                date TEXT,
-                size_bytes INTEGER NOT NULL,
-                relative_path TEXT NOT NULL,
-                sha256_hash TEXT NOT NULL,
-                is_remote_deleted INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE,
-                UNIQUE(folder_id, uid)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_messages_account ON messages(account_id);
-            CREATE INDEX IF NOT EXISTS idx_messages_hash ON messages(sha256_hash);
-            CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(message_id);
-            CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);
-
+            {messages}
+{indexes}
             CREATE TABLE IF NOT EXISTS attachments (
                 id TEXT PRIMARY KEY,
                 message_id TEXT NOT NULL,
@@ -344,7 +491,16 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_sync_history_account ON sync_history(account_id);
             "#
-        )?;
+        .replace("{messages}", &messages_ddl("messages"))
+        .replace("{indexes}", MESSAGES_INDEXES);
+        if fresh {
+            conn.execute_batch(&schema)?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            return Ok(());
+        }
+        migrate_to_v1(&mut conn)?;
+        // Tables added later than `messages` (no-ops when present)
+        conn.execute_batch(&schema)?;
         Ok(())
     }
 
@@ -378,28 +534,12 @@ impl Database {
 
         let existing = conn.query_row(
             r#"
-            SELECT id, account_id, remote_name, local_slug, uidvalidity, last_synced_uid, message_count, updated_at
+            SELECT {}
             FROM folders
             WHERE account_id = ?1 AND remote_name = ?2
-            "#,
+            "#.replace("{}", FOLDER_COLUMNS).as_str(),
             params![account_id, remote_name],
-            |row| {
-                let updated_at_str: String = row.get(7)?;
-                let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-
-                Ok(FolderRecord {
-                    id: row.get(0)?,
-                    account_id: row.get(1)?,
-                    remote_name: row.get(2)?,
-                    local_slug: row.get(3)?,
-                    uidvalidity: row.get(4)?,
-                    last_synced_uid: row.get(5)?,
-                    message_count: row.get(6)?,
-                    updated_at,
-                })
-            },
+            folder_from_row,
         ).optional()?;
 
         if let Some(folder) = existing {
@@ -439,6 +579,8 @@ impl Database {
             last_synced_uid: 0,
             message_count: 0,
             updated_at: Utc::now(),
+            remote_identity: None,
+            uid_generation: 0,
         })
     }
 
@@ -462,30 +604,16 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, account_id, remote_name, local_slug, uidvalidity, last_synced_uid, message_count, updated_at
+            SELECT {}
             FROM folders
             WHERE account_id = ?1
             ORDER BY remote_name ASC
-            "#,
+            "#
+            .replace("{}", FOLDER_COLUMNS)
+            .as_str(),
         )?;
 
-        let rows = stmt.query_map(params![account_id], |row| {
-            let updated_at_str: String = row.get(7)?;
-            let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-
-            Ok(FolderRecord {
-                id: row.get(0)?,
-                account_id: row.get(1)?,
-                remote_name: row.get(2)?,
-                local_slug: row.get(3)?,
-                uidvalidity: row.get(4)?,
-                last_synced_uid: row.get(5)?,
-                message_count: row.get(6)?,
-                updated_at,
-            })
-        })?;
+        let rows = stmt.query_map(params![account_id], folder_from_row)?;
 
         let mut list = Vec::new();
         for r in rows {
@@ -494,14 +622,172 @@ impl Database {
         Ok(list)
     }
 
+    /// Whether `uid` of the folder's *current* generation is archived.
     pub fn message_exists_by_uid(&self, folder_id: &str, uid: u32) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE folder_id = ?1 AND uid = ?2",
+            r#"SELECT COUNT(*) FROM messages
+               WHERE folder_id = ?1 AND uid = ?2
+                 AND uid_generation = (SELECT uid_generation FROM folders WHERE id = ?1)"#,
             params![folder_id, uid],
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// Whether `uid` of `generation` is archived in the folder.
+    pub fn message_exists_in_generation(&self, folder_id: &str, generation: u32, uid: u32) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE folder_id = ?1 AND uid_generation = ?2 AND uid = ?3",
+            params![folder_id, generation, uid],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Starts syncing a folder: creates it if new and decides which UID
+    /// generation this session works in. A new generation (with the
+    /// checkpoint back at 0, so the whole folder is re-scanned) starts when the
+    /// UIDs already archived can't be trusted to mean the same messages:
+    /// - the server reports a UIDVALIDITY different from the stored one;
+    /// - the account's server, port or username (`remote_identity`) changed,
+    ///   even if the new server reports the same UIDVALIDITY;
+    /// - the folder has archived messages but no recorded identity (synced
+    ///   before 0.4.0) or no recorded UIDVALIDITY while the server now reports
+    ///   one: nothing ties the old UIDs to this mailbox.
+    ///
+    /// Archived messages are kept; a re-scan re-binds them by content (see
+    /// [`Self::rebind_message`]).
+    pub fn begin_folder_sync(
+        &self,
+        account_id: &str,
+        remote_name: &str,
+        local_slug: &str,
+        uidvalidity: Option<u32>,
+        remote_identity: &str,
+    ) -> Result<FolderSync> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let now = Utc::now().to_rfc3339();
+        let existing = tx
+            .query_row(
+                &format!("SELECT {} FROM folders WHERE account_id = ?1 AND remote_name = ?2", FOLDER_COLUMNS),
+                params![account_id, remote_name],
+                folder_from_row,
+            )
+            .optional()?;
+
+        let Some(folder) = existing else {
+            let new_id = Uuid::new_v4().to_string();
+            tx.execute(
+                r#"INSERT INTO folders (id, account_id, remote_name, local_slug, uidvalidity, last_synced_uid,
+                       message_count, updated_at, remote_identity, uid_generation)
+                   VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7, 0)"#,
+                params![new_id, account_id, remote_name, local_slug, uidvalidity, now, remote_identity],
+            )?;
+            let folder = tx.query_row(
+                &format!("SELECT {} FROM folders WHERE id = ?1", FOLDER_COLUMNS),
+                params![new_id],
+                folder_from_row,
+            )?;
+            tx.commit()?;
+            return Ok(FolderSync { generation: 0, folder, rescan_reason: None });
+        };
+
+        let has_messages: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE folder_id = ?1)",
+            params![folder.id],
+            |r| r.get(0),
+        )?;
+        let rescan_reason = match (folder.uidvalidity, uidvalidity, folder.remote_identity.as_deref()) {
+            (Some(old), Some(new), _) if old != new => {
+                Some(format!("the server reports a new UIDVALIDITY ({} → {})", old, new))
+            }
+            (_, _, Some(old)) if old != remote_identity => {
+                Some("the account's server, port or username changed".to_string())
+            }
+            (_, _, None) if has_messages => {
+                Some("the folder was archived by an older version that didn't record which server its UIDs came from".to_string())
+            }
+            (None, Some(_), _) if has_messages => {
+                Some("the server reports a UIDVALIDITY for the first time".to_string())
+            }
+            _ => None,
+        };
+
+        let generation = if rescan_reason.is_some() { folder.uid_generation + 1 } else { folder.uid_generation };
+        if rescan_reason.is_some() {
+            tx.execute(
+                r#"UPDATE folders SET uid_generation = ?1, last_synced_uid = 0, uidvalidity = ?2,
+                       remote_identity = ?3, updated_at = ?4
+                   WHERE id = ?5"#,
+                params![generation, uidvalidity, remote_identity, now, folder.id],
+            )?;
+        } else {
+            // Same mailbox: record the identity and a newly reported UIDVALIDITY
+            tx.execute(
+                r#"UPDATE folders SET remote_identity = ?1, uidvalidity = COALESCE(?2, uidvalidity), updated_at = ?3
+                   WHERE id = ?4"#,
+                params![remote_identity, uidvalidity, now, folder.id],
+            )?;
+        }
+        let folder = tx.query_row(
+            &format!("SELECT {} FROM folders WHERE id = ?1", FOLDER_COLUMNS),
+            params![folder.id],
+            folder_from_row,
+        )?;
+        tx.commit()?;
+        Ok(FolderSync { folder, generation, rescan_reason })
+    }
+
+    /// If the folder holds a message with this content that no UID of
+    /// `generation` claims yet (archived under an older generation), binds it
+    /// to `uid` of `generation` instead of storing it again, and returns its
+    /// id. Each archived copy is re-bound at most once, so a mailbox holding
+    /// the same message several times keeps as many copies.
+    pub fn rebind_message(&self, folder_id: &str, generation: u32, uid: u32, sha256_hash: &str) -> Result<Option<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        ensure_generation(&tx, folder_id, generation)?;
+        let candidate: Option<String> = tx
+            .query_row(
+                r#"SELECT id FROM messages
+                   WHERE folder_id = ?1 AND sha256_hash = ?2 AND uid_generation < ?3
+                   ORDER BY uid_generation, uid LIMIT 1"#,
+                params![folder_id, sha256_hash, generation],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = &candidate {
+            tx.execute(
+                "UPDATE messages SET uid_generation = ?1, uid = ?2 WHERE id = ?3",
+                params![generation, uid, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(candidate)
+    }
+
+    /// Advances the folder's checkpoint, unless a newer sync has started a
+    /// new generation since this one began (`Error::StaleSync`).
+    pub fn update_folder_checkpoint(&self, folder_id: &str, generation: u32, last_synced_uid: u32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let updated = conn.execute(
+            r#"
+            UPDATE folders
+            SET last_synced_uid = ?1,
+                message_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?2),
+                updated_at = ?3
+            WHERE id = ?2 AND uid_generation = ?4
+            "#,
+            params![last_synced_uid, folder_id, now, generation],
+        )?;
+        if updated == 0 {
+            return Err(crate::Error::StaleSync(folder_id.to_string()));
+        }
+        Ok(())
     }
 
     pub fn find_existing_message_by_hash(&self, sha256_hash: &str) -> Result<Option<MessageRecord>> {
@@ -580,6 +866,7 @@ impl Database {
         Ok(msg)
     }
 
+    /// Inserts a message under the folder's current UID generation.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_message(
         &self,
@@ -598,7 +885,44 @@ impl Database {
         body_text: Option<&str>,
         attachments: &[(&str, &str, u64)], // (filename, mime_type, size)
     ) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
+        let generation: u32 = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row("SELECT uid_generation FROM folders WHERE id = ?1", params![folder_id], |r| r.get(0))
+                .optional()?
+                .unwrap_or(0)
+        };
+        self.insert_message_in_generation(
+            account_id, folder_id, generation, uid, message_id, subject, from_addr, to_addrs, cc_addrs, date,
+            size_bytes, relative_path, sha256_hash, body_text, attachments,
+        )
+    }
+
+    /// Inserts a message fetched as `uid` of `generation`, unless a newer
+    /// sync has started a new generation since (`Error::StaleSync`, nothing
+    /// written). The message, its attachments and its search entry are
+    /// written together or not at all.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_message_in_generation(
+        &self,
+        account_id: &str,
+        folder_id: &str,
+        generation: u32,
+        uid: u32,
+        message_id: Option<&str>,
+        subject: Option<&str>,
+        from_addr: Option<&str>,
+        to_addrs: Option<&str>,
+        cc_addrs: Option<&str>,
+        date: Option<DateTime<Utc>>,
+        size_bytes: u64,
+        relative_path: &str,
+        sha256_hash: &str,
+        body_text: Option<&str>,
+        attachments: &[(&str, &str, u64)], // (filename, mime_type, size)
+    ) -> Result<String> {
+        let mut conn = self.conn.lock().unwrap();
+        let conn = conn.transaction()?;
+        ensure_generation(&conn, folder_id, generation)?;
         let new_id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let date_str = date.map(|d| d.to_rfc3339());
@@ -608,12 +932,12 @@ impl Database {
             INSERT INTO messages (
                 id, account_id, folder_id, uid, message_id, subject, from_addr,
                 to_addrs, cc_addrs, date, size_bytes, relative_path, sha256_hash,
-                is_remote_deleted, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14)
+                is_remote_deleted, created_at, uid_generation
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14, ?15)
             "#,
             params![
                 new_id, account_id, folder_id, uid, message_id, subject, from_addr,
-                to_addrs, cc_addrs, date_str, size_bytes as i64, relative_path, sha256_hash, now
+                to_addrs, cc_addrs, date_str, size_bytes as i64, relative_path, sha256_hash, now, generation
             ],
         )?;
 
@@ -649,6 +973,7 @@ impl Database {
             ],
         )?;
 
+        conn.commit()?;
         Ok(new_id)
     }
 

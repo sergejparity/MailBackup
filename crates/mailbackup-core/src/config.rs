@@ -79,6 +79,15 @@ pub struct AccountConfig {
     pub enabled: bool,
 }
 
+impl AccountConfig {
+    /// Which remote mailbox store this account's UIDs come from: server
+    /// (case-insensitive), port and username, normalized the way the API
+    /// decides that an account's connection changed.
+    pub fn remote_identity(&self) -> String {
+        format!("{}:{}:{}", self.imap_server.trim().to_ascii_lowercase(), self.imap_port, self.username.trim())
+    }
+}
+
 fn default_provider() -> ProviderType {
     ProviderType::GenericImap
 }
