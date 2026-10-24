@@ -2794,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-cli"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2814,11 +2814,12 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
  "argon2",
+ "async-compression",
  "async-imap",
  "async-trait",
  "base64 0.22.1",
@@ -2849,7 +2850,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-gui"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2866,7 +2867,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-server"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "axum",

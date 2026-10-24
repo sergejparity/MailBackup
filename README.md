@@ -104,7 +104,7 @@ Sync only downloads messages it hasn't seen, by their IMAP UID. Those UIDs only 
 - you change the account's server, port or username;
 - the folder was archived by a version before 0.4.0. This happens once after upgrading, because those versions didn't record which server the UIDs came from.
 
-A re-scan downloads the folder's messages again, but keeps everything already archived. Messages that are already in the archive are recognized by their exact content and not stored twice. Messages that no longer exist on the new server stay in the archive. Each re-scan is noted in the event log (`SYNC_RESCAN`).
+A re-scan downloads the folder's messages again (each one has to be compared in full), but keeps everything already archived. Messages that are already in the archive are recognized by their exact content and not stored twice. Messages that no longer exist on the new server stay in the archive. Each re-scan is noted in the event log (`SYNC_RESCAN`). Downloads use compression (`COMPRESS=DEFLATE`) when the server offers it, and fetch messages in batches. A message the server lists but doesn't deliver is asked for again on the next sync rather than skipped.
 
 **Upgrading to 0.4.0:** the catalog database is migrated once, on first start. **Back up the catalog file first** (see `db_path` in the config), and don't sync it with an older version afterwards: older versions don't know about re-scans, so they refuse to add messages to a migrated catalog. To go back, restore the backup. A catalog from a newer version is refused rather than migrated backwards.
 

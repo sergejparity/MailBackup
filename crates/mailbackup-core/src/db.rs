@@ -747,26 +747,41 @@ impl Database {
     /// id. Each archived copy is re-bound at most once, so a mailbox holding
     /// the same message several times keeps as many copies.
     pub fn rebind_message(&self, folder_id: &str, generation: u32, uid: u32, sha256_hash: &str) -> Result<Option<String>> {
+        self.rebind_message_if(folder_id, generation, uid, sha256_hash, |_| true)
+    }
+
+    /// [`Self::rebind_message`], considering only archived copies for which
+    /// `usable(relative_path)` holds (e.g. whose file is present and intact);
+    /// the others stay as they are.
+    pub fn rebind_message_if(
+        &self,
+        folder_id: &str,
+        generation: u32,
+        uid: u32,
+        sha256_hash: &str,
+        usable: impl Fn(&str) -> bool,
+    ) -> Result<Option<String>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         ensure_generation(&tx, folder_id, generation)?;
-        let candidate: Option<String> = tx
-            .query_row(
-                r#"SELECT id FROM messages
+        let candidates: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                r#"SELECT id, relative_path FROM messages
                    WHERE folder_id = ?1 AND sha256_hash = ?2 AND uid_generation < ?3
-                   ORDER BY uid_generation, uid LIMIT 1"#,
-                params![folder_id, sha256_hash, generation],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(id) = &candidate {
+                   ORDER BY uid_generation, uid"#,
+            )?;
+            let rows = stmt.query_map(params![folder_id, sha256_hash, generation], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let chosen = candidates.into_iter().find(|(_, path)| usable(path)).map(|(id, _)| id);
+        if let Some(id) = &chosen {
             tx.execute(
                 "UPDATE messages SET uid_generation = ?1, uid = ?2 WHERE id = ?3",
                 params![generation, uid, id],
             )?;
         }
         tx.commit()?;
-        Ok(candidate)
+        Ok(chosen)
     }
 
     /// Advances the folder's checkpoint, unless a newer sync has started a
