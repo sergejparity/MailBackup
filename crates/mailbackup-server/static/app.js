@@ -1,7 +1,10 @@
 // MailBackup Studio Web Application
 
 // API authentication: the server injects a per-process token into index.html.
-// Every same-origin /api/ request must present it; plain links carry it as ?token=.
+// Every same-origin /api/ request must present it in the X-MailBackup-Token
+// header. Downloads, which can't send headers, use a single-use ticket bound to
+// the exact URL instead (see downloadViaTicket), so no long-lived secret ever
+// appears in a URL.
 const API_TOKEN = document.querySelector('meta[name="mailbackup-api-token"]')?.content || '';
 
 function isApiUrl(url) {
@@ -13,12 +16,6 @@ function isApiUrl(url) {
   }
 }
 
-function withApiToken(url) {
-  if (!isApiUrl(url)) return url;
-  const sep = url.includes('?') ? '&' : '?';
-  return `${url}${sep}token=${encodeURIComponent(API_TOKEN)}`;
-}
-
 const nativeFetch = window.fetch.bind(window);
 window.fetch = (input, init = {}) => {
   const url = typeof input === 'string' ? input : input.url;
@@ -28,9 +25,37 @@ window.fetch = (input, init = {}) => {
   return nativeFetch(input, { ...init, headers });
 };
 
+// Downloads `url` (a same-origin /api/ download route) with a ticket that
+// the server issues for exactly this URL, valid once and for a minute.
+async function downloadViaTicket(url, filename = '') {
+  let ticket;
+  try {
+    const res = await fetch('/api/download-ticket', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    ticket = (await res.json()).ticket;
+  } catch (e) {
+    showToast('Could not start the download');
+    return false;
+  }
+  const a = document.createElement('a');
+  a.href = `${url}${url.includes('?') ? '&' : '?'}ticket=${encodeURIComponent(ticket)}`;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  return true;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
-  document.querySelectorAll('a[data-api-link]').forEach(a => {
-    a.href = withApiToken(a.getAttribute('href'));
+  document.querySelectorAll('a[data-ticket-download]').forEach(a => {
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      downloadViaTicket(a.getAttribute('href'), a.getAttribute('download') || '');
+    });
   });
 });
 let state = {
@@ -871,7 +896,7 @@ function initEventListeners() {
   // Download raw .eml button
   el.btnDownloadRawEml.addEventListener('click', () => {
     if (state.selectedMessageId) {
-      window.open(withApiToken(`/api/messages/${state.selectedMessageId}/download`), '_blank');
+      downloadViaTicket(`/api/messages/${encodeURIComponent(state.selectedMessageId)}/download`);
     }
   });
 
@@ -2118,7 +2143,7 @@ async function handleExportMbox(e, forceOverwrite = false) {
   }
 }
 
-function handleDownloadMboxBrowser() {
+async function handleDownloadMboxBrowser() {
   const accountId = el.exportAccountSelect.value;
   if (!accountId) {
     showToast('Please select an account to export');
@@ -2126,13 +2151,8 @@ function handleDownloadMboxBrowser() {
   }
   const folderId = el.exportFolderSelect.value;
   showToast('Preparing .mbox archive download in browser... 📦');
-  const a = document.createElement('a');
-  a.href = withApiToken(`/api/export/mbox/download?account_id=${encodeURIComponent(accountId)}&folder_id=${encodeURIComponent(folderId)}`);
-  a.download = '';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  closeModal(el.exportModal);
+  const url = `/api/export/mbox/download?account_id=${encodeURIComponent(accountId)}&folder_id=${encodeURIComponent(folderId)}`;
+  if (await downloadViaTicket(url)) closeModal(el.exportModal);
 }
 
 // ---------------------------------------------------------------------------
@@ -2799,11 +2819,7 @@ function renderLogs(logs) {
 
 function handleDownloadLogs() {
   const selected = el.logsFileSelect ? el.logsFileSelect.value : '';
-  if (selected) {
-    window.open(withApiToken(`/api/logs/download?file=${encodeURIComponent(selected)}`), '_blank');
-  } else {
-    window.open(withApiToken('/api/logs/download'), '_blank');
-  }
+  downloadViaTicket(selected ? `/api/logs/download?file=${encodeURIComponent(selected)}` : '/api/logs/download');
 }
 
 async function handleClearLogs() {
