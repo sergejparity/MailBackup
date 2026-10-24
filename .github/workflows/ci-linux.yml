@@ -1,0 +1,87 @@
+name: CI (Linux)
+
+# Tests, lints and a dependency audit for the non-GUI crates. The desktop GUI
+# needs Tauri 1's GTK/WebKit stack (webkit2gtk-4.0, absent from current
+# Ubuntu), so it's excluded here; the Windows workflow builds it.
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  # New advisories appear without any change here, so audit daily too
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-linux-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace --exclude mailbackup-gui --locked
+
+  clippy:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Pinned so a new stable release can't fail CI with lints nobody
+      # introduced; bump it deliberately
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy
+        run: cargo clippy --workspace --exclude mailbackup-gui --all-targets --locked -- -D warnings
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Checks the committed workspace Cargo.lock (GUI dependencies included)
+      # against a freshly fetched advisory database. Vulnerabilities and fetch
+      # errors fail the job; warnings (unmaintained, unsound, yanked) are
+      # reported without failing it
+      - name: Audit dependencies
+        run: cargo audit
