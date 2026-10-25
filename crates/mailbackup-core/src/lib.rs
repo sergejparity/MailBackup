@@ -8,6 +8,8 @@ pub mod imap;
 pub mod retention;
 pub mod mbox;
 pub mod scheduler;
+pub mod sync_gate;
+pub mod archive;
 pub mod autostart;
 pub mod service;
 pub mod event_log;

@@ -324,6 +324,9 @@ pub fn account(server: &FakeImap, username: &str) -> AccountConfig {
         folder_filter: FolderFilter::default(),
         gmail_smart_labels: false,
         enabled: true,
+        storage_namespace: None,
+        credential_ref: None,
+        archive: None,
     }
 }
 

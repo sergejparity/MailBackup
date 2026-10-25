@@ -48,6 +48,9 @@ fn test_config_serialization() {
         folder_filter: FolderFilter::default(),
         gmail_smart_labels: true,
         enabled: true,
+        storage_namespace: None,
+        credential_ref: None,
+        archive: None,
     });
 
     config.save(&config_path).unwrap();
@@ -632,6 +635,9 @@ async fn test_scheduler_event_logging_and_listener() {
         folder_filter: FolderFilter::default(),
         gmail_smart_labels: false,
         enabled: true,
+        storage_namespace: None,
+        credential_ref: None,
+        archive: None,
     });
 
     let mut scheduler = BackupScheduler::new(Arc::new(config), db, storage, creds).await.unwrap();
@@ -962,6 +968,9 @@ fn binding_test_account(id: &str) -> AccountConfig {
         folder_filter: FolderFilter::default(),
         gmail_smart_labels: true,
         enabled: true,
+        storage_namespace: None,
+        credential_ref: None,
+        archive: None,
     }
 }
 

@@ -41,6 +41,9 @@ pub struct BackupScheduler {
     storage: StorageEngine,
     credentials: Arc<CredentialStore>,
     status_listener: Option<SchedulerStatusCallback>,
+    /// When set, every job takes the account's sync gate and syncs the
+    /// account as the config at this path has it (see `sync_gate`).
+    config_path: Option<std::path::PathBuf>,
 }
 
 impl BackupScheduler {
@@ -61,7 +64,16 @@ impl BackupScheduler {
             storage,
             credentials,
             status_listener: None,
+            config_path: None,
         })
+    }
+
+    /// Jobs take the account's sync gate and use the account as the config
+    /// file at `path` has it when they run, not the snapshot they were
+    /// registered with.
+    pub fn with_config_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.config_path = Some(path.into());
+        self
     }
 
     pub fn set_status_listener(&mut self, listener: Option<SchedulerStatusCallback>) {
@@ -79,7 +91,7 @@ impl BackupScheduler {
 
     async fn register_jobs(&self) -> Result<()> {
         for account in &self.config.accounts {
-            if !account.enabled {
+            if !account.enabled || account.is_archive() {
                 continue;
             }
 
@@ -95,6 +107,7 @@ impl BackupScheduler {
             let storage_clone = self.storage.clone();
             let creds_clone = self.credentials.clone();
             let status_listener_clone = self.status_listener.clone();
+            let config_path_clone = self.config_path.clone();
 
             info!(
                 "Registering scheduled backup for account '{}' ({}) with cron: '{}' (normalized: '{}')",
@@ -102,13 +115,30 @@ impl BackupScheduler {
             );
 
             let job = Job::new_async(&cron_expr, move |_uuid, _lock| {
-                let acc = account_clone.clone();
+                let snapshot = account_clone.clone();
+                let config_path = config_path_clone.clone();
                 let db = db_clone.clone();
                 let storage = storage_clone.clone();
                 let creds = creds_clone.clone();
                 let status_listener = status_listener_clone.clone();
 
                 Box::pin(async move {
+                    // Hold the account's gate for the whole job and sync the
+                    // account as it is now, not as it was when scheduled
+                    let (_gate, acc) = match &config_path {
+                        Some(path) => match crate::sync_gate::begin_account_sync(&db, &creds, path, &snapshot.id).await {
+                            Ok((gate, acc)) if acc.enabled => (Some(gate), acc),
+                            Ok(_) => {
+                                info!("Skipping scheduled backup of '{}': disabled since it was scheduled", snapshot.id);
+                                return;
+                            }
+                            Err(e) => {
+                                info!("Skipping scheduled backup of '{}': {}", snapshot.id, e);
+                                return;
+                            }
+                        },
+                        None => (None, snapshot),
+                    };
                     info!("Starting scheduled backup for account '{}' ({})", acc.name, acc.email);
                     crate::event_log::log_event(
                         "SYNC_STARTED",

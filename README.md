@@ -106,6 +106,16 @@ Sync only downloads messages it hasn't seen, by their IMAP UID. Those UIDs only 
 
 A re-scan downloads the folder's messages again (each one has to be compared in full), but keeps everything already archived. Messages that are already in the archive are recognized by their exact content and not stored twice. Messages that no longer exist on the new server stay in the archive. Each re-scan is noted in the event log (`SYNC_RESCAN`). Downloads use compression (`COMPRESS=DEFLATE`) when the server offers it, and fetch messages in batches. A message the server lists but doesn't deliver is asked for again on the next sync rather than skipped.
 
+**Starting a new archive instead.** When you change an account's server, port or username in the Web Studio's edit dialog, you can choose what happens to the mail archived so far:
+- **Keep it in this account and re-scan.** This is the default, and the behaviour described above.
+- **Start a new archive.** The mail archived so far becomes a separate, **read-only archive account**, named "<name> (archived <date>)". The account itself starts empty on the new server.
+  - An archive is never synced and never pruned by retention, and only its name can be changed.
+  - It stays searchable, browsable and exportable like any account.
+  - Its label only states what MailBackup knows: when it was archived and, if recorded, the server it was last synced from.
+  - Deleting an archive account removes it from the configuration. As with any account, its archived files and catalog entries stay on disk.
+
+The switch waits for, and blocks, any sync of the account. If it's interrupted, it's completed or undone the next time MailBackup starts, depending on whether the new configuration was saved. The CLI and hand-edited configs always keep the archive and re-scan.
+
 **Upgrading to 0.4.0:** the catalog database is migrated once, on first start. **Back up the catalog file first** (see `db_path` in the config), and don't sync it with an older version afterwards: older versions don't know about re-scans, so they refuse to add messages to a migrated catalog. To go back, restore the backup. A catalog from a newer version is refused rather than migrated backwards.
 
 ### 3. Launching the Web Studio

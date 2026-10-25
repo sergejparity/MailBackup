@@ -173,6 +173,10 @@ async fn main() -> Result<()> {
     let storage = StorageEngine::new(&config.data_dir);
     // Same store as the server and the background service for this config
     let credentials = Arc::new(CredentialStore::for_config(&config_path, &config.settings));
+    // Settle "start a new archive" switches a crash left half-done
+    if let Err(e) = mailbackup_core::archive::recover(&db, &credentials, &config_path) {
+        eprintln!("{} Couldn't check for interrupted account archive switches: {}", WARN_EMOJI, e);
+    }
 
     match cli.command {
         Commands::Account(AccountCommands::Add(args)) => {
@@ -191,7 +195,7 @@ async fn main() -> Result<()> {
             handle_account_import_csv(&mut config, cli.config.as_deref(), &credentials, &file, dry_run)?;
         }
         Commands::Sync(args) => {
-            handle_sync(&config, &db, &storage, &credentials, args).await?;
+            handle_sync(&config, &config_path, &db, &storage, &credentials, args).await?;
         }
         Commands::Search(args) => {
             handle_search(&db, args)?;
@@ -200,7 +204,7 @@ async fn main() -> Result<()> {
             handle_export_mbox(&config, &db, &storage, args)?;
         }
         Commands::Daemon => {
-            handle_daemon(config, db, storage, credentials).await?;
+            handle_daemon(config, &config_path, db, storage, credentials).await?;
         }
         Commands::Serve(args) => {
             println!("{} Starting MailBackup Studio on http://127.0.0.1:{}", MAIL_EMOJI, args.port);
@@ -413,6 +417,9 @@ fn handle_account_add(
         folder_filter: FolderFilter::default(),
         gmail_smart_labels: true,
         enabled: true,
+        storage_namespace: None,
+        credential_ref: None,
+        archive: None,
     };
 
     // Store password securely, bound to this server/port/username
@@ -506,8 +513,14 @@ fn handle_account_remove(
         bail!("Account '{}' not found", account_id);
     }
 
-    config.accounts.retain(|a| a.id != account_id && a.email != account_id);
-    let _ = credentials.delete_password(account_id);
+    // An archive shares its email with the live account; it only matches by id
+    let matches = |a: &AccountConfig| a.id == account_id || (a.email == account_id && !a.is_archive());
+    let removed: Vec<AccountConfig> = config.accounts.iter().filter(|a| matches(a)).cloned().collect();
+    config.accounts.retain(|a| !matches(a));
+    // Archives have no password of their own
+    for acc in removed.iter().filter(|a| !a.is_archive()) {
+        let _ = credentials.delete_password(acc.credential_ref());
+    }
 
     let save_path = config_path.unwrap_or_else(|| mailbackup_core::config::default_config_path().leak());
     config.save(save_path)?;
@@ -593,6 +606,7 @@ fn handle_account_import_csv(
 
 async fn handle_sync(
     config: &AppConfig,
+    config_path: &std::path::Path,
     db: &Database,
     storage: &StorageEngine,
     credentials: &CredentialStore,
@@ -600,9 +614,13 @@ async fn handle_sync(
 ) -> Result<()> {
     let accounts_to_sync: Vec<&AccountConfig> = if let Some(ref target) = args.account {
         let acc = config.get_account(target).context(format!("Account '{}' not found", target))?;
+        if acc.is_archive() {
+            bail!("Account '{}' is a read-only archive and can't be synced", acc.id);
+        }
         vec![acc]
     } else {
-        config.accounts.iter().filter(|a| a.enabled).collect()
+        // Read-only archives are never synced
+        config.accounts.iter().filter(|a| a.enabled && !a.is_archive()).collect()
     };
 
     if accounts_to_sync.is_empty() {
@@ -612,7 +630,17 @@ async fn handle_sync(
 
     println!("\n{} {}", SYNC_EMOJI, style("Starting Email Backup").bold());
 
-    for acc in accounts_to_sync {
+    for snapshot in accounts_to_sync {
+        // Hold the account's sync gate, and sync it as the config on disk has
+        // it once the gate is ours (a change may have finished meanwhile)
+        let (_gate, acc) = match mailbackup_core::sync_gate::begin_account_sync(db, credentials, config_path, &snapshot.id).await {
+            Ok(gated) => gated,
+            Err(e) => {
+                println!("{} Skipping {}: {}", WARN_EMOJI, snapshot.id, e);
+                continue;
+            }
+        };
+        let acc = &acc;
         println!("\nSyncing account: {} ({})", style(&acc.id).bold().cyan(), acc.email);
         let password = match credentials.get_account_password(acc) {
             Ok(p) => p,
@@ -773,6 +801,7 @@ fn handle_export_mbox(
 
 async fn handle_daemon(
     config: AppConfig,
+    config_path: &std::path::Path,
     db: Database,
     storage: StorageEngine,
     credentials: Arc<CredentialStore>,
@@ -781,7 +810,7 @@ async fn handle_daemon(
     println!("Running background scheduled backups. Press Ctrl+C to terminate.");
 
     let config_arc = Arc::new(config);
-    let mut scheduler = BackupScheduler::new(config_arc, db, storage, credentials).await?;
+    let mut scheduler = BackupScheduler::new(config_arc, db, storage, credentials).await?.with_config_path(config_path);
     scheduler.start().await?;
 
     tokio::signal::ctrl_c().await?;

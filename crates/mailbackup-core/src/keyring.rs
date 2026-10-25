@@ -283,8 +283,8 @@ impl CredentialStore {
     /// Stores an account's password together with a fingerprint of the
     /// server/port/username it was entered for (see [`connection_binding`]).
     pub fn set_account_password(&self, account: &AccountConfig, secret: &str) -> Result<()> {
-        self.set_password(&account.id, secret)?;
-        self.set_secret(&binding_key(&account.id), &connection_binding(account))
+        self.set_password(account.credential_ref(), secret)?;
+        self.set_secret(&binding_key(account.credential_ref()), &connection_binding(account))
     }
 
     /// Returns an account's password only if it was entered for the account's
@@ -296,13 +296,13 @@ impl CredentialStore {
     /// working. That only happens when the binding is certainly missing, never
     /// when it couldn't be read.
     pub fn get_account_password(&self, account: &AccountConfig) -> Result<String> {
-        let secret = self.get_password(&account.id)?;
+        let secret = self.get_password(account.credential_ref())?;
         let expected = connection_binding(account);
-        match self.get_secret(&binding_key(&account.id)) {
+        match self.get_secret(&binding_key(account.credential_ref())) {
             Ok(stored) if stored == expected => Ok(secret),
             Ok(_) => Err(Error::CredentialMismatch(account.id.clone())),
             Err(e) if e.is_not_found() => {
-                self.set_secret(&binding_key(&account.id), &expected)?;
+                self.set_secret(&binding_key(account.credential_ref()), &expected)?;
                 Ok(secret)
             }
             Err(e) => Err(e),
