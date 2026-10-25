@@ -297,6 +297,7 @@ fn binding_is_only_created_when_certainly_missing() {
         storage_namespace: None,
         credential_ref: None,
         archive: None,
+        trust_server_ids: false,
     };
     // The password is readable, the binding sits in a locked keyring
     let mut keyring = FailingKeyring::new(Kind::Locked);

@@ -194,6 +194,8 @@ const el = {
   editRetention: document.getElementById('edit-retention'),
   editSchedule: document.getElementById('edit-schedule'),
   editEnabled: document.getElementById('edit-enabled'),
+  editTrustServerIds: document.getElementById('edit-trust-server-ids'),
+  editServerIdNote: document.getElementById('edit-server-id-note'),
   editArchiveChoice: document.getElementById('edit-archive-choice'),
   editArchiveNote: document.getElementById('edit-archive-note'),
 
@@ -1129,12 +1131,14 @@ window.openEditAccount = function(accountId) {
   el.editRetention.value = acc.retention_days || 0;
   el.editSchedule.value = acc.schedule || '0 0 * * *';
   el.editEnabled.checked = acc.enabled !== false;
+  el.editTrustServerIds.checked = acc.trust_server_ids === true;
+  showServerIdNote(acc.id);
   const rescan = el.editAccountForm.querySelector('input[name="on-connection-change"][value="rescan"]');
   if (rescan) rescan.checked = true;
 
   // A read-only archive can only be renamed
   const archived = Boolean(acc.archive);
-  [el.editServer, el.editPort, el.editUsername, el.editPassword, el.editRetention, el.editSchedule, el.editEnabled]
+  [el.editServer, el.editPort, el.editUsername, el.editPassword, el.editRetention, el.editSchedule, el.editEnabled, el.editTrustServerIds]
     .forEach(input => { input.disabled = archived; });
   if (el.editArchiveNote) {
     el.editArchiveNote.style.display = archived ? '' : 'none';
@@ -1144,6 +1148,26 @@ window.openEditAccount = function(accountId) {
 
   openModal(el.editAccountModal);
 };
+
+// Server id sources found inconsistent or unparseable stay off until reset
+// from the command line.
+async function showServerIdNote(accountId) {
+  const note = el.editServerIdNote;
+  if (!note) return;
+  note.style.display = 'none';
+  note.textContent = '';
+  try {
+    const res = await fetch(`/api/accounts/${encodeURIComponent(accountId)}/server-ids`);
+    if (!res.ok || el.editAccountId.value !== accountId) return;
+    const states = await res.json();
+    if (!states.length) return;
+    const lines = states.map(s => `${s.distrusted ? 'Not trusted' : 'Not requested'} from ${s.source}: ${s.reason}.`);
+    note.textContent = `${lines.join(' ')} Every message from there is downloaded. To use the ids again: mailbackup account server-ids ${accountId} --reset`;
+    note.style.display = '';
+  } catch (_) {
+    // Only informational
+  }
+}
 
 // What is actually known about an archive: when it was archived and, if the
 // catalog recorded one, the connection it was last synced from.
@@ -1208,6 +1232,7 @@ async function handleSaveAccountEdit(e) {
     retention_days: parseInt(el.editRetention.value) || null,
     schedule: el.editSchedule.value.trim() || '0 0 * * *',
     enabled: el.editEnabled.checked,
+    trust_server_ids: el.editTrustServerIds.checked,
   };
   if (editConnectionChanged()) {
     const choice = el.editAccountForm.querySelector('input[name="on-connection-change"]:checked');

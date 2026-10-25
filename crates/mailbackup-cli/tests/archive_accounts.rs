@@ -24,6 +24,7 @@ fn account(id: &str, archive: bool) -> AccountConfig {
         storage_namespace: None,
         credential_ref: None,
         archive: archive.then(|| ArchiveInfo { archived_at: chrono::Utc::now(), retired_from: "live".into(), last_source: None }),
+        trust_server_ids: false,
     }
 }
 

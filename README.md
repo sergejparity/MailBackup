@@ -116,7 +116,15 @@ A re-scan downloads the folder's messages again (each one has to be compared in 
 
 The switch waits for, and blocks, any sync of the account. If it's interrupted, it's completed or undone the next time MailBackup starts, depending on whether the new configuration was saved. The CLI and hand-edited configs always keep the archive and re-scan.
 
+**Re-scans by server message ids (opt-in).** Some servers give every message a permanent id: `EMAILID` on servers that advertise `OBJECTID` (RFC 8474), and `X-GM-MSGID` on Gmail. With **"Trust the server's message ids to skip re-downloading on re-scans"** turned on in the edit dialog (or `mailbackup account server-ids <id> --trust on`), a re-scan of the **same** server, port and username matches messages to their archived copies by id instead of downloading them again.
+- **What is checked:** an archived copy is used only if it came from the same server account, has the same id and size, is in the same folder, and its file still matches its checksum. Each archived copy is used at most once. Anything else is downloaded as usual.
+- **What it relies on:** that the server never gives an id to different content. Those bodies are not downloaded, so they are not verified; this is weaker than the default, where every message is downloaded and compared. It's off by default for that reason.
+- **When the server's ids prove inconsistent:** an id seen with another size, or a downloaded message whose id belongs to different archived content, turns the shortcut off for that server account. Every message matched by id there is then downloaded and checked, and wrong matches are undone. A response with ids that can't be parsed stops MailBackup from asking that server for ids. Both stay so until `mailbackup account server-ids <id> --reset`, and the edit dialog shows a note meanwhile.
+- **Coverage:** only messages archived while the setting is on carry ids. Another server or username never uses them.
+
 **Upgrading to 0.4.0:** the catalog database is migrated once, on first start. **Back up the catalog file first** (see `db_path` in the config), and don't sync it with an older version afterwards: older versions don't know about re-scans, so they refuse to add messages to a migrated catalog. To go back, restore the backup. A catalog from a newer version is refused rather than migrated backwards.
+
+**Upgrading to 0.6.0:** the catalog gains columns and tables for server message ids (schema 3) on first start; existing data is untouched. Older versions refuse a migrated catalog, so back it up first if you may go back.
 
 ### 3. Launching the Web Studio
 

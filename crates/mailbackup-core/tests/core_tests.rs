@@ -51,6 +51,7 @@ fn test_config_serialization() {
         storage_namespace: None,
         credential_ref: None,
         archive: None,
+        trust_server_ids: false,
     });
 
     config.save(&config_path).unwrap();
@@ -638,6 +639,7 @@ async fn test_scheduler_event_logging_and_listener() {
         storage_namespace: None,
         credential_ref: None,
         archive: None,
+        trust_server_ids: false,
     });
 
     let mut scheduler = BackupScheduler::new(Arc::new(config), db, storage, creds).await.unwrap();
@@ -971,6 +973,7 @@ fn binding_test_account(id: &str) -> AccountConfig {
         storage_namespace: None,
         credential_ref: None,
         archive: None,
+        trust_server_ids: false,
     }
 }
 

@@ -38,6 +38,7 @@ impl ValidImportAccount {
             storage_namespace: None,
             credential_ref: None,
             archive: None,
+            trust_server_ids: false,
         }
     }
 }

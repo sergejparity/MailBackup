@@ -1084,6 +1084,14 @@
               <input type="checkbox" id="edit-enabled" style="width: 18px; height: 18px;">
               <label for="edit-enabled" style="cursor: pointer; font-size: 0.85rem;">Enable automatic scheduled backups for this account</label>
             </div>
+            <div class="form-group">
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <input type="checkbox" id="edit-trust-server-ids" style="width: 18px; height: 18px;">
+                <label for="edit-trust-server-ids" style="cursor: pointer; font-size: 0.85rem;">Trust the server's message ids to skip re-downloading on re-scans</label>
+              </div>
+              <small class="form-hint">When the same server renumbers a folder, messages it identifies by EMAILID or Gmail's X-GM-MSGID are matched to their archived copies without downloading them again. This relies on the server never reusing an id for other content: the size and the archived file are checked, and an inconsistency turns it off and re-checks, but not every body is verified. Off: every message is downloaded and verified.</small>
+              <small class="form-hint server-id-note" id="edit-server-id-note" style="display: none;"></small>
+            </div>
             <fieldset class="form-group archive-choice" id="edit-archive-choice" style="display: none;">
               <legend>The mail archived so far</legend>
               <label class="archive-option">

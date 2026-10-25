@@ -641,6 +641,12 @@ body.is-modal-resizing * {
   color: var(--text-dim);
 }
 
+.server-id-note {
+  margin-top: 4px;
+  font-weight: 600;
+  color: var(--accent-amber);
+}
+
 .account-email {
   font-size: 0.72rem;
   color: var(--text-dim);

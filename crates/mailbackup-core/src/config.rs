@@ -90,6 +90,12 @@ pub struct AccountConfig {
     /// Set on read-only archives retired by "start a new archive".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive: Option<ArchiveInfo>,
+    /// Re-bind archived copies by the server's message ids (EMAILID or
+    /// X-GM-MSGID) on same-server re-scans instead of downloading them again
+    /// (issue #33). Off by default: it accepts the server's promise that an
+    /// id never names other content, instead of verifying every body.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trust_server_ids: bool,
 }
 
 /// A read-only archive: the mail an account had archived when it moved to

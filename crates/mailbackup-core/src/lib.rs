@@ -5,6 +5,7 @@ pub mod db;
 pub mod keyring;
 pub mod storage;
 pub mod imap;
+pub mod server_ids;
 pub mod retention;
 pub mod mbox;
 pub mod scheduler;

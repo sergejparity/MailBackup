@@ -54,6 +54,19 @@ pub struct Mailbox {
     pub connections: usize,
     /// Sessions that switched to compression
     pub compressed_sessions: usize,
+    /// Advertise OBJECTID (RFC 8474) / X-GM-EXT-1 (Gmail)
+    pub object_id: bool,
+    pub gmail: bool,
+    /// Per UID, the id attribute sent when a FETCH asks for EMAILID or
+    /// X-GM-MSGID, verbatim (e.g. `EMAILID (Mabc)`, or something broken)
+    pub id_attrs: HashMap<u32, String>,
+    /// RFC822.SIZE to report instead of the real size
+    pub size_override: HashMap<u32, usize>,
+    /// Every command line received, with the number of its connection
+    pub raw_commands: Vec<(usize, String)>,
+    /// (connection number, UIDVALIDITY): switch to it when that connection
+    /// arrives
+    pub uidvalidity_on_connection: Option<(usize, u32)>,
 }
 
 #[derive(Clone)]
@@ -73,8 +86,17 @@ impl FakeImap {
         let (shared, counter) = (mailbox.clone(), wire_bytes.clone());
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                shared.lock().unwrap().connections += 1;
-                tokio::spawn(serve(stream, shared.clone(), counter.clone()));
+                let connection = {
+                    let mut mb = shared.lock().unwrap();
+                    mb.connections += 1;
+                    if let Some((n, v)) = mb.uidvalidity_on_connection {
+                        if n == mb.connections {
+                            mb.uidvalidity = Some(v);
+                        }
+                    }
+                    mb.connections
+                };
+                tokio::spawn(serve(stream, shared.clone(), counter.clone(), connection));
             }
         });
         FakeImap { port, mailbox, wire_bytes }
@@ -110,6 +132,24 @@ impl FakeImap {
     pub fn set_compress(&self, mode: Compress) {
         self.mailbox.lock().unwrap().compress = mode;
     }
+
+    /// Advertises OBJECTID and sends these EMAILIDs (well-formed or not).
+    pub fn set_email_ids(&self, ids: &[(u32, &str)]) {
+        let mut mb = self.mailbox.lock().unwrap();
+        mb.object_id = true;
+        mb.id_attrs = ids.iter().map(|(u, v)| (*u, format!("EMAILID ({})", v))).collect();
+    }
+
+    /// Advertises X-GM-EXT-1 and sends these X-GM-MSGIDs.
+    pub fn set_gmail_ids(&self, ids: &[(u32, u64)]) {
+        let mut mb = self.mailbox.lock().unwrap();
+        mb.gmail = true;
+        mb.id_attrs = ids.iter().map(|(u, v)| (*u, format!("X-GM-MSGID {}", v))).collect();
+    }
+
+    pub fn take_raw_commands(&self) -> Vec<(usize, String)> {
+        std::mem::take(&mut self.mailbox.lock().unwrap().raw_commands)
+    }
 }
 
 /// Counts bytes written to the network.
@@ -139,17 +179,17 @@ enum Next<R, W> {
     Compress(R, W),
 }
 
-async fn serve(stream: TcpStream, mailbox: Arc<Mutex<Mailbox>>, wire: Arc<AtomicU64>) {
+async fn serve(stream: TcpStream, mailbox: Arc<Mutex<Mailbox>>, wire: Arc<AtomicU64>, connection: usize) {
     let (read, write) = stream.into_split();
     let mut writer = Counting { inner: write, count: wire };
     if writer.write_all(b"* OK fake IMAP ready\r\n").await.is_err() {
         return;
     }
-    if let Next::Compress(reader, writer) = session(BufReader::new(read), writer, &mailbox).await {
+    if let Next::Compress(reader, writer) = session(BufReader::new(read), writer, &mailbox, connection).await {
         mailbox.lock().unwrap().compressed_sessions += 1;
         let reader = BufReader::new(DeflateDecoder::new(reader));
         let writer = DeflateEncoder::new(writer);
-        session(reader, writer, &mailbox).await;
+        session(reader, writer, &mailbox, connection).await;
     }
 }
 
@@ -179,7 +219,7 @@ fn select(set: &str, existing: &[u32], star_matches_last: bool) -> Vec<u32> {
     out
 }
 
-async fn session<R, W>(mut reader: R, mut writer: W, mailbox: &Arc<Mutex<Mailbox>>) -> Next<R, W>
+async fn session<R, W>(mut reader: R, mut writer: W, mailbox: &Arc<Mutex<Mailbox>>, connection: usize) -> Next<R, W>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -195,12 +235,22 @@ where
         let tag = parts.next().unwrap_or("*").to_string();
         let command = parts.next().unwrap_or("").to_string();
         let upper = command.to_ascii_uppercase();
+        mailbox.lock().unwrap().raw_commands.push((connection, command.clone()));
         let mut out: Vec<u8> = Vec::new();
         let mut close_after = false;
         if upper.starts_with("CAPABILITY") {
             let mut mb = mailbox.lock().unwrap();
             mb.commands.push("CAPABILITY".into());
-            let extra = if mb.compress == Compress::Off { "" } else { " COMPRESS=DEFLATE" };
+            let mut extra = String::new();
+            if mb.compress != Compress::Off {
+                extra.push_str(" COMPRESS=DEFLATE");
+            }
+            if mb.object_id {
+                extra.push_str(" OBJECTID");
+            }
+            if mb.gmail {
+                extra.push_str(" X-GM-EXT-1");
+            }
             out.extend(format!("* CAPABILITY IMAP4rev1{}\r\n{} OK CAPABILITY completed\r\n", extra, tag).bytes());
         } else if upper.starts_with("COMPRESS") {
             let mode = {
@@ -244,6 +294,7 @@ where
             // "UID FETCH <set> (<items>)"
             let set = command.split(' ').nth(2).unwrap_or("").to_string();
             let wants_body = upper.contains("BODY.PEEK[]");
+            let wants_id = upper.contains("EMAILID") || upper.contains("X-GM-MSGID");
             let mut mb = mailbox.lock().unwrap();
             mb.commands.push(if wants_body { "BODY".into() } else { "SIZE".into() });
             let gone = std::mem::take(&mut mb.expunge_on_fetch);
@@ -251,10 +302,14 @@ where
             let existing: Vec<u32> = mb.messages.iter().map(|(u, _)| *u).collect();
             for uid in select(&set, &existing, false) {
                 let seq = existing.iter().position(|u| *u == uid).unwrap() + 1;
+                let id_attr = match mb.id_attrs.get(&uid) {
+                    Some(attr) if wants_id => format!(" {}", attr),
+                    _ => String::new(),
+                };
                 if !wants_body {
                     if !mb.omit_size_of.contains(&uid) {
-                        let size = mb.messages[seq - 1].1.len();
-                        out.extend(format!("* {} FETCH (UID {} RFC822.SIZE {})\r\n", seq, uid, size).bytes());
+                        let size = mb.size_override.get(&uid).copied().unwrap_or(mb.messages[seq - 1].1.len());
+                        out.extend(format!("* {} FETCH (UID {} RFC822.SIZE {}{})\r\n", seq, uid, size, id_attr).bytes());
                     }
                     continue;
                 }
@@ -270,7 +325,8 @@ where
                 let body = mb.messages[seq - 1].1.clone();
                 let date = mb.internal_dates.get(&uid).cloned().unwrap_or_else(|| "24-Oct-2026 10:00:00 +0000".into());
                 out.extend(
-                    format!("* {} FETCH (UID {} INTERNALDATE \"{}\" BODY[] {{{}}}\r\n", seq, uid, date, body.len()).bytes(),
+                    format!("* {} FETCH (UID {}{} INTERNALDATE \"{}\" BODY[] {{{}}}\r\n", seq, uid, id_attr, date, body.len())
+                        .bytes(),
                 );
                 out.extend(&body);
                 out.extend(b")\r\n");
@@ -327,6 +383,7 @@ pub fn account(server: &FakeImap, username: &str) -> AccountConfig {
         storage_namespace: None,
         credential_ref: None,
         archive: None,
+        trust_server_ids: false,
     }
 }
 

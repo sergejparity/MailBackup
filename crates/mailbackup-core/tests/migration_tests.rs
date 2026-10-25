@@ -120,7 +120,7 @@ fn a_v0_catalog_is_migrated_with_everything_intact() {
     assert_eq!(user_version(&path), 0);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(user_version(&path), 2);
+    assert_eq!(user_version(&path), 3);
 
     let folder = &db.get_folders("acc").unwrap()[0];
     assert_eq!((folder.uidvalidity, folder.last_synced_uid, folder.uid_generation), (Some(7), 42, 0));
@@ -142,7 +142,7 @@ fn a_v0_catalog_is_migrated_with_everything_intact() {
     let indexes: i64 = conn
         .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages' AND name LIKE 'idx_%'", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(indexes, 4, "indexes recreated");
+    assert_eq!(indexes, 5, "indexes recreated, plus the server id one");
     // Deleting the message still cascades to its attachment
     conn.execute_batch("PRAGMA foreign_keys = ON; DELETE FROM messages WHERE id = 'm1';").unwrap();
     let left: i64 = conn.query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0)).unwrap();
@@ -195,11 +195,11 @@ fn reopening_is_a_no_op_and_fresh_catalogs_start_at_the_current_version() {
     Database::open(&path).unwrap();
     let db = Database::open(&path).unwrap();
     assert_eq!(db.get_messages_for_folder("f1").unwrap().len(), 1);
-    assert_eq!(user_version(&path), 2);
+    assert_eq!(user_version(&path), 3);
 
     let fresh = dir.path().join("fresh.db");
     Database::open(&fresh).unwrap();
-    assert_eq!(user_version(&fresh), 2);
+    assert_eq!(user_version(&fresh), 3);
 }
 
 #[test]
@@ -225,7 +225,35 @@ fn a_v1_catalog_gains_the_account_transitions_table() {
     drop(conn);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(user_version(&path), 2);
+    assert_eq!(user_version(&path), 3);
     assert_eq!(db.last_transition_seq("acc").unwrap(), 0);
     assert_eq!(db.get_messages_for_folder("f1").unwrap().len(), 1, "data untouched");
+}
+
+#[test]
+fn a_v2_catalog_gains_server_id_columns_and_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    v0_catalog(&path);
+    Database::open(&path).unwrap();
+    // Back to what 0.5.x left: schema 2 without anything of #33
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        r#"DROP INDEX idx_messages_server_id;
+           ALTER TABLE messages DROP COLUMN server_id_kind;
+           ALTER TABLE messages DROP COLUMN server_id;
+           ALTER TABLE messages DROP COLUMN server_id_source;
+           DROP TABLE server_id_distrust; DROP TABLE server_id_disabled; DROP TABLE server_id_rebinds;
+           PRAGMA user_version = 2;"#,
+    )
+    .unwrap();
+    drop(conn);
+
+    let db = Database::open(&path).unwrap();
+    assert_eq!(user_version(&path), 3);
+    let rows = db.get_messages_for_folder("f1").unwrap();
+    assert_eq!(rows.len(), 1, "data untouched");
+    assert!(db.message_server_id(&rows[0].id).unwrap().is_none(), "old rows have no server id");
+    assert!(db.server_id_states("acc").unwrap().is_empty());
+    assert!(db.pending_id_rebinds("f1").unwrap().is_empty());
 }

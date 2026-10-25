@@ -71,6 +71,11 @@ pub enum Error {
     #[error("Account '{0}' is busy: a sync or a change of it is in progress")]
     AccountBusy(String),
 
+    /// The server's response couldn't be parsed; the session can't be used
+    /// for another command.
+    #[error("IMAP protocol error: {0}")]
+    ProtocolBroken(String),
+
     #[error("Generic error: {0}")]
     Other(String),
 }
