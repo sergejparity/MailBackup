@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::server_ids::{ServerId, ServerIdKind, SourcedId};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -50,8 +51,9 @@ fn folder_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FolderRecord> {
 }
 
 /// Catalog schema version (`PRAGMA user_version`). 1 added UID generations
-/// (issue #17), 2 the account transitions of "start a new archive" (#31).
-const SCHEMA_VERSION: i64 = 2;
+/// (issue #17), 2 the account transitions of "start a new archive" (#31), 3
+/// server-guaranteed message ids (#33).
+const SCHEMA_VERSION: i64 = 3;
 
 /// `messages` as of schema version 1. `uid_generation` deliberately has no
 /// default: binaries older than 0.4.0 don't know about generations, and their
@@ -89,6 +91,20 @@ const MESSAGES_INDEXES: &str = r#"
             CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);
 "#;
 
+/// Schema 3: each message's server id (kind, exact value, and the remote
+/// identity it was fetched from), all NULL for rows archived before.
+fn add_server_id_columns(conn: &Connection) -> Result<()> {
+    for column in ["server_id_kind", "server_id", "server_id_source"] {
+        if !has_column(conn, "messages", column)? {
+            conn.execute_batch(&format!("ALTER TABLE messages ADD COLUMN {} TEXT;", column))?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_messages_server_id ON messages(folder_id, server_id_kind, server_id);",
+    )?;
+    Ok(())
+}
+
 fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
     let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -109,6 +125,38 @@ pub struct FolderSync {
     pub generation: u32,
     /// Why a new generation (a full re-scan) was started, if one was.
     pub rescan_reason: Option<String>,
+}
+
+/// What [`Database::rebind_by_server_id_if`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdRebind {
+    /// This archived copy was re-bound.
+    Rebound(String),
+    /// No usable copy with this id (none at all, or none whose file is
+    /// intact): download the body.
+    NoCandidate,
+    /// Copies with this id exist, but none of this size: the server's ids
+    /// are inconsistent.
+    SizeMismatch,
+}
+
+/// A re-bind by id still to be checked; see [`Database::pending_id_rebinds`].
+#[derive(Debug, Clone)]
+pub struct PendingIdRebind {
+    pub message_id: String,
+    pub uid: u32,
+    pub sha256_hash: String,
+}
+
+/// A distrusted (inconsistent ids) or disabled (unparseable responses)
+/// server id source of an account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerIdState {
+    pub distrusted: bool,
+    pub source: String,
+    pub kind: String,
+    pub reason: String,
+    pub detected_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +409,85 @@ fn migrate_to_v1(conn: &mut Connection) -> Result<()> {
     result
 }
 
+/// A message to insert; see [`Database::insert_new_message`].
+pub struct NewMessage<'a> {
+    pub account_id: &'a str,
+    pub folder_id: &'a str,
+    pub generation: u32,
+    pub uid: u32,
+    pub message_id: Option<&'a str>,
+    pub subject: Option<&'a str>,
+    pub from_addr: Option<&'a str>,
+    pub to_addrs: Option<&'a str>,
+    pub cc_addrs: Option<&'a str>,
+    pub date: Option<DateTime<Utc>>,
+    pub size_bytes: u64,
+    pub relative_path: &'a str,
+    pub sha256_hash: &'a str,
+    pub body_text: Option<&'a str>,
+    pub attachments: &'a [(&'a str, &'a str, u64)], // (filename, mime_type, size)
+    /// The server id fetched together with this body, if any.
+    pub server_id: Option<SourcedId<'a>>,
+}
+
+fn insert_message_tx(tx: &Connection, m: &NewMessage<'_>) -> Result<String> {
+    let new_id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let date_str = m.date.map(|d| d.to_rfc3339());
+    let (id_kind, id_value, id_source) = match m.server_id {
+        Some(s) => (Some(s.id.kind.as_str()), Some(s.id.value.as_str()), Some(s.source)),
+        None => (None, None, None),
+    };
+
+    tx.execute(
+        r#"
+        INSERT INTO messages (
+            id, account_id, folder_id, uid, message_id, subject, from_addr,
+            to_addrs, cc_addrs, date, size_bytes, relative_path, sha256_hash,
+            is_remote_deleted, created_at, uid_generation, server_id_kind, server_id, server_id_source
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14, ?15, ?16, ?17, ?18)
+        "#,
+        params![
+            new_id, m.account_id, m.folder_id, m.uid, m.message_id, m.subject, m.from_addr,
+            m.to_addrs, m.cc_addrs, date_str, m.size_bytes as i64, m.relative_path, m.sha256_hash, now, m.generation,
+            id_kind, id_value, id_source
+        ],
+    )?;
+
+    // Insert attachments
+    let mut att_names = Vec::new();
+    for (fname, mtype, sz) in m.attachments {
+        let att_id = Uuid::new_v4().to_string();
+        tx.execute(
+            r#"
+            INSERT INTO attachments (id, message_id, filename, mime_type, size_bytes)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![att_id, new_id, fname, mtype, *sz as i64],
+        )?;
+        att_names.push(*fname);
+    }
+
+    // Insert into FTS5 index
+    let att_names_str = att_names.join(" ");
+    tx.execute(
+        r#"
+        INSERT INTO messages_fts (message_id, account_id, subject, from_addr, to_addrs, body_text, attachment_names)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+        params![
+            new_id,
+            m.account_id,
+            m.subject.unwrap_or(""),
+            m.from_addr.unwrap_or(""),
+            m.to_addrs.unwrap_or(""),
+            m.body_text.unwrap_or(""),
+            att_names_str
+        ],
+    )?;
+    Ok(new_id)
+}
+
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -536,17 +663,53 @@ impl Database {
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_account_transitions_live ON account_transitions(live_id);
+
+            -- Server ids (#33). A source whose ids were seen inconsistent
+            -- (distrust), or whose responses with ids couldn't be parsed
+            -- (disabled), until an explicit reset.
+            CREATE TABLE IF NOT EXISTS server_id_distrust (
+                account_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                detected_at TEXT NOT NULL,
+                PRIMARY KEY(account_id, source, kind)
+            );
+            CREATE TABLE IF NOT EXISTS server_id_disabled (
+                account_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                detected_at TEXT NOT NULL,
+                PRIMARY KEY(account_id, source, kind)
+            );
+            -- Messages re-bound by server id without a download, and where
+            -- they were bound before, so they can be checked and undone if
+            -- their source turns out inconsistent.
+            CREATE TABLE IF NOT EXISTS server_id_rebinds (
+                message_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                folder_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                prev_generation INTEGER NOT NULL,
+                prev_uid INTEGER NOT NULL,
+                verified INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+            );
             "#
         .replace("{messages}", &messages_ddl("messages"))
         .replace("{indexes}", MESSAGES_INDEXES);
         if fresh {
             conn.execute_batch(&schema)?;
+            add_server_id_columns(&conn)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             return Ok(());
         }
         migrate_to_v1(&mut conn)?;
         // Tables added later than `messages` (no-ops when present)
         conn.execute_batch(&schema)?;
+        add_server_id_columns(&conn)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
@@ -922,6 +1085,23 @@ impl Database {
         sha256_hash: &str,
         usable: impl Fn(&str) -> bool,
     ) -> Result<Option<String>> {
+        self.rebind_message_with_id_if(folder_id, generation, uid, sha256_hash, None, usable)
+    }
+
+    /// [`Self::rebind_message_if`] for a body fetched together with
+    /// `server_id`: the re-bound row's server id becomes that one (or none),
+    /// so an id it carried from another fetch, possibly from another server,
+    /// can't make it a false candidate later. A full-content match also
+    /// verifies an earlier re-bind of the row by id.
+    pub fn rebind_message_with_id_if(
+        &self,
+        folder_id: &str,
+        generation: u32,
+        uid: u32,
+        sha256_hash: &str,
+        server_id: Option<SourcedId<'_>>,
+        usable: impl Fn(&str) -> bool,
+    ) -> Result<Option<String>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         ensure_generation(&tx, folder_id, generation)?;
@@ -936,13 +1116,263 @@ impl Database {
         };
         let chosen = candidates.into_iter().find(|(_, path)| usable(path)).map(|(id, _)| id);
         if let Some(id) = &chosen {
+            let (kind, value, source) = match server_id {
+                Some(s) => (Some(s.id.kind.as_str()), Some(s.id.value.as_str()), Some(s.source)),
+                None => (None, None, None),
+            };
             tx.execute(
-                "UPDATE messages SET uid_generation = ?1, uid = ?2 WHERE id = ?3",
-                params![generation, uid, id],
+                r#"UPDATE messages SET uid_generation = ?1, uid = ?2,
+                       server_id_kind = ?3, server_id = ?4, server_id_source = ?5
+                   WHERE id = ?6"#,
+                params![generation, uid, kind, value, source, id],
             )?;
+            tx.execute("UPDATE server_id_rebinds SET verified = 1 WHERE message_id = ?1", params![id])?;
         }
         tx.commit()?;
         Ok(chosen)
+    }
+
+    /// Whether the folder has archived copies from older generations that a
+    /// re-bind by a `kind` id from `source` could use.
+    pub fn has_server_id_candidates(&self, folder_id: &str, generation: u32, kind: ServerIdKind, source: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            r#"SELECT EXISTS(SELECT 1 FROM messages
+                   WHERE folder_id = ?1 AND uid_generation < ?2 AND server_id_kind = ?3 AND server_id_source = ?4)"#,
+            params![folder_id, generation, kind.as_str(), source],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Re-binds an archived copy to `uid` of `generation` by its server id,
+    /// without its body (issue #33). Candidates are older-generation rows of
+    /// this folder only, with the same id kind, exact value and source; one
+    /// whose size is `size` and for which `usable(relative_path, sha256)`
+    /// holds (its file is present and matches its stored hash) is re-bound, and the
+    /// re-bind is recorded so it can be checked and undone if the source
+    /// turns out inconsistent. Each row is re-bound at most once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rebind_by_server_id_if(
+        &self,
+        account_id: &str,
+        folder_id: &str,
+        generation: u32,
+        uid: u32,
+        server_id: SourcedId<'_>,
+        size: u64,
+        usable: impl Fn(&str, &str) -> bool,
+    ) -> Result<IdRebind> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        ensure_generation(&tx, folder_id, generation)?;
+        let candidates: Vec<(String, String, u64, u32, u32, String)> = {
+            let mut stmt = tx.prepare(
+                r#"SELECT id, relative_path, size_bytes, uid_generation, uid, sha256_hash FROM messages
+                   WHERE folder_id = ?1 AND uid_generation < ?2
+                     AND server_id_kind = ?3 AND server_id = ?4 AND server_id_source = ?5
+                   ORDER BY uid_generation, uid"#,
+            )?;
+            let rows = stmt.query_map(
+                params![folder_id, generation, server_id.id.kind.as_str(), server_id.id.value, server_id.source],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if candidates.is_empty() {
+            return Ok(IdRebind::NoCandidate);
+        }
+        if candidates.iter().all(|c| c.2 != size) {
+            return Ok(IdRebind::SizeMismatch);
+        }
+        let Some((id, _, _, prev_generation, prev_uid, _)) =
+            candidates.into_iter().find(|(_, path, sz, _, _, sha)| *sz == size && usable(path, sha))
+        else {
+            return Ok(IdRebind::NoCandidate);
+        };
+        tx.execute(
+            "UPDATE messages SET uid_generation = ?1, uid = ?2 WHERE id = ?3",
+            params![generation, uid, id],
+        )?;
+        tx.execute(
+            r#"INSERT OR REPLACE INTO server_id_rebinds
+                   (message_id, account_id, folder_id, source, kind, prev_generation, prev_uid, verified)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)"#,
+            params![id, account_id, folder_id, server_id.source, server_id.id.kind.as_str(), prev_generation, prev_uid],
+        )?;
+        tx.commit()?;
+        Ok(IdRebind::Rebound(id))
+    }
+
+    /// Whether the folder already holds a message with this server id from
+    /// this source but other content: the server reused an id it promised
+    /// never to reuse (RFC 8474 §8.4).
+    pub fn server_id_conflicts(&self, folder_id: &str, server_id: SourcedId<'_>, sha256_hash: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            r#"SELECT EXISTS(SELECT 1 FROM messages
+                   WHERE folder_id = ?1 AND server_id_kind = ?2 AND server_id = ?3 AND server_id_source = ?4
+                     AND sha256_hash != ?5)"#,
+            params![folder_id, server_id.id.kind.as_str(), server_id.id.value, server_id.source, sha256_hash],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The server id stored with a message, and its source.
+    pub fn message_server_id(&self, message_id: &str) -> Result<Option<(ServerId, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT server_id_kind, server_id, server_id_source FROM messages WHERE id = ?1",
+                params![message_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((Some(kind), Some(value), Some(source))) => {
+                ServerIdKind::parse(&kind).map(|kind| (ServerId { kind, value }, source))
+            }
+            _ => None,
+        })
+    }
+
+    /// Records that `source`'s `kind` ids can't be trusted for `account_id`
+    /// (kept until [`Self::reset_server_id_state`]).
+    pub fn record_server_id_distrust(&self, account_id: &str, source: &str, kind: ServerIdKind, reason: &str) -> Result<()> {
+        self.record_server_id_state("server_id_distrust", account_id, source, kind, reason)
+    }
+
+    /// Records that `source` must not be asked for `kind` ids again for
+    /// `account_id` (kept until [`Self::reset_server_id_state`]).
+    pub fn record_server_id_disabled(&self, account_id: &str, source: &str, kind: ServerIdKind, reason: &str) -> Result<()> {
+        self.record_server_id_state("server_id_disabled", account_id, source, kind, reason)
+    }
+
+    fn record_server_id_state(&self, table: &str, account_id: &str, source: &str, kind: ServerIdKind, reason: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            &format!(
+                "INSERT OR IGNORE INTO {} (account_id, source, kind, reason, detected_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                table
+            ),
+            params![account_id, source, kind.as_str(), reason, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn server_id_distrusted(&self, account_id: &str, source: &str, kind: ServerIdKind) -> Result<bool> {
+        self.server_id_state_exists("server_id_distrust", account_id, source, kind)
+    }
+
+    pub fn server_id_disabled(&self, account_id: &str, source: &str, kind: ServerIdKind) -> Result<bool> {
+        self.server_id_state_exists("server_id_disabled", account_id, source, kind)
+    }
+
+    fn server_id_state_exists(&self, table: &str, account_id: &str, source: &str, kind: ServerIdKind) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {} WHERE account_id = ?1 AND source = ?2 AND kind = ?3)", table),
+            params![account_id, source, kind.as_str()],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The account's distrusted and disabled server id sources.
+    pub fn server_id_states(&self, account_id: &str) -> Result<Vec<ServerIdState>> {
+        let conn = self.conn.lock().unwrap();
+        let mut out = Vec::new();
+        for (table, distrusted) in [("server_id_distrust", true), ("server_id_disabled", false)] {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT source, kind, reason, detected_at FROM {} WHERE account_id = ?1 ORDER BY detected_at",
+                table
+            ))?;
+            let rows = stmt.query_map(params![account_id], |r| {
+                Ok(ServerIdState {
+                    distrusted,
+                    source: r.get(0)?,
+                    kind: r.get(1)?,
+                    reason: r.get(2)?,
+                    detected_at: r.get(3)?,
+                })
+            })?;
+            out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        Ok(out)
+    }
+
+    /// Clears the account's distrusted and disabled server id records (of
+    /// one source, or all). Returns how many were cleared.
+    pub fn reset_server_id_state(&self, account_id: &str, source: Option<&str>) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let mut cleared = 0;
+        for table in ["server_id_distrust", "server_id_disabled"] {
+            cleared += conn.execute(
+                &format!("DELETE FROM {} WHERE account_id = ?1 AND (?2 IS NULL OR source = ?2)", table),
+                params![account_id, source],
+            )?;
+        }
+        Ok(cleared)
+    }
+
+    /// Re-binds by id in this folder that must be checked: not verified,
+    /// still bound in the folder's current generation, and from a source and
+    /// kind now distrusted for their account.
+    pub fn pending_id_rebinds(&self, folder_id: &str) -> Result<Vec<PendingIdRebind>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT m.id, m.uid, m.sha256_hash FROM server_id_rebinds r
+               JOIN messages m ON m.id = r.message_id
+               JOIN folders f ON f.id = m.folder_id
+               WHERE r.folder_id = ?1 AND m.folder_id = ?1 AND r.verified = 0
+                 AND m.uid_generation = f.uid_generation
+                 AND EXISTS(SELECT 1 FROM server_id_distrust d
+                            WHERE d.account_id = r.account_id AND d.source = r.source AND d.kind = r.kind)
+               ORDER BY m.uid"#,
+        )?;
+        let rows = stmt.query_map(params![folder_id], |r| {
+            Ok(PendingIdRebind { message_id: r.get(0)?, uid: r.get(1)?, sha256_hash: r.get(2)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The body fetched for a re-bind by id matched the archived copy.
+    pub fn mark_id_rebind_verified(&self, message_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE server_id_rebinds SET verified = 1 WHERE message_id = ?1", params![message_id])?;
+        Ok(())
+    }
+
+    /// Undoes a re-bind by id whose UID turned out to hold other content (or
+    /// is gone): in one transaction bound to `generation`, the archived copy
+    /// goes back to where it was bound before, and `replacement` (the body
+    /// actually fetched for the UID, already stored) is inserted in its place.
+    pub fn undo_id_rebind(&self, folder_id: &str, generation: u32, message_id: &str, replacement: Option<&NewMessage<'_>>) -> Result<Option<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        ensure_generation(&tx, folder_id, generation)?;
+        let prev: Option<(u32, u32)> = tx
+            .query_row(
+                "SELECT prev_generation, prev_uid FROM server_id_rebinds WHERE message_id = ?1 AND verified = 0",
+                params![message_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((prev_generation, prev_uid)) = prev else {
+            return Err(crate::Error::Other(format!("message {} has no pending re-bind by id", message_id)));
+        };
+        let moved = tx.execute(
+            "UPDATE messages SET uid_generation = ?1, uid = ?2 WHERE id = ?3 AND folder_id = ?4 AND uid_generation = ?5",
+            params![prev_generation, prev_uid, message_id, folder_id, generation],
+        )?;
+        if moved != 1 {
+            return Err(crate::Error::StaleSync(folder_id.to_string()));
+        }
+        tx.execute("DELETE FROM server_id_rebinds WHERE message_id = ?1", params![message_id])?;
+        let inserted = match replacement {
+            Some(m) => Some(insert_message_tx(&tx, m)?),
+            None => None,
+        };
+        tx.commit()?;
+        Ok(inserted)
     }
 
     /// Advances the folder's checkpoint, unless a newer sync has started a
@@ -1096,60 +1526,34 @@ impl Database {
         body_text: Option<&str>,
         attachments: &[(&str, &str, u64)], // (filename, mime_type, size)
     ) -> Result<String> {
+        self.insert_new_message(&NewMessage {
+            account_id,
+            folder_id,
+            generation,
+            uid,
+            message_id,
+            subject,
+            from_addr,
+            to_addrs,
+            cc_addrs,
+            date,
+            size_bytes,
+            relative_path,
+            sha256_hash,
+            body_text,
+            attachments,
+            server_id: None,
+        })
+    }
+
+    /// Inserts `m` under its generation, which must still be the folder's
+    /// current one (`Error::StaleSync` otherwise).
+    pub fn insert_new_message(&self, m: &NewMessage<'_>) -> Result<String> {
         let mut conn = self.conn.lock().unwrap();
-        let conn = conn.transaction()?;
-        ensure_generation(&conn, folder_id, generation)?;
-        let new_id = Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
-        let date_str = date.map(|d| d.to_rfc3339());
-
-        conn.execute(
-            r#"
-            INSERT INTO messages (
-                id, account_id, folder_id, uid, message_id, subject, from_addr,
-                to_addrs, cc_addrs, date, size_bytes, relative_path, sha256_hash,
-                is_remote_deleted, created_at, uid_generation
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14, ?15)
-            "#,
-            params![
-                new_id, account_id, folder_id, uid, message_id, subject, from_addr,
-                to_addrs, cc_addrs, date_str, size_bytes as i64, relative_path, sha256_hash, now, generation
-            ],
-        )?;
-
-        // Insert attachments
-        let mut att_names = Vec::new();
-        for (fname, mtype, sz) in attachments {
-            let att_id = Uuid::new_v4().to_string();
-            conn.execute(
-                r#"
-                INSERT INTO attachments (id, message_id, filename, mime_type, size_bytes)
-                VALUES (?1, ?2, ?3, ?4, ?5)
-                "#,
-                params![att_id, new_id, fname, mtype, *sz as i64],
-            )?;
-            att_names.push(*fname);
-        }
-
-        // Insert into FTS5 index
-        let att_names_str = att_names.join(" ");
-        conn.execute(
-            r#"
-            INSERT INTO messages_fts (message_id, account_id, subject, from_addr, to_addrs, body_text, attachment_names)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            "#,
-            params![
-                new_id,
-                account_id,
-                subject.unwrap_or(""),
-                from_addr.unwrap_or(""),
-                to_addrs.unwrap_or(""),
-                body_text.unwrap_or(""),
-                att_names_str
-            ],
-        )?;
-
-        conn.commit()?;
+        let tx = conn.transaction()?;
+        ensure_generation(&tx, m.folder_id, m.generation)?;
+        let new_id = insert_message_tx(&tx, m)?;
+        tx.commit()?;
         Ok(new_id)
     }
 

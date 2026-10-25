@@ -2377,8 +2377,6 @@ dependencies = [
 [[package]]
 name = "imap-proto"
 version = "0.16.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25f6af35c6a517aea5c72314abe90134980d2ae6a763809b50c208b3e429d71f"
 dependencies = [
  "nom",
 ]
@@ -2794,7 +2792,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-cli"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2814,7 +2812,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2850,7 +2848,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-gui"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2867,7 +2865,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-server"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",

@@ -75,6 +75,24 @@ enum AccountCommands {
         account: String,
     },
 
+    #[command(
+        about = "Show, turn on or off, or reset re-binding by the server's message ids on same-server re-scans"
+    )]
+    ServerIds {
+        #[arg(help = "Account ID or email address")]
+        account: String,
+        #[arg(
+            long,
+            value_parser = ["on", "off"],
+            help = "on: trust the server's message ids (EMAILID / X-GM-MSGID) to skip re-downloading on re-scans; off: download and verify every message (the default)"
+        )]
+        trust: Option<String>,
+        #[arg(long, help = "Clear the records of inconsistent or unparseable ids, so the server's ids are used again")]
+        reset: bool,
+        #[arg(long, requires = "reset", help = "Reset only this source (server:port:username)")]
+        source: Option<String>,
+    },
+
     #[command(about = "Bulk import accounts from a CSV file")]
     ImportCsv {
         #[arg(help = "Path to CSV file containing accounts")]
@@ -190,6 +208,9 @@ async fn main() -> Result<()> {
         }
         Commands::Account(AccountCommands::Remove { account }) => {
             handle_account_remove(&mut config, cli.config.as_deref(), &credentials, &account)?;
+        }
+        Commands::Account(AccountCommands::ServerIds { account, trust, reset, source }) => {
+            handle_account_server_ids(&mut config, cli.config.as_deref(), &db, &account, trust.as_deref(), reset, source.as_deref())?;
         }
         Commands::Account(AccountCommands::ImportCsv { file, dry_run }) => {
             handle_account_import_csv(&mut config, cli.config.as_deref(), &credentials, &file, dry_run)?;
@@ -420,6 +441,7 @@ fn handle_account_add(
         storage_namespace: None,
         credential_ref: None,
         archive: None,
+        trust_server_ids: false,
     };
 
     // Store password securely, bound to this server/port/username
@@ -526,6 +548,55 @@ fn handle_account_remove(
     config.save(save_path)?;
 
     println!("{} Removed account '{}' from configuration and credentials store.", CHECK_EMOJI, account_id);
+    Ok(())
+}
+
+fn handle_account_server_ids(
+    config: &mut AppConfig,
+    config_path: Option<&std::path::Path>,
+    db: &Database,
+    account: &str,
+    trust: Option<&str>,
+    reset: bool,
+    source: Option<&str>,
+) -> Result<()> {
+    let Some(acc) = config.accounts.iter_mut().find(|a| a.id == account || (a.email == account && !a.is_archive())) else {
+        bail!("Account '{}' not found", account);
+    };
+    let id = acc.id.clone();
+    if let Some(trust) = trust {
+        if acc.is_archive() {
+            bail!("'{}' is a read-only archive and isn't synced", id);
+        }
+        acc.trust_server_ids = trust == "on";
+        let save_path = config_path.unwrap_or_else(|| mailbackup_core::config::default_config_path().leak());
+        config.save(save_path)?;
+        println!(
+            "{} {} '{}'.",
+            CHECK_EMOJI,
+            if trust == "on" { "Trusting the server's message ids for" } else { "Downloading and verifying every message for" },
+            id
+        );
+    }
+    if reset {
+        let cleared = db.reset_server_id_state(&id, source)?;
+        println!("{} Cleared {} server id record(s) of '{}'.", CHECK_EMOJI, cleared, id);
+    }
+    let acc = config.get_account(&id).expect("found above");
+    println!(
+        "Re-binding by server ids: {}",
+        if acc.trust_server_ids { "on (the server's ids are trusted; see the README)" } else { "off (every message is downloaded and verified)" }
+    );
+    for state in db.server_id_states(&id)? {
+        println!(
+            "  {} {} from {} since {}: {}",
+            if state.distrusted { "Distrusted" } else { "Not requested" },
+            state.kind,
+            state.source,
+            state.detected_at,
+            state.reason
+        );
+    }
     Ok(())
 }
 

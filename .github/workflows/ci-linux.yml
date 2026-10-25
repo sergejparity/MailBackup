@@ -46,6 +46,11 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --exclude mailbackup-gui --locked
 
+      # The vendored imap-proto (EMAILID patch, issue #33) is outside the
+      # workspace; run its own tests too
+      - name: Run vendored imap-proto tests
+        run: cargo test --manifest-path vendor/imap-proto/Cargo.toml
+
   clippy:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest

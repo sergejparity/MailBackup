@@ -145,6 +145,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/accounts/test-direct", post(api_test_direct))
         .route("/api/accounts/:id/folders", get(api_get_folders))
+        .route("/api/accounts/:id/server-ids", get(api_get_server_id_states))
         .route("/api/folders/:id/messages", get(api_get_messages))
         .route("/api/messages/:id", get(api_get_message_detail))
         .route("/api/messages/:id/download", get(api_download_eml))
@@ -641,6 +642,7 @@ async fn api_add_account(
         storage_namespace: None,
         credential_ref: None,
         archive: None,
+        trust_server_ids: false,
     };
 
     if let Err(e) = state.credentials.set_account_password(&account, &payload.password) {
@@ -846,6 +848,10 @@ struct UpdateAccountPayload {
     /// `"new_archive"` retires it as a read-only archive account.
     #[serde(default)]
     on_connection_change: Option<String>,
+    /// Re-bind by the server's message ids on same-server re-scans instead
+    /// of downloading again (opt-in; see `AccountConfig::trust_server_ids`).
+    #[serde(default)]
+    trust_server_ids: Option<bool>,
 }
 
 async fn api_update_account(
@@ -867,7 +873,8 @@ async fn api_update_account(
             || payload.password.as_deref().is_some_and(|p| !p.is_empty())
             || payload.schedule.is_some()
             || payload.retention_days.is_some()
-            || payload.enabled == Some(true);
+            || payload.enabled == Some(true)
+            || payload.trust_server_ids == Some(true);
         if changes_more {
             return (StatusCode::BAD_REQUEST, "This account is a read-only archive; only its name can be changed.")
                 .into_response();
@@ -971,6 +978,9 @@ async fn api_update_account(
     if let Some(e) = payload.enabled {
         acc.enabled = e;
     }
+    if let Some(trust) = payload.trust_server_ids {
+        acc.trust_server_ids = trust;
+    }
 
     if archived.is_none() {
         if let Some(pw) = new_password {
@@ -1063,6 +1073,7 @@ async fn api_test_direct(Json(payload): Json<TestDirectPayload>) -> impl IntoRes
         storage_namespace: None,
         credential_ref: None,
         archive: None,
+        trust_server_ids: false,
     };
 
     let connect = ImapSyncEngine::connect(&dummy_acc, &payload.password);
@@ -1109,6 +1120,18 @@ async fn api_get_folders(
 ) -> impl IntoResponse {
     match state.db.get_folders(&account_id) {
         Ok(folders) => Json(folders).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// The account's server id sources that are distrusted (inconsistent ids)
+/// or disabled (unparseable responses); see issue #33.
+async fn api_get_server_id_states(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+) -> impl IntoResponse {
+    match state.db.server_id_states(&account_id) {
+        Ok(states) => Json(states).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -2324,6 +2347,7 @@ mod tests {
     use super::*;
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
+    use mailbackup_core::server_ids::ServerIdKind;
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -2913,6 +2937,7 @@ mod tests {
             storage_namespace: None,
             credential_ref: None,
             archive: None,
+            trust_server_ids: false,
         };
         use mailbackup_core::Error as E;
         let generic = "Could not connect to imap.example.com:993. Check the host and port, and that the server accepts TLS (IMAPS).";
@@ -3225,6 +3250,7 @@ mod tests {
             storage_namespace: None,
             credential_ref: None,
             archive: None,
+            trust_server_ids: false,
         };
         state.config.write().await.accounts.push(acc.clone());
         state.config.read().await.save(&state.config_path).unwrap();
@@ -3288,6 +3314,41 @@ mod tests {
         assert_eq!(entry["archive"]["retired_from"], "acc");
         assert_eq!(entry["archive"]["last_source"], "imap.old.example:993:user");
         assert_eq!(entry["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn trusting_server_ids_is_an_opt_in_setting_with_visible_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = archive_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let on_disk = || AppConfig::load_existing(&state.config_path).unwrap().unwrap().accounts.into_iter().find(|a| a.id == "acc").unwrap();
+        assert!(!on_disk().trust_server_ids, "off by default");
+
+        let turn = |on: bool| edit("imap.old.example", serde_json::json!({ "password": null, "trust_server_ids": on }));
+        assert_eq!(status(&router, authed("PUT", "/api/accounts/acc", Some(turn(true)))).await, StatusCode::OK);
+        assert!(on_disk().trust_server_ids);
+        let res = router.clone().oneshot(authed("GET", "/api/accounts/acc", None)).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["trust_server_ids"], true);
+        assert_eq!(status(&router, authed("PUT", "/api/accounts/acc", Some(turn(false)))).await, StatusCode::OK);
+        assert!(!on_disk().trust_server_ids);
+
+        // Distrusted sources are listed for the edit dialog's note
+        state.db.record_server_id_distrust("acc", "imap.old.example:993:user", ServerIdKind::EmailId, "reused").unwrap();
+        let res = router.clone().oneshot(authed("GET", "/api/accounts/acc/server-ids", None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let states: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(states[0]["distrusted"], true);
+        assert_eq!(states[0]["source"], "imap.old.example:993:user");
+
+        // An archive can't opt in
+        let switch = edit("imap.new.example", serde_json::json!({ "on_connection_change": "new_archive" }));
+        assert_eq!(status(&router, authed("PUT", "/api/accounts/acc", Some(switch))).await, StatusCode::OK);
+        let archive_id = archived_ids(&state).await.remove(0);
+        let opt_in = serde_json::json!({ "name": "Old", "trust_server_ids": true });
+        let uri = format!("/api/accounts/{}", archive_id);
+        assert_eq!(status(&router, authed("PUT", &uri, Some(opt_in))).await, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
