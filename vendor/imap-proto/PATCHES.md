@@ -15,7 +15,8 @@ contributors; see `LICENSE-MIT` and `LICENSE-APACHE`) with only these changes:
 4. `src/types.rs`: `AttributeValue::EmailId(Cow<str>)` (and its
    `into_owned` arm), plus `Attribute::EmailId`.
 5. `src/builders/command.rs`: `Attribute::EmailId` renders as `EMAILID`.
-6. `Cargo.toml.orig` and `Cargo.lock` removed; `LICENSE-*` and this file added.
+6. `Cargo.toml.orig`, `Cargo.lock` and `.cargo-ok` removed; `LICENSE-*` (from the upstream
+   repository) and this file added. `.cargo_vcs_info.json` names the upstream commit.
 
 Without patch 1, a server's `EMAILID` in a FETCH response is a parse error,
 and async-imap's stream can't get past it.
