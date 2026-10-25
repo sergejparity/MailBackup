@@ -683,9 +683,11 @@ impl Database {
                 detected_at TEXT NOT NULL,
                 PRIMARY KEY(account_id, source, kind)
             );
-            -- Messages re-bound by server id without a download, and where
-            -- they were bound before, so they can be checked and undone if
-            -- their source turns out inconsistent.
+            -- Messages re-bound by server id without a download, and the
+            -- last binding of theirs that was verified (by content), so they
+            -- can be checked and undone if their source turns out
+            -- inconsistent. `needs_check` is set when it does, and stays set
+            -- until the check is done, whatever happens to the distrust.
             CREATE TABLE IF NOT EXISTS server_id_rebinds (
                 message_id TEXT PRIMARY KEY,
                 account_id TEXT NOT NULL,
@@ -695,6 +697,7 @@ impl Database {
                 prev_generation INTEGER NOT NULL,
                 prev_uid INTEGER NOT NULL,
                 verified INTEGER NOT NULL DEFAULT 0,
+                needs_check INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
             );
             "#
@@ -1193,10 +1196,22 @@ impl Database {
             "UPDATE messages SET uid_generation = ?1, uid = ?2 WHERE id = ?3",
             params![generation, uid, id],
         )?;
+        // A copy re-bound by id again before it was ever checked keeps the
+        // slot it was last verified in: the slots in between were never
+        // shown to hold its content
         tx.execute(
-            r#"INSERT OR REPLACE INTO server_id_rebinds
-                   (message_id, account_id, folder_id, source, kind, prev_generation, prev_uid, verified)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)"#,
+            r#"INSERT INTO server_id_rebinds
+                   (message_id, account_id, folder_id, source, kind, prev_generation, prev_uid, verified, needs_check)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0)
+               ON CONFLICT(message_id) DO UPDATE SET
+                   account_id = excluded.account_id,
+                   folder_id = excluded.folder_id,
+                   source = excluded.source,
+                   kind = excluded.kind,
+                   prev_generation = CASE WHEN verified = 0 THEN prev_generation ELSE excluded.prev_generation END,
+                   prev_uid = CASE WHEN verified = 0 THEN prev_uid ELSE excluded.prev_uid END,
+                   needs_check = CASE WHEN verified = 0 THEN needs_check ELSE 0 END,
+                   verified = 0"#,
             params![id, account_id, folder_id, server_id.source, server_id.id.kind.as_str(), prev_generation, prev_uid],
         )?;
         tx.commit()?;
@@ -1237,8 +1252,17 @@ impl Database {
 
     /// Records that `source`'s `kind` ids can't be trusted for `account_id`
     /// (kept until [`Self::reset_server_id_state`]).
+    /// Every unverified re-bind by id from that source is marked to be
+    /// checked; that mark outlives a reset of the distrust.
     pub fn record_server_id_distrust(&self, account_id: &str, source: &str, kind: ServerIdKind, reason: &str) -> Result<()> {
-        self.record_server_id_state("server_id_distrust", account_id, source, kind, reason)
+        self.record_server_id_state("server_id_distrust", account_id, source, kind, reason)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"UPDATE server_id_rebinds SET needs_check = 1
+               WHERE account_id = ?1 AND source = ?2 AND kind = ?3 AND verified = 0"#,
+            params![account_id, source, kind.as_str()],
+        )?;
+        Ok(())
     }
 
     /// Records that `source` must not be asked for `kind` ids again for
@@ -1300,7 +1324,8 @@ impl Database {
     }
 
     /// Clears the account's distrusted and disabled server id records (of
-    /// one source, or all). Returns how many were cleared.
+    /// one source, or all). Returns how many were cleared. Re-binds by id
+    /// still to be checked stay so (see [`Self::pending_id_rebinds`]).
     pub fn reset_server_id_state(&self, account_id: &str, source: Option<&str>) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let mut cleared = 0;
@@ -1314,18 +1339,16 @@ impl Database {
     }
 
     /// Re-binds by id in this folder that must be checked: not verified,
-    /// still bound in the folder's current generation, and from a source and
-    /// kind now distrusted for their account.
+    /// still bound in the folder's current generation, and marked when their
+    /// source and kind were distrusted (even if that has been reset since).
     pub fn pending_id_rebinds(&self, folder_id: &str) -> Result<Vec<PendingIdRebind>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT m.id, m.uid, m.sha256_hash FROM server_id_rebinds r
                JOIN messages m ON m.id = r.message_id
                JOIN folders f ON f.id = m.folder_id
-               WHERE r.folder_id = ?1 AND m.folder_id = ?1 AND r.verified = 0
+               WHERE r.folder_id = ?1 AND m.folder_id = ?1 AND r.verified = 0 AND r.needs_check = 1
                  AND m.uid_generation = f.uid_generation
-                 AND EXISTS(SELECT 1 FROM server_id_distrust d
-                            WHERE d.account_id = r.account_id AND d.source = r.source AND d.kind = r.kind)
                ORDER BY m.uid"#,
         )?;
         let rows = stmt.query_map(params![folder_id], |r| {

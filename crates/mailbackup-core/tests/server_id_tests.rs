@@ -439,6 +439,59 @@ async fn an_unfinished_check_of_rebinds_resumes_at_the_next_sync() {
 }
 
 #[tokio::test]
+async fn a_reset_doesnt_drop_an_unfinished_check() {
+    let (a, server) = (archive(), FakeImap::start().await);
+    let acc = trusting(&server);
+    archived_then_renumbered(&a, &server, &acc, &[(1, mail("A"), "M1")], &[(11, mail("Q"), "M1"), (12, mail("R"), "M1")]).await;
+    server.fail_fetch_of(11);
+    sync(&a, &server, &acc).await;
+    assert_eq!(inbox(&a).last_synced_uid, 12);
+    assert_eq!(a.db.pending_id_rebinds(&inbox(&a).id).unwrap().len(), 1);
+
+    // The supported reset (`account server-ids acc --reset`) before the check resumes
+    assert_eq!(a.db.reset_server_id_state("acc", None).unwrap(), 1);
+    assert_eq!(a.db.pending_id_rebinds(&inbox(&a).id).unwrap().len(), 1, "still to be checked");
+    server.take_fetched();
+    sync(&a, &server, &acc).await;
+    assert_eq!(server.take_fetched(), [11], "UID 11 is checked after all");
+    assert!(a.db.pending_id_rebinds(&inbox(&a).id).unwrap().is_empty());
+    assert_eq!(current(&a), [(11, mail("Q")), (12, mail("R"))]);
+    assert!(rows(&a).iter().any(|r| r.uid == 1 && r.bytes == mail("A")));
+}
+
+#[tokio::test]
+async fn repeated_rescans_by_id_keep_the_last_verified_binding() {
+    for interrupted in [false, true] {
+        let (a, server) = (archive(), FakeImap::start().await);
+        let acc = trusting(&server);
+        // Verified binding: UID 1 of the first generation (downloaded)
+        archived_then_renumbered(&a, &server, &acc, &[(1, mail("A"), "M1")], &[(11, mail("A"), "M1")]).await;
+        let original = rows(&a).remove(0);
+        // Re-bound by id, unverified: UID 11
+        sync(&a, &server, &acc).await;
+        assert!(server.take_fetched().is_empty());
+        // Re-bound by id again (UID 21), then UID 22 reveals the id is reused
+        server.set(Some(3), &[(21, &mail("Q")), (22, &mail("R"))]);
+        server.set_email_ids(&[(21, "M1"), (22, "M1")]);
+        if interrupted {
+            server.fail_fetch_of(21);
+            sync(&a, &server, &acc).await;
+            assert_eq!(a.db.pending_id_rebinds(&inbox(&a).id).unwrap().len(), 1, "interrupted");
+        }
+        sync(&a, &server, &acc).await;
+        assert!(a.db.pending_id_rebinds(&inbox(&a).id).unwrap().is_empty(), "interrupted={}", interrupted);
+        let back = rows(&a).into_iter().find(|r| r.id == original.id).unwrap();
+        assert_eq!(
+            (back.generation, back.uid, back.bytes),
+            (original.generation, 1, mail("A")),
+            "interrupted={}: back in its verified slot, not the unverified UID 11",
+            interrupted
+        );
+        assert_eq!(current(&a), [(21, mail("Q")), (22, mail("R"))], "interrupted={}", interrupted);
+    }
+}
+
+#[tokio::test]
 async fn an_interrupted_rescan_by_ids_resumes_without_loss() {
     let (a, server) = (archive(), FakeImap::start().await);
     let acc = trusting(&server);
