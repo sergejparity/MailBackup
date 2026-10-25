@@ -608,3 +608,28 @@ fn distrust_found_anywhere_makes_every_folder_check_its_rebinds() {
     assert_eq!(pending.iter().map(|p| p.uid).collect::<Vec<_>>(), [9]);
     assert!(a.db.pending_id_rebinds(&inbox_id).unwrap().is_empty());
 }
+
+#[test]
+fn distrust_and_its_check_marks_are_written_together() {
+    let (a, _, other_id) = db_setup();
+    let id = ServerId::email_id("M1").unwrap();
+    insert_with_id(&a, &other_id, 0, 1, &id);
+    let next = a.db.begin_folder_sync("acc", "Other", "Other", Some(2), "src").unwrap();
+    let sourced = SourcedId { id: &id, source: "src" };
+    a.db.rebind_by_server_id_if("acc", &other_id, next.generation, 9, sourced, 10, |_, _| true).unwrap();
+
+    // The marking fails (as a crash between the two writes would leave it)
+    let conn = rusqlite::Connection::open(a._dir.path().join("catalog.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER fail_marking BEFORE UPDATE OF needs_check ON server_id_rebinds BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+    )
+    .unwrap();
+    assert!(a.db.record_server_id_distrust("acc", "src", ServerIdKind::EmailId, "reused").is_err());
+    assert!(!a.db.server_id_distrusted("acc", "src", ServerIdKind::EmailId).unwrap(), "no distrust without its marks");
+    assert!(a.db.pending_id_rebinds(&other_id).unwrap().is_empty());
+
+    conn.execute_batch("DROP TRIGGER fail_marking;").unwrap();
+    a.db.record_server_id_distrust("acc", "src", ServerIdKind::EmailId, "reused").unwrap();
+    assert!(a.db.server_id_distrusted("acc", "src", ServerIdKind::EmailId).unwrap());
+    assert_eq!(a.db.pending_id_rebinds(&other_id).unwrap().len(), 1, "both written");
+}

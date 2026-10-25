@@ -488,6 +488,24 @@ fn insert_message_tx(tx: &Connection, m: &NewMessage<'_>) -> Result<String> {
     Ok(new_id)
 }
 
+fn insert_server_id_state(
+    conn: &Connection,
+    table: &str,
+    account_id: &str,
+    source: &str,
+    kind: ServerIdKind,
+    reason: &str,
+) -> Result<()> {
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO {} (account_id, source, kind, reason, detected_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            table
+        ),
+        params![account_id, source, kind.as_str(), reason, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
@@ -1254,14 +1272,18 @@ impl Database {
     /// (kept until [`Self::reset_server_id_state`]).
     /// Every unverified re-bind by id from that source is marked to be
     /// checked; that mark outlives a reset of the distrust.
+    /// Both are written in one transaction, so no crash leaves the source
+    /// distrusted with re-binds unmarked.
     pub fn record_server_id_distrust(&self, account_id: &str, source: &str, kind: ServerIdKind, reason: &str) -> Result<()> {
-        self.record_server_id_state("server_id_distrust", account_id, source, kind, reason)?;
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        insert_server_id_state(&tx, "server_id_distrust", account_id, source, kind, reason)?;
+        tx.execute(
             r#"UPDATE server_id_rebinds SET needs_check = 1
                WHERE account_id = ?1 AND source = ?2 AND kind = ?3 AND verified = 0"#,
             params![account_id, source, kind.as_str()],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1273,14 +1295,7 @@ impl Database {
 
     fn record_server_id_state(&self, table: &str, account_id: &str, source: &str, kind: ServerIdKind, reason: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            &format!(
-                "INSERT OR IGNORE INTO {} (account_id, source, kind, reason, detected_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                table
-            ),
-            params![account_id, source, kind.as_str(), reason, Utc::now().to_rfc3339()],
-        )?;
-        Ok(())
+        insert_server_id_state(&conn, table, account_id, source, kind, reason)
     }
 
     pub fn server_id_distrusted(&self, account_id: &str, source: &str, kind: ServerIdKind) -> Result<bool> {
