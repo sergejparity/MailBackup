@@ -166,6 +166,12 @@ fn main() {
     let system_tray = SystemTray::new().with_menu(tray_menu);
 
     tauri::Builder::default()
+        // One desktop instance per user: a later launch (desktop link, Start
+        // menu, autostart) hands off to the running one, which shows its
+        // window, and then exits without opening a window of its own.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .setup(move |app| {
             // The window is created here, only for the verified server
             let builder = match server {
