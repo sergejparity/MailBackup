@@ -183,6 +183,20 @@ fn a_locked_keyring_is_an_error_never_an_older_credential() {
 }
 
 #[test]
+fn a_damaged_local_store_is_an_error_never_the_legacy_copy() {
+    // The legacy location holds this secret too; a store that can't be read
+    // must not be bypassed for it (#45)
+    let dir = copy_fixture(&fixtures_root().join("credentials").join("key-file"));
+    let path = dir.path().join("config").join(".credentials_store.json");
+    let mut file = read_json(&path);
+    let entry = file["entries"]["account:acct-live"].as_str().unwrap().to_string();
+    file["entries"]["account:acct-live"] = serde_json::Value::String(entry.replace("enc:v1:", "enc:v1:zz"));
+    write_json(&path, &file);
+    let store = key_file_store(dir.path(), Arc::new(NoKeyring));
+    fails_without_change(dir.path(), Kind::Corrupt, || store.get_password(ADOPTED_ID));
+}
+
+#[test]
 fn without_any_keyring_the_legacy_location_is_still_read() {
     // Current behaviour: "no keyring on this machine" (Unavailable) is not an
     // access failure, so the legacy location is consulted (and adopted)

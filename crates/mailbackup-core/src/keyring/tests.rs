@@ -1198,3 +1198,15 @@ fn vector_keyring_namespace() {
         "cfg-5cfff7936d7b4200"
     );
 }
+
+/// The OS keyring's errors as the store sees them (#45): "access denied" is
+/// `Locked`, which blocks the legacy lookup; any other failure is
+/// `Unavailable` (no usable keyring), which keeps today's fallback.
+#[test]
+fn os_keyring_errors_map_to_locked_or_unavailable() {
+    let denied = keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("synthetic: access denied")));
+    assert_eq!(keyring_error(denied).credential_kind(), Some(Kind::Locked));
+    assert_eq!(keyring_error(keyring::Error::NoEntry).credential_kind(), Some(Kind::NotFound));
+    let failure = keyring::Error::PlatformFailure(Box::new(std::io::Error::other("synthetic: no service")));
+    assert_eq!(keyring_error(failure).credential_kind(), Some(Kind::Unavailable));
+}
