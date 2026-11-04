@@ -58,6 +58,18 @@ fn show_main_window<R: tauri::Runtime>(manager: &impl Manager<R>) {
     }
 }
 
+fn build_tray() -> SystemTray {
+    let quit = CustomMenuItem::new("quit".to_string(), "Quit MailBackup");
+    let show = CustomMenuItem::new("show".to_string(), "Open Studio");
+    let sync = CustomMenuItem::new("sync".to_string(), "Sync Now");
+    let tray_menu = SystemTrayMenu::new()
+        .add_item(show)
+        .add_item(sync)
+        .add_native_item(SystemTrayMenuItem::Separator)
+        .add_item(quit);
+    SystemTray::new().with_menu(tray_menu)
+}
+
 fn main() {
     let mut is_headless = false;
     let mut force_gui = false;
@@ -142,29 +154,12 @@ fn main() {
     }
 
     let port_num = port.unwrap_or(8765);
-    let server = genuine_server(port_num);
-    if let Err(e) = &server {
-        eprintln!("Not showing the MailBackup UI: {}", e);
-    }
 
-    // Sync OS autostart registration if configured
-    if let Ok(cfg) = mailbackup_core::config::AppConfig::load_or_create(None) {
-        if cfg.settings.autostart {
-            let _ = mailbackup_core::autostart::set_autostart(true);
-        }
-    }
-
-    let quit = CustomMenuItem::new("quit".to_string(), "Quit MailBackup");
-    let show = CustomMenuItem::new("show".to_string(), "Open Studio");
-    let sync = CustomMenuItem::new("sync".to_string(), "Sync Now");
-    let tray_menu = SystemTrayMenu::new()
-        .add_item(show)
-        .add_item(sync)
-        .add_native_item(SystemTrayMenuItem::Separator)
-        .add_item(quit);
-
-    let system_tray = SystemTray::new().with_menu(tray_menu);
-
+    // Nothing with side effects (server, config, autostart, tray) may run
+    // before the single-instance check, or a second launch would do it too
+    // before handing off. Tauri 1 runs plugin setup before `setup` below and
+    // builds a builder-registered tray before plugins, so all of it lives in
+    // `setup`, which a second instance never reaches (the plugin exits it).
     tauri::Builder::default()
         // One desktop instance per user: a later launch (desktop link, Start
         // menu, autostart) hands off to the running one, which shows its
@@ -173,6 +168,21 @@ fn main() {
             show_main_window(app);
         }))
         .setup(move |app| {
+            let server = genuine_server(port_num);
+            if let Err(e) = &server {
+                eprintln!("Not showing the MailBackup UI: {}", e);
+            }
+
+            // Sync OS autostart registration if configured
+            if let Ok(cfg) = mailbackup_core::config::AppConfig::load_or_create(None) {
+                if cfg.settings.autostart {
+                    let _ = mailbackup_core::autostart::set_autostart(true);
+                }
+            }
+
+            // Events reach the builder's `on_system_tray_event` handler
+            build_tray().build(app)?;
+
             // The window is created here, only for the verified server
             let builder = match server {
                 Ok(port) => {
@@ -187,7 +197,6 @@ fn main() {
             builder.title("MailBackup Studio").inner_size(1280.0, 840.0).resizable(true).build()?;
             Ok(())
         })
-        .system_tray(system_tray)
         .on_system_tray_event(|app, event| match event {
             SystemTrayEvent::LeftClick { .. } => {
                 show_main_window(app);
