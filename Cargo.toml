@@ -9,7 +9,7 @@ exclude = ["vendor/imap-proto"]
 resolver = "2"
 
 [workspace.package]
-version = "0.6.7"
+version = "0.6.8"
 edition = "2021"
 authors = ["SP"]
 license = "MIT OR Apache-2.0"
@@ -18,8 +18,8 @@ license = "MIT OR Apache-2.0"
 tokio = { version = "1.40", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
-rusqlite = { version = "0.32", features = ["bundled", "bundled-full", "chrono", "uuid"] }
+serde_norway = "0.9"
+rusqlite = { version = "0.41", features = ["bundled", "bundled-full", "chrono", "uuid", "fallible_uint"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 sha2 = "0.10"
@@ -30,8 +30,8 @@ thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dirs = "5.0"
-tokio-cron-scheduler = "0.13"
+dirs = "7.0"
+tokio-cron-scheduler = "0.15"
 clap = { version = "4.5", features = ["derive", "env"] }
 indicatif = { version = "0.18", features = ["tokio"] }
 dialoguer = { version = "0.12", features = ["password"] }

@@ -35,7 +35,7 @@ pub fn snapshot(conn: &rusqlite::Connection) -> Value {
 
 fn rows(conn: &rusqlite::Connection, sql: &str) -> Value {
     let mut stmt = conn.prepare(sql).unwrap();
-    let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let names: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
     let mut out = Vec::new();
     let mut rows = stmt.query([]).unwrap();
     while let Some(row) = rows.next().unwrap() {

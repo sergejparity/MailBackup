@@ -412,7 +412,7 @@ pub fn sensitive_targets_in(config_path: &Path, base: &Path) -> Vec<Target> {
     }
     if let Some(cfg) = std::fs::read_to_string(config_path)
         .ok()
-        .and_then(|text| serde_yaml::from_str::<crate::config::AppConfig>(&text).ok())
+        .and_then(|text| serde_norway::from_str::<crate::config::AppConfig>(&text).ok())
     {
         if let (Some(dir), Some(name)) = (cfg.db_path.parent(), cfg.db_path.file_name()) {
             let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
@@ -444,7 +444,7 @@ pub fn sensitive_targets_in(config_path: &Path, base: &Path) -> Vec<Target> {
 pub fn archive_targets(config_path: &Path) -> Vec<Target> {
     let Some(cfg) = std::fs::read_to_string(config_path)
         .ok()
-        .and_then(|text| serde_yaml::from_str::<crate::config::AppConfig>(&text).ok())
+        .and_then(|text| serde_norway::from_str::<crate::config::AppConfig>(&text).ok())
     else {
         return Vec::new();
     };
