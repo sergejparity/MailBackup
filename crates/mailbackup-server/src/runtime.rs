@@ -51,9 +51,9 @@ pub struct ServerIdentity {
 impl ServerIdentity {
     pub fn new(port: u16) -> Self {
         let mut secret = [0u8; 32];
-        getrandom::getrandom(&mut secret).expect("OS random number generator unavailable");
+        getrandom::fill(&mut secret).expect("OS random number generator unavailable");
         let mut id = [0u8; 16];
-        getrandom::getrandom(&mut id).expect("OS random number generator unavailable");
+        getrandom::fill(&mut id).expect("OS random number generator unavailable");
         Self { instance_id: hex::encode(id), secret, port }
     }
 
@@ -143,7 +143,7 @@ pub fn verify_genuine(config_dir: &Path, port: u16) -> Option<RuntimeInfo> {
     }
     let secret = hex::decode(&info.secret).ok().filter(|s| s.len() == 32)?;
     let mut nonce_bytes = [0u8; 32];
-    getrandom::getrandom(&mut nonce_bytes).ok()?;
+    getrandom::fill(&mut nonce_bytes).ok()?;
     let nonce = hex::encode(nonce_bytes);
 
     let body = handshake_request(port, &nonce)?;

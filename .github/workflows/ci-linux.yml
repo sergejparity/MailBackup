@@ -35,7 +35,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -57,7 +57,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Pinned so a new stable release can't fail CI with lints nobody
       # introduced; bump it deliberately
@@ -72,16 +72,14 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --exclude mailbackup-gui --all-targets --locked -- -D warnings
 
-  # Declared but unused dependencies (issue #40). Informational until the
-  # cleanup in #41: findings don't fail CI yet
+  # Declared but unused dependencies (issues #40, #41)
   unused-deps:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install cargo-machete
         uses: taiki-e/install-action@v2
@@ -96,7 +94,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
