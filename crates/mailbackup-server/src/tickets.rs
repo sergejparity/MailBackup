@@ -124,7 +124,7 @@ impl DownloadTickets {
 
     fn mint_at(&self, target: Target, now: Instant) -> Result<String, MintError> {
         let mut bytes = [0u8; 32];
-        getrandom::getrandom(&mut bytes).expect("OS random number generator unavailable");
+        getrandom::fill(&mut bytes).expect("OS random number generator unavailable");
         let ticket = hex::encode(bytes);
         let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         live.retain(|_, entry| entry.expires > now);

@@ -124,7 +124,7 @@ const API_TOKEN_PLACEHOLDER: &str = "__MAILBACKUP_API_TOKEN__";
 /// Generates a random 256-bit API token (hex encoded) from the OS CSPRNG.
 pub fn generate_api_token() -> String {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("OS random number generator unavailable");
+    getrandom::fill(&mut bytes).expect("OS random number generator unavailable");
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
