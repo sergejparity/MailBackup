@@ -338,6 +338,29 @@ async fn an_unparseable_id_in_the_size_query_reconnects_without_ids() {
 }
 
 #[tokio::test]
+async fn an_unrelated_attribute_the_parser_skips_is_not_an_unparseable_id() {
+    // imap-proto 0.17 absorbs attributes it doesn't know instead of failing
+    // the response; one sent in place of the id costs that message its id,
+    // not the source its ids
+    let (a, server) = (archive(), FakeImap::start().await);
+    let acc = trusting(&server);
+    archived_then_renumbered(
+        &a,
+        &server,
+        &acc,
+        &[(1, mail("A"), "M1"), (2, mail("B"), "M2"), (3, mail("C"), "M3")],
+        &[(11, mail("A"), "M1"), (12, mail("B"), "M2"), (13, mail("C"), "M3")],
+    )
+    .await;
+    server.with(|mb| mb.id_attrs.insert(12, "X-SOMETHING (a b)".into()));
+    sync(&a, &server, &acc).await;
+    assert_eq!(server.take_fetched(), [12], "11 and 13 re-bound by id, 12 downloaded");
+    assert_eq!(current(&a), [(11, mail("A")), (12, mail("B")), (13, mail("C"))]);
+    assert!(!a.db.server_id_disabled("acc", &acc.remote_identity(), ServerIdKind::EmailId).unwrap());
+    assert!(!a.db.server_id_distrusted("acc", &acc.remote_identity(), ServerIdKind::EmailId).unwrap());
+}
+
+#[tokio::test]
 async fn an_unparseable_id_in_a_body_batch_keeps_what_arrived_before_it() {
     let (a, server) = (archive(), FakeImap::start().await);
     let acc = trusting(&server);

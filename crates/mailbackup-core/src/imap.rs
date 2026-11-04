@@ -2,6 +2,8 @@ use crate::config::AccountConfig;
 use crate::db::{Database, FolderSync, IdRebind, NewMessage};
 use crate::error::{Error, Result};
 use crate::server_ids::{ServerId, ServerIdKind, SourcedId};
+
+mod absorbed_id;
 use crate::storage::StorageEngine;
 use async_imap::imap_proto::{AttributeValue, Response, Status};
 use chrono::{DateTime, Utc};
@@ -62,10 +64,15 @@ struct Fetched<'a> {
     internal_date: Option<DateTime<Utc>>,
     /// The server id, if it was requested, sent, and is valid.
     server_id: Option<ServerId>,
+    /// An id attribute arrived (valid or not).
+    id_sent: bool,
+    /// The parser absorbed an attribute it couldn't parse (imap-proto's
+    /// catch-all, e.g. for `EMAILID NIL`).
+    unparsed: bool,
 }
 
 fn fetched_from<'a>(attrs: &'a [AttributeValue<'a>]) -> Fetched<'a> {
-    let mut f = Fetched { uid: None, size: None, body: None, internal_date: None, server_id: None };
+    let mut f = Fetched { uid: None, size: None, body: None, internal_date: None, server_id: None, id_sent: false, unparsed: false };
     for attr in attrs {
         match attr {
             AttributeValue::Uid(uid) => f.uid = Some(*uid),
@@ -79,8 +86,15 @@ fn fetched_from<'a>(attrs: &'a [AttributeValue<'a>]) -> Fetched<'a> {
             }
             // Delimited but not a valid objectid: ignored, so this message
             // takes the full-body path
-            AttributeValue::EmailId(value) => f.server_id = ServerId::email_id(value),
-            AttributeValue::GmailMsgId(value) => f.server_id = Some(ServerId::gmail_msg_id(*value)),
+            AttributeValue::EmailId(value) => {
+                f.id_sent = true;
+                f.server_id = ServerId::email_id(value);
+            }
+            AttributeValue::GmailMsgId(value) => {
+                f.id_sent = true;
+                f.server_id = Some(ServerId::gmail_msg_id(*value));
+            }
+            AttributeValue::Unknown => f.unparsed = true,
             _ => {}
         }
     }
@@ -782,32 +796,54 @@ impl ImapSyncEngine {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
         let set = uid_set(uids);
+        let upper = items.to_ascii_uppercase();
+        let requested_kind = ServerIdKind::ALL.into_iter().find(|kind| upper.contains(kind.fetch_item()));
         let tag = session
             .run_command(format!("UID FETCH {} {}", set, items))
             .await
             .map_err(|e| Error::Imap(format!("Failed to send UID FETCH {}: {}", set, e)))?;
         loop {
             let response = match session.read_response().await {
-                None => return Err(Error::Imap(format!("The connection closed during UID FETCH {}", set))),
+                Ok(None) => return Err(Error::Imap(format!("The connection closed during UID FETCH {}", set))),
                 // async-imap reports an unparseable response this way and
                 // keeps the bytes in its buffer, so the stream can't go on
-                Some(Err(e)) if e.kind() == std::io::ErrorKind::Other && e.to_string().contains("during parsing") => {
+                Err(e) if e.kind() == std::io::ErrorKind::Other && e.to_string().contains("during parsing") => {
                     return Err(Error::ProtocolBroken(e.to_string()))
                 }
-                Some(Err(e)) => return Err(Error::Imap(format!("Reading UID FETCH {} failed: {}", set, e))),
-                Some(Ok(response)) => response,
+                Err(e) => return Err(Error::Imap(format!("Reading UID FETCH {} failed: {}", set, e))),
+                Ok(Some(response)) => response,
             };
             match response.parsed() {
-                Response::Done { tag: done, status, information, .. } if *done == tag => {
+                Response::Done { tag: done, status, outcome } if *done == tag => {
                     if *status != Status::Ok {
                         // As with async-imap: what arrived is used, the rest
                         // counts as missing
-                        warn!("UID FETCH {} ended with {:?}: {:?}", set, status, information);
+                        warn!("UID FETCH {} ended with {:?}: {:?}", set, status, outcome.information);
                     }
                     return Ok(());
                 }
                 Response::Fetch(_, attrs) => {
                     let item = fetched_from(attrs);
+                    // An id was asked for but imap-proto absorbed something
+                    // instead: decide from the raw bytes, as the parser of
+                    // releases up to 0.6.8 did (see `absorbed_id`)
+                    if let Some(kind) = requested_kind.filter(|_| !item.id_sent && item.unparsed) {
+                        let raw: &[u8] = response.borrow_owner();
+                        let this = match async_imap::imap_proto::Response::parse(raw) {
+                            Ok((rest, _)) => &raw[..raw.len() - rest.len()],
+                            Err(_) => raw,
+                        };
+                        if absorbed_id::classify(this, kind) == absorbed_id::AbsorbedId::Malformed {
+                            // The session is dropped after this, so the rest
+                            // of the response needn't be read
+                            return Err(Error::ProtocolBroken(format!(
+                                "UID FETCH {}: the {} of {} couldn't be parsed",
+                                set,
+                                kind.fetch_item(),
+                                item.uid.map_or("a message".to_string(), |uid| format!("UID {}", uid))
+                            )));
+                        }
+                    }
                     if item.uid.is_none_or(|uid| uids.contains(&uid)) {
                         on_item(item)?;
                     }
