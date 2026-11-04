@@ -460,7 +460,7 @@ pub fn ownership_candidates(config_path: &Path) -> Vec<PathBuf> {
 
     if let Some(cfg) = std::fs::read_to_string(config_path)
         .ok()
-        .and_then(|text| serde_yaml::from_str::<crate::config::AppConfig>(&text).ok())
+        .and_then(|text| serde_norway::from_str::<crate::config::AppConfig>(&text).ok())
     {
         let db = cfg.db_path.to_string_lossy().to_string();
         paths.push(cfg.db_path.clone());

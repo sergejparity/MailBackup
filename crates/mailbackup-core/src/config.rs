@@ -356,7 +356,7 @@ impl AppConfig {
 
         let content = std::fs::read_to_string(&config_path)
             .map_err(|e| Error::Config(format!("Failed to read config file {}: {}", config_path.display(), e)))?;
-        let config: AppConfig = serde_yaml::from_str(&content)
+        let config: AppConfig = serde_norway::from_str(&content)
             .map_err(|e| Error::Serialization(format!("Failed to parse config {}: {}", config_path.display(), e)))?;
 
         config.ensure_dirs()?;
@@ -371,7 +371,7 @@ impl AppConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(Error::Config(format!("Failed to read config file {}: {}", path.display(), e))),
         };
-        serde_yaml::from_str(&content)
+        serde_norway::from_str(&content)
             .map(Some)
             .map_err(|e| Error::Serialization(format!("Failed to parse config {}: {}", path.display(), e)))
     }
@@ -393,7 +393,7 @@ impl AppConfig {
                 crate::private_fs::create_dir_all(parent)?;
             }
         }
-        let yaml = serde_yaml::to_string(self)
+        let yaml = serde_norway::to_string(self)
             .map_err(|e| Error::Serialization(format!("Failed to serialize config: {}", e)))?;
         crate::private_fs::write_atomic(path, yaml.as_bytes())?;
         Ok(())

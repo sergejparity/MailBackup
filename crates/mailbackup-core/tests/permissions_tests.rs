@@ -172,7 +172,7 @@ fn loose_install(foreign_in_data: bool) -> LooseInstall {
     let config_path = config_dir.join("config.yaml");
     let db_path = db_dir.join("catalog.db");
     let config = AppConfig { data_dir: data_dir.clone(), db_path: db_path.clone(), ..Default::default() };
-    std::fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&config_path, serde_norway::to_string(&config).unwrap()).unwrap();
     std::fs::write(&db_path, b"").unwrap();
     std::fs::write(config_dir.join(".credentials_store.json"), b"{}").unwrap();
     std::fs::write(config_dir.join(".credentials_key"), b"00").unwrap();
@@ -380,9 +380,9 @@ extern "C" {
 #[test]
 fn startup_tightening_can_be_turned_off() {
     let yaml = "data_dir: /x\ndb_path: /x.db\nsettings:\n  tighten_permissions: false\n";
-    let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+    let config: AppConfig = serde_norway::from_str(yaml).unwrap();
     assert!(!config.settings.tighten_permissions);
     assert!(AppConfig::default().settings.tighten_permissions);
-    let legacy: AppConfig = serde_yaml::from_str("data_dir: /x\ndb_path: /x.db\n").unwrap();
+    let legacy: AppConfig = serde_norway::from_str("data_dir: /x\ndb_path: /x.db\n").unwrap();
     assert!(legacy.settings.tighten_permissions, "older configs default to on");
 }

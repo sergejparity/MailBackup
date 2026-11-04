@@ -469,7 +469,7 @@ settings:
   web_port: 8765
 accounts: []
 "#;
-    let loaded: AppConfig = serde_yaml::from_str(legacy_yaml).unwrap();
+    let loaded: AppConfig = serde_norway::from_str(legacy_yaml).unwrap();
     assert!(loaded.settings.close_to_tray);
 
     // 3. Explicit false should deserialize properly
@@ -482,7 +482,7 @@ settings:
   close_to_tray: false
 accounts: []
 "#;
-    let loaded_false: AppConfig = serde_yaml::from_str(explicit_false_yaml).unwrap();
+    let loaded_false: AppConfig = serde_norway::from_str(explicit_false_yaml).unwrap();
     assert!(!loaded_false.settings.close_to_tray);
 
     // 4. Save and reload preserves setting
@@ -570,7 +570,7 @@ settings:
   web_port: 8765
 accounts: []
 "#;
-    let loaded: AppConfig = serde_yaml::from_str(yaml).unwrap();
+    let loaded: AppConfig = serde_norway::from_str(yaml).unwrap();
     assert!(!loaded.settings.autostart);
     assert!(!loaded.settings.run_as_service);
 }
@@ -810,7 +810,7 @@ settings:
   default_schedule: "0 0 * * *"
 accounts: []
 "#;
-    let parsed: AppConfig = serde_yaml::from_str(yaml_missing).unwrap();
+    let parsed: AppConfig = serde_norway::from_str(yaml_missing).unwrap();
     assert_eq!(parsed.settings.log_retention_days, Some(30));
 
     // 3. Custom retention period
@@ -822,7 +822,7 @@ settings:
   log_retention_days: 90
 accounts: []
 "#;
-    let parsed_custom: AppConfig = serde_yaml::from_str(yaml_custom).unwrap();
+    let parsed_custom: AppConfig = serde_norway::from_str(yaml_custom).unwrap();
     assert_eq!(parsed_custom.settings.log_retention_days, Some(90));
 }
 
