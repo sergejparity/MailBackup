@@ -1,0 +1,3 @@
+# Compatibility fixtures (issue #40) are compared byte for byte: never
+# normalize their line endings (the .eml inputs mix CRLF and LF on purpose)
+crates/mailbackup-core/tests/fixtures/** -text

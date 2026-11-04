@@ -1,0 +1,92 @@
+data_dir: /srv/mailbackup/data
+db_path: /srv/mailbackup/mailbackup.db
+settings:
+  default_schedule: 0 0 * * *
+  default_retention_days: null
+  max_attachment_size_mb: null
+  rate_limit_kbps: null
+  notifications_enabled: true
+  web_port: 8765
+  bind_address: 127.0.0.1
+  allowed_hosts:
+  - backup.example.test
+  approved_dirs:
+  - /srv/exports
+  close_to_tray: true
+  autostart: true
+  run_as_service: false
+  log_retention_days: null
+  tighten_permissions: true
+accounts:
+- id: acct-live
+  name: Fixture acct-live
+  email: acct-live@example.test
+  provider: generic_imap
+  imap_server: new.example.test
+  imap_port: 993
+  use_tls: true
+  auth_type: password
+  username: live@new.example.test
+  schedule: 0 */6 * * *
+  retention_days: 365
+  folder_filter:
+    include:
+    - INBOX
+    - Projects/*
+    exclude:
+    - Trash
+    - '[Gmail]/Trash'
+    - '[Gmail]/Spam'
+    - Junk
+    - Spam
+  gmail_smart_labels: true
+  enabled: true
+  storage_namespace: acct-live~1
+  credential_ref: acct-live~cred-1
+  trust_server_ids: true
+- id: acct-live~archive-20261104-1
+  name: Fixture acct-live (archived 2026-11-04)
+  email: acct-live@example.test
+  provider: generic_imap
+  imap_server: imap.example.test
+  imap_port: 993
+  use_tls: true
+  auth_type: password
+  username: live@example.test
+  schedule: null
+  retention_days: null
+  folder_filter:
+    include: []
+    exclude:
+    - Trash
+    - '[Gmail]/Trash'
+    - '[Gmail]/Spam'
+    - Junk
+    - Spam
+  gmail_smart_labels: true
+  enabled: false
+  archive:
+    archived_at: 2026-11-04T07:00:00Z
+    retired_from: acct-live
+    last_source: imap.example.test:993:live@example.test
+- id: acct-gmail
+  name: Fixture acct-gmail
+  email: acct-gmail@example.test
+  provider: gmail
+  imap_server: imap.gmail.com
+  imap_port: 993
+  use_tls: true
+  auth_type: password
+  username: someone@gmail.test
+  schedule: null
+  retention_days: null
+  folder_filter:
+    include: []
+    exclude:
+    - Trash
+    - '[Gmail]/Trash'
+    - '[Gmail]/Spam'
+    - Junk
+    - Spam
+  gmail_smart_labels: false
+  enabled: true

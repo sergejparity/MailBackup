@@ -1102,3 +1102,111 @@ fn a_partly_installed_service_keeps_its_disk_passwords() {
     assert_eq!(err.to_string(), "Generic error: failed");
     assert!(!store.disk_storage());
 }
+
+// ---------------------------------------------------------------------------
+// Fixed vectors (issue #40). Computed independently (Python `cryptography` /
+// `hashlib`), so they pin the algorithms and encodings, not just whatever the
+// current crates produce. A dependency upgrade must pass them unchanged.
+// ---------------------------------------------------------------------------
+
+/// SHA-256("mailbackup compat vector key")
+const VECTOR_KEY: &str = "bfc1ded1efb4010046991eb64e0dbbc463ef5b7812166895a743ae8406d48bbe";
+const VECTOR_SECRET: &str = "synthetic secret: Grüße";
+
+fn vector_key() -> [u8; 32] {
+    parse_key(VECTOR_KEY).unwrap()
+}
+
+#[test]
+fn vector_aes_256_gcm_entry_decrypts() {
+    // nonce 00..0b, no associated data
+    let encoded = "enc:v1:000102030405060708090a0b:8c46e6dfe1d0c81a9423c462e236e7c6f10f54a66b9ff84b1476e34deaecb27dc86072bf4658d05d24";
+    assert_eq!(decrypt_secret(encoded, &vector_key()).unwrap(), VECTOR_SECRET);
+    // and what we encrypt today decrypts the same way, with a fresh nonce each time
+    let a = encrypt_secret(VECTOR_SECRET, &vector_key()).unwrap();
+    let b = encrypt_secret(VECTOR_SECRET, &vector_key()).unwrap();
+    assert_ne!(a, b);
+    assert!(a.starts_with(ENC_PREFIX) && a.len() == encoded.len());
+    assert_eq!(decrypt_secret(&a, &vector_key()).unwrap(), VECTOR_SECRET);
+}
+
+#[test]
+fn vector_argon2id_key_derivation() {
+    let fx = Fixture::new();
+    let store = fx.store();
+    let kdf = KdfParams {
+        alg: "argon2id".to_string(),
+        version: 0x13,
+        m_cost: ARGON2_M_COST_KIB,
+        t_cost: ARGON2_T_COST,
+        p_cost: ARGON2_P_COST,
+        salt: "000102030405060708090a0b0c0d0e0f".to_string(),
+    };
+    let salt = kdf.validate().unwrap();
+    let key = store.derive("synthetic fixture passphrase", &kdf, &salt).unwrap();
+    assert_eq!(hex::encode(key), "f3824b6df3545b250815b47d2231d2d4fe01c4af6680995264a37d83a77f1f1b");
+    // The parameters new stores get
+    assert_eq!((ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST), (19_456, 2, 1));
+}
+
+#[test]
+fn vector_legacy_keys() {
+    assert_eq!(
+        hex::encode(legacy_passphrase_key("  synthetic fixture passphrase \n")),
+        "548ff3878d5d9b00da46ac7293a8012ebe26ea4cff0798d15b56ad34287edb25"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        hex::encode(legacy_path_key(Path::new("/srv/mailbackup/.credentials_key"))),
+        "1f3ee30f8052b9bd2d0b22430f07fc00632d135b55309a93ea224062bd9d3cd0"
+    );
+}
+
+#[test]
+fn vector_connection_binding_and_value_fingerprint() {
+    let account = AccountConfig {
+        id: "a".into(),
+        name: "A".into(),
+        email: "a@example.test".into(),
+        provider: crate::config::ProviderType::GenericImap,
+        imap_server: "  IMAP.Example.TEST ".into(),
+        imap_port: 993,
+        use_tls: true,
+        auth_type: crate::config::AuthType::Password,
+        username: " live@example.test ".into(),
+        schedule: None,
+        retention_days: None,
+        folder_filter: Default::default(),
+        gmail_smart_labels: true,
+        enabled: true,
+        storage_namespace: None,
+        credential_ref: None,
+        archive: None,
+        trust_server_ids: false,
+    };
+    // SHA-256("imap.example.test" 0x00 "993" 0x00 "live@example.test")
+    assert_eq!(connection_binding(&account), "f0d9010ef9ed353c16daf3c3be31fa3370dc6c4cc78db7fe9ef3b8ab9c8a5096");
+    assert_eq!(value_fingerprint(VECTOR_SECRET), "4be1ebfaa522180007844b34ffccf9e4df4a8244c03b66e84ed1d2c8926ce722");
+}
+
+#[cfg(unix)]
+#[test]
+fn vector_keyring_namespace() {
+    // "cfg-" + first 16 hex digits of SHA-256(<resolved folder>)
+    assert_eq!(
+        keyring_namespace(Path::new("/nonexistent-mailbackup-fixture/config/.credentials_store.json")),
+        "cfg-5cfff7936d7b4200"
+    );
+}
+
+/// The OS keyring's errors as the store sees them (#45): "access denied" is
+/// `Locked`, which blocks the legacy lookup; any other failure is
+/// `Unavailable` (no usable keyring), which keeps today's fallback.
+#[test]
+fn os_keyring_errors_map_to_locked_or_unavailable() {
+    let denied = keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("synthetic: access denied")));
+    assert_eq!(keyring_error(denied).credential_kind(), Some(Kind::Locked));
+    assert_eq!(keyring_error(keyring::Error::NoEntry).credential_kind(), Some(Kind::NotFound));
+    let failure = keyring::Error::PlatformFailure(Box::new(std::io::Error::other("synthetic: no service")));
+    assert_eq!(keyring_error(failure).credential_kind(), Some(Kind::Unavailable));
+}

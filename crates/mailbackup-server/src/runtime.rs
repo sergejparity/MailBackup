@@ -228,3 +228,19 @@ fn parse_head(head: &[u8]) -> Option<usize> {
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fixed vector (issue #40), computed independently (Python `hmac`): the
+    /// GUI and the server check this proof across processes, possibly of
+    /// different versions during an upgrade, so it must never change.
+    #[test]
+    fn vector_handshake_proof() {
+        let nonce = "AB".repeat(32);
+        assert!(valid_nonce(&nonce));
+        // HMAC-SHA256(key = 0x42 * 32, "mailbackup-handshake:v1:8765:" + lowercase nonce)
+        assert_eq!(proof(&[0x42; 32], 8765, &nonce), "8bbd554ee5e63cb98452db9c9f22e67c59db6e0145cbb123823085b8485b8947");
+    }
+}
