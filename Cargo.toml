@@ -9,7 +9,7 @@ exclude = ["vendor/imap-proto"]
 resolver = "2"
 
 [workspace.package]
-version = "0.6.6"
+version = "0.6.7"
 edition = "2021"
 authors = ["SP"]
 license = "MIT OR Apache-2.0"
@@ -36,8 +36,8 @@ clap = { version = "4.5", features = ["derive", "env"] }
 indicatif = { version = "0.18", features = ["tokio"] }
 dialoguer = { version = "0.12", features = ["password"] }
 console = "0.16"
-axum = { version = "0.7", features = ["ws", "macros"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+axum = "0.8"
+tower-http = { version = "0.7", features = ["trace"] }
 rust-embed = { version = "8.5", features = ["mime-guess"] }
 mime_guess = "2.0"
 async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio", "compress"] }
