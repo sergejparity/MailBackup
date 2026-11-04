@@ -1,0 +1,7 @@
+From: Carol <carol@example.test>
+To: live@example.test
+Subject: After the rescan
+Date: Mon, 02 Nov 2026 08:00:00 +0000
+Message-ID: <m5@example.test>
+
+Arrived after the UIDVALIDITY change.

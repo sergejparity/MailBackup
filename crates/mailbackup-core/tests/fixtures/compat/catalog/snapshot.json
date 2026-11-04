@@ -1,0 +1,682 @@
+{
+  "schema": [
+    {
+      "name": "idx_account_transitions_live",
+      "sql": "CREATE INDEX idx_account_transitions_live ON account_transitions(live_id)",
+      "tbl_name": "account_transitions",
+      "type": "index"
+    },
+    {
+      "name": "idx_messages_account",
+      "sql": "CREATE INDEX idx_messages_account ON messages(account_id)",
+      "tbl_name": "messages",
+      "type": "index"
+    },
+    {
+      "name": "idx_messages_date",
+      "sql": "CREATE INDEX idx_messages_date ON messages(date)",
+      "tbl_name": "messages",
+      "type": "index"
+    },
+    {
+      "name": "idx_messages_hash",
+      "sql": "CREATE INDEX idx_messages_hash ON messages(sha256_hash)",
+      "tbl_name": "messages",
+      "type": "index"
+    },
+    {
+      "name": "idx_messages_msg_id",
+      "sql": "CREATE INDEX idx_messages_msg_id ON messages(message_id)",
+      "tbl_name": "messages",
+      "type": "index"
+    },
+    {
+      "name": "idx_messages_server_id",
+      "sql": "CREATE INDEX idx_messages_server_id ON messages(folder_id, server_id_kind, server_id)",
+      "tbl_name": "messages",
+      "type": "index"
+    },
+    {
+      "name": "idx_sync_history_account",
+      "sql": "CREATE INDEX idx_sync_history_account ON sync_history(account_id)",
+      "tbl_name": "sync_history",
+      "type": "index"
+    },
+    {
+      "name": "sqlite_autoindex_accounts_1",
+      "sql": null,
+      "tbl_name": "accounts",
+      "type": "index"
+    },
+    {
+      "name": "sqlite_autoindex_accounts_2",
+      "sql": null,
+      "tbl_name": "accounts",
+      "type": "index"
+    },
+    {
+      "name": "sqlite_autoindex_attachments_1",
+      "sql": null,
+      "tbl_name": "attachments",
+      "type": "index"
+    },
+    {
+      "name": "sqlite_autoindex_folders_1",
+      "sql": null,
+      "tbl_name": "folders",
+      "type": "index"
+    },
+    {
+      "name": "sqlite_autoindex_folders_2",
+      "sql": null,
+      "tbl_name": "folders",
+      "type": "index"
+    },
+    {
+      "name": "sqlite_autoindex_messages_1",
+      "sql": null,
+      "tbl_name": "messages",
+      "type": "index"
+    },
+    {
+      "name": "sqlite_autoindex_messages_2",
+      "sql": null,
+      "tbl_name": "messages",
+      "type": "index"
+    },
+    {
+      "name": "sqlite_autoindex_server_id_disabled_1",
+      "sql": null,
+      "tbl_name": "server_id_disabled",
+      "type": "index"
+    },
+    {
+      "name": "sqlite_autoindex_server_id_distrust_1",
+      "sql": null,
+      "tbl_name": "server_id_distrust",
+      "type": "index"
+    },
+    {
+      "name": "sqlite_autoindex_server_id_rebinds_1",
+      "sql": null,
+      "tbl_name": "server_id_rebinds",
+      "type": "index"
+    },
+    {
+      "name": "sqlite_autoindex_sync_history_1",
+      "sql": null,
+      "tbl_name": "sync_history",
+      "type": "index"
+    },
+    {
+      "name": "account_transitions",
+      "sql": "CREATE TABLE account_transitions (\n                id INTEGER PRIMARY KEY AUTOINCREMENT,\n                live_id TEXT NOT NULL,\n                archive_id TEXT NOT NULL,\n                seq INTEGER NOT NULL,\n                old_credential_ref TEXT NOT NULL,\n                staged_credential_ref TEXT NOT NULL,\n                state TEXT NOT NULL,\n                created_at TEXT NOT NULL\n            )",
+      "tbl_name": "account_transitions",
+      "type": "table"
+    },
+    {
+      "name": "accounts",
+      "sql": "CREATE TABLE accounts (\n                id TEXT PRIMARY KEY,\n                name TEXT NOT NULL,\n                email TEXT NOT NULL UNIQUE,\n                provider TEXT NOT NULL,\n                created_at TEXT NOT NULL,\n                updated_at TEXT NOT NULL\n            )",
+      "tbl_name": "accounts",
+      "type": "table"
+    },
+    {
+      "name": "attachments",
+      "sql": "CREATE TABLE attachments (\n                id TEXT PRIMARY KEY,\n                message_id TEXT NOT NULL,\n                filename TEXT NOT NULL,\n                mime_type TEXT NOT NULL,\n                size_bytes INTEGER NOT NULL,\n                FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE\n            )",
+      "tbl_name": "attachments",
+      "type": "table"
+    },
+    {
+      "name": "folders",
+      "sql": "CREATE TABLE folders (\n                id TEXT PRIMARY KEY,\n                account_id TEXT NOT NULL,\n                remote_name TEXT NOT NULL,\n                local_slug TEXT NOT NULL,\n                uidvalidity INTEGER,\n                last_synced_uid INTEGER NOT NULL DEFAULT 0,\n                message_count INTEGER NOT NULL DEFAULT 0,\n                updated_at TEXT NOT NULL,\n                remote_identity TEXT,\n                uid_generation INTEGER NOT NULL DEFAULT 0,\n                UNIQUE(account_id, remote_name)\n            )",
+      "tbl_name": "folders",
+      "type": "table"
+    },
+    {
+      "name": "messages",
+      "sql": "CREATE TABLE messages (\n                id TEXT PRIMARY KEY,\n                account_id TEXT NOT NULL,\n                folder_id TEXT NOT NULL,\n                uid INTEGER NOT NULL,\n                message_id TEXT,\n                subject TEXT,\n                from_addr TEXT,\n                to_addrs TEXT,\n                cc_addrs TEXT,\n                date TEXT,\n                size_bytes INTEGER NOT NULL,\n                relative_path TEXT NOT NULL,\n                sha256_hash TEXT NOT NULL,\n                is_remote_deleted INTEGER NOT NULL DEFAULT 0,\n                created_at TEXT NOT NULL,\n                uid_generation INTEGER NOT NULL, server_id_kind TEXT, server_id TEXT, server_id_source TEXT,\n                FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE,\n                UNIQUE(folder_id, uid_generation, uid)\n            )",
+      "tbl_name": "messages",
+      "type": "table"
+    },
+    {
+      "name": "messages_fts",
+      "sql": "CREATE VIRTUAL TABLE messages_fts USING fts5(\n                message_id UNINDEXED,\n                account_id UNINDEXED,\n                subject,\n                from_addr,\n                to_addrs,\n                body_text,\n                attachment_names,\n                tokenize = 'porter unicode61'\n            )",
+      "tbl_name": "messages_fts",
+      "type": "table"
+    },
+    {
+      "name": "messages_fts_config",
+      "sql": "CREATE TABLE 'messages_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID",
+      "tbl_name": "messages_fts_config",
+      "type": "table"
+    },
+    {
+      "name": "messages_fts_content",
+      "sql": "CREATE TABLE 'messages_fts_content'(id INTEGER PRIMARY KEY, c0, c1, c2, c3, c4, c5, c6)",
+      "tbl_name": "messages_fts_content",
+      "type": "table"
+    },
+    {
+      "name": "messages_fts_data",
+      "sql": "CREATE TABLE 'messages_fts_data'(id INTEGER PRIMARY KEY, block BLOB)",
+      "tbl_name": "messages_fts_data",
+      "type": "table"
+    },
+    {
+      "name": "messages_fts_docsize",
+      "sql": "CREATE TABLE 'messages_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)",
+      "tbl_name": "messages_fts_docsize",
+      "type": "table"
+    },
+    {
+      "name": "messages_fts_idx",
+      "sql": "CREATE TABLE 'messages_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID",
+      "tbl_name": "messages_fts_idx",
+      "type": "table"
+    },
+    {
+      "name": "server_id_disabled",
+      "sql": "CREATE TABLE server_id_disabled (\n                account_id TEXT NOT NULL,\n                source TEXT NOT NULL,\n                kind TEXT NOT NULL,\n                reason TEXT NOT NULL,\n                detected_at TEXT NOT NULL,\n                PRIMARY KEY(account_id, source, kind)\n            )",
+      "tbl_name": "server_id_disabled",
+      "type": "table"
+    },
+    {
+      "name": "server_id_distrust",
+      "sql": "CREATE TABLE server_id_distrust (\n                account_id TEXT NOT NULL,\n                source TEXT NOT NULL,\n                kind TEXT NOT NULL,\n                reason TEXT NOT NULL,\n                detected_at TEXT NOT NULL,\n                PRIMARY KEY(account_id, source, kind)\n            )",
+      "tbl_name": "server_id_distrust",
+      "type": "table"
+    },
+    {
+      "name": "server_id_rebinds",
+      "sql": "CREATE TABLE server_id_rebinds (\n                message_id TEXT PRIMARY KEY,\n                account_id TEXT NOT NULL,\n                folder_id TEXT NOT NULL,\n                source TEXT NOT NULL,\n                kind TEXT NOT NULL,\n                prev_generation INTEGER NOT NULL,\n                prev_uid INTEGER NOT NULL,\n                verified INTEGER NOT NULL DEFAULT 0,\n                needs_check INTEGER NOT NULL DEFAULT 0,\n                FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE\n            )",
+      "tbl_name": "server_id_rebinds",
+      "type": "table"
+    },
+    {
+      "name": "sqlite_sequence",
+      "sql": "CREATE TABLE sqlite_sequence(name,seq)",
+      "tbl_name": "sqlite_sequence",
+      "type": "table"
+    },
+    {
+      "name": "sync_history",
+      "sql": "CREATE TABLE sync_history (\n                id TEXT PRIMARY KEY,\n                account_id TEXT NOT NULL,\n                status TEXT NOT NULL,\n                start_time TEXT NOT NULL,\n                end_time TEXT,\n                messages_downloaded INTEGER NOT NULL DEFAULT 0,\n                bytes_downloaded INTEGER NOT NULL DEFAULT 0,\n                error_message TEXT\n            )",
+      "tbl_name": "sync_history",
+      "type": "table"
+    }
+  ],
+  "tables": {
+    "account_transitions": [
+      {
+        "archive_id": "acct-moved~archive-20261104-1",
+        "created_at": "2026-11-04T15:35:28.676417244+00:00",
+        "id": 1,
+        "live_id": "acct-moved",
+        "old_credential_ref": "acct-moved",
+        "seq": 1,
+        "staged_credential_ref": "acct-moved~cred-1",
+        "state": "done"
+      },
+      {
+        "archive_id": "acct-pending~archive-20261104-1",
+        "created_at": "2026-11-04T15:35:28.678025029+00:00",
+        "id": 2,
+        "live_id": "acct-pending",
+        "old_credential_ref": "acct-pending",
+        "seq": 1,
+        "staged_credential_ref": "acct-pending~cred-1",
+        "state": "prepared"
+      }
+    ],
+    "accounts": [
+      {
+        "created_at": "2026-11-04T15:35:28.669990664+00:00",
+        "email": "acct-live@example.test",
+        "id": "acct-live",
+        "name": "Fixture live",
+        "provider": "generic_imap",
+        "updated_at": "2026-11-04T15:35:28.669990664+00:00"
+      },
+      {
+        "created_at": "2026-11-04T15:35:28.675637499+00:00",
+        "email": "acct-moved@example.test",
+        "id": "acct-moved",
+        "name": "Fixture moved",
+        "provider": "generic_imap",
+        "updated_at": "2026-11-04T15:35:28.675637499+00:00"
+      },
+      {
+        "created_at": "2026-11-04T15:35:28.676362229+00:00",
+        "email": "acct-moved~archive@example.test",
+        "id": "acct-moved~archive-20261104-1",
+        "name": "Fixture moved (archived 2026-11-04)",
+        "provider": "generic_imap",
+        "updated_at": "2026-11-04T15:35:28.676362229+00:00"
+      },
+      {
+        "created_at": "2026-11-04T15:35:28.677510296+00:00",
+        "email": "acct-pending@example.test",
+        "id": "acct-pending",
+        "name": "Fixture pending",
+        "provider": "generic_imap",
+        "updated_at": "2026-11-04T15:35:28.677510296+00:00"
+      }
+    ],
+    "attachments": [
+      {
+        "filename": "budget-2026.pdf",
+        "id": "51efada7-d5ba-427e-aa83-638ff4a8a0cd",
+        "message_id": "f3fd3a08-aaec-48f0-bacf-7d192f6ea2c3",
+        "mime_type": "application/pdf",
+        "size_bytes": 22
+      },
+      {
+        "filename": "budget-2026.pdf",
+        "id": "e7d442bb-ba31-4cb0-bc59-31fd08173ff7",
+        "message_id": "a849616f-826a-4c94-b989-6d7264bedd47",
+        "mime_type": "application/pdf",
+        "size_bytes": 22
+      }
+    ],
+    "folders": [
+      {
+        "account_id": "acct-live",
+        "id": "70049cad-e5c6-4d70-b654-d14990a029ae",
+        "last_synced_uid": 14,
+        "local_slug": "INBOX",
+        "message_count": 5,
+        "remote_identity": "imap.example.test:993:live@example.test",
+        "remote_name": "INBOX",
+        "uid_generation": 1,
+        "uidvalidity": 200,
+        "updated_at": "2026-11-04T15:35:28.675396528+00:00"
+      },
+      {
+        "account_id": "acct-live",
+        "id": "2af2015e-81d2-4384-8b6f-7fcb39f8df9b",
+        "last_synced_uid": 1,
+        "local_slug": "Archive",
+        "message_count": 1,
+        "remote_identity": "imap.example.test:993:live@example.test",
+        "remote_name": "Archive",
+        "uid_generation": 0,
+        "uidvalidity": 7,
+        "updated_at": "2026-11-04T15:35:28.674109948+00:00"
+      },
+      {
+        "account_id": "acct-moved~archive-20261104-1",
+        "id": "88b050c2-af6d-484d-bbb3-8e2d210dfe99",
+        "last_synced_uid": 1,
+        "local_slug": "INBOX",
+        "message_count": 1,
+        "remote_identity": "old.example.test:993:moved@example.test",
+        "remote_name": "INBOX",
+        "uid_generation": 1,
+        "uidvalidity": 5,
+        "updated_at": "2026-11-04T15:35:28.676301543+00:00"
+      },
+      {
+        "account_id": "acct-moved",
+        "id": "0c792eee-7c34-4976-83d5-99376e65b300",
+        "last_synced_uid": 1,
+        "local_slug": "INBOX",
+        "message_count": 1,
+        "remote_identity": "new.example.test:993:moved@new.example.test",
+        "remote_name": "INBOX",
+        "uid_generation": 0,
+        "uidvalidity": 9,
+        "updated_at": "2026-11-04T15:35:28.677434726+00:00"
+      },
+      {
+        "account_id": "acct-pending~archive-20261104-1",
+        "id": "fcc829e0-f47b-4264-98f6-e349b5fa2b53",
+        "last_synced_uid": 0,
+        "local_slug": "INBOX",
+        "message_count": 0,
+        "remote_identity": "p.example.test:993:p@example.test",
+        "remote_name": "INBOX",
+        "uid_generation": 1,
+        "uidvalidity": 3,
+        "updated_at": "2026-11-04T15:35:28.677565422+00:00"
+      }
+    ],
+    "messages": [
+      {
+        "account_id": "acct-live",
+        "cc_addrs": null,
+        "created_at": "2026-11-04T15:35:28.670854192+00:00",
+        "date": "2026-10-06T09:15:00+00:00",
+        "folder_id": "70049cad-e5c6-4d70-b654-d14990a029ae",
+        "from_addr": "fixture@example.test",
+        "id": "55c04370-4302-4849-a40f-0e55271d4e85",
+        "is_remote_deleted": 0,
+        "message_id": null,
+        "relative_path": "acct-live/INBOX/2026/10/1_da0d1fc30841.eml",
+        "server_id": null,
+        "server_id_kind": null,
+        "server_id_source": null,
+        "sha256_hash": "da0d1fc308418937eb5268d2ae79e1ec336aa2ea8af6f0fd9aa4ca842698c2e7",
+        "size_bytes": 197,
+        "subject": "Quarterly report zebrafish",
+        "to_addrs": "live@example.test",
+        "uid": 11,
+        "uid_generation": 1
+      },
+      {
+        "account_id": "acct-live",
+        "cc_addrs": null,
+        "created_at": "2026-11-04T15:35:28.671502921+00:00",
+        "date": "2026-10-07T10:00:00+00:00",
+        "folder_id": "70049cad-e5c6-4d70-b654-d14990a029ae",
+        "from_addr": "fixture@example.test",
+        "id": "f3fd3a08-aaec-48f0-bacf-7d192f6ea2c3",
+        "is_remote_deleted": 0,
+        "message_id": null,
+        "relative_path": "acct-live/INBOX/2026/10/2_83346b4f22d3.eml",
+        "server_id": "M2bbbb",
+        "server_id_kind": "emailid",
+        "server_id_source": "imap.example.test:993:live@example.test",
+        "sha256_hash": "83346b4f22d32457a4b67b0c448829240446c0786c91916d89bd3064f6737436",
+        "size_bytes": 468,
+        "subject": "Budget attached",
+        "to_addrs": "live@example.test",
+        "uid": 12,
+        "uid_generation": 1
+      },
+      {
+        "account_id": "acct-live",
+        "cc_addrs": null,
+        "created_at": "2026-11-04T15:35:28.672028050+00:00",
+        "date": "2026-10-08T16:30:00+00:00",
+        "folder_id": "70049cad-e5c6-4d70-b654-d14990a029ae",
+        "from_addr": "fixture@example.test",
+        "id": "fb7b5c8e-968a-405e-ab1c-e4e84ea3590f",
+        "is_remote_deleted": 0,
+        "message_id": null,
+        "relative_path": "acct-live/INBOX/2026/10/3_0c54c9a189b1.eml",
+        "server_id": "M3cccc",
+        "server_id_kind": "emailid",
+        "server_id_source": "imap.example.test:993:live@example.test",
+        "sha256_hash": "0c54c9a189b16c294a1fed78ae3a8b628b5d3ed363f917c60fb7d1a8312a5ffc",
+        "size_bytes": 296,
+        "subject": "Grüße aus Köln",
+        "to_addrs": "live@example.test",
+        "uid": 13,
+        "uid_generation": 1
+      },
+      {
+        "account_id": "acct-live",
+        "cc_addrs": null,
+        "created_at": "2026-11-04T15:35:28.672589259+00:00",
+        "date": "2026-10-06T09:15:00+00:00",
+        "folder_id": "70049cad-e5c6-4d70-b654-d14990a029ae",
+        "from_addr": "fixture@example.test",
+        "id": "3de0c0cd-cada-4925-a699-a03ed7fc71d3",
+        "is_remote_deleted": 0,
+        "message_id": null,
+        "relative_path": "acct-live/INBOX/2026/10/4_da0d1fc30841.eml",
+        "server_id": "M4dddd",
+        "server_id_kind": "emailid",
+        "server_id_source": "imap.example.test:993:live@example.test",
+        "sha256_hash": "da0d1fc308418937eb5268d2ae79e1ec336aa2ea8af6f0fd9aa4ca842698c2e7",
+        "size_bytes": 197,
+        "subject": "Quarterly report zebrafish",
+        "to_addrs": "live@example.test",
+        "uid": 4,
+        "uid_generation": 0
+      },
+      {
+        "account_id": "acct-live",
+        "cc_addrs": null,
+        "created_at": "2026-11-04T15:35:28.673754927+00:00",
+        "date": "2026-10-06T09:15:00+00:00",
+        "folder_id": "2af2015e-81d2-4384-8b6f-7fcb39f8df9b",
+        "from_addr": "fixture@example.test",
+        "id": "be55448a-f556-498f-a82e-e655037abe38",
+        "is_remote_deleted": 0,
+        "message_id": null,
+        "relative_path": "acct-live/Archive/2026/10/1_da0d1fc30841.eml",
+        "server_id": null,
+        "server_id_kind": null,
+        "server_id_source": null,
+        "sha256_hash": "da0d1fc308418937eb5268d2ae79e1ec336aa2ea8af6f0fd9aa4ca842698c2e7",
+        "size_bytes": 197,
+        "subject": "Quarterly report zebrafish",
+        "to_addrs": "live@example.test",
+        "uid": 1,
+        "uid_generation": 0
+      },
+      {
+        "account_id": "acct-live",
+        "cc_addrs": null,
+        "created_at": "2026-11-04T15:35:28.675205917+00:00",
+        "date": "2026-11-02T08:00:00+00:00",
+        "folder_id": "70049cad-e5c6-4d70-b654-d14990a029ae",
+        "from_addr": "fixture@example.test",
+        "id": "bb5e1de2-ea58-4911-a54f-e88e50c97a35",
+        "is_remote_deleted": 0,
+        "message_id": null,
+        "relative_path": "acct-live/INBOX/2026/11/14_g1_e2cfde53b2ba.eml",
+        "server_id": "M5eeee",
+        "server_id_kind": "emailid",
+        "server_id_source": "imap.example.test:993:live@example.test",
+        "sha256_hash": "e2cfde53b2ba3ac4d6751c2457e036db9c65d102c69db17720f79033807c57db",
+        "size_bytes": 195,
+        "subject": "After the rescan",
+        "to_addrs": "live@example.test",
+        "uid": 14,
+        "uid_generation": 1
+      },
+      {
+        "account_id": "acct-moved~archive-20261104-1",
+        "cc_addrs": null,
+        "created_at": "2026-11-04T15:35:28.676020267+00:00",
+        "date": "2026-10-07T10:00:00+00:00",
+        "folder_id": "88b050c2-af6d-484d-bbb3-8e2d210dfe99",
+        "from_addr": "fixture@example.test",
+        "id": "a849616f-826a-4c94-b989-6d7264bedd47",
+        "is_remote_deleted": 0,
+        "message_id": null,
+        "relative_path": "acct-moved/INBOX/2026/10/1_83346b4f22d3.eml",
+        "server_id": null,
+        "server_id_kind": null,
+        "server_id_source": null,
+        "sha256_hash": "83346b4f22d32457a4b67b0c448829240446c0786c91916d89bd3064f6737436",
+        "size_bytes": 468,
+        "subject": "Budget attached",
+        "to_addrs": "live@example.test",
+        "uid": 1,
+        "uid_generation": 0
+      },
+      {
+        "account_id": "acct-moved",
+        "cc_addrs": null,
+        "created_at": "2026-11-04T15:35:28.677254634+00:00",
+        "date": "2026-10-08T16:30:00+00:00",
+        "folder_id": "0c792eee-7c34-4976-83d5-99376e65b300",
+        "from_addr": "fixture@example.test",
+        "id": "9c11935d-f803-45ea-abcd-da76ff4b441b",
+        "is_remote_deleted": 0,
+        "message_id": null,
+        "relative_path": "acct-moved~1/INBOX/2026/10/1_0c54c9a189b1.eml",
+        "server_id": null,
+        "server_id_kind": null,
+        "server_id_source": null,
+        "sha256_hash": "0c54c9a189b16c294a1fed78ae3a8b628b5d3ed363f917c60fb7d1a8312a5ffc",
+        "size_bytes": 296,
+        "subject": "Grüße aus Köln",
+        "to_addrs": "live@example.test",
+        "uid": 1,
+        "uid_generation": 0
+      },
+      {
+        "account_id": "acct-pending~archive-20261104-1",
+        "cc_addrs": null,
+        "created_at": "2026-11-04T15:35:28.677850099+00:00",
+        "date": "2026-11-02T08:00:00+00:00",
+        "folder_id": "fcc829e0-f47b-4264-98f6-e349b5fa2b53",
+        "from_addr": "fixture@example.test",
+        "id": "f609998e-c6c4-4821-8f2e-d03a0ca27b46",
+        "is_remote_deleted": 0,
+        "message_id": null,
+        "relative_path": "acct-pending/INBOX/2026/11/1_e2cfde53b2ba.eml",
+        "server_id": null,
+        "server_id_kind": null,
+        "server_id_source": null,
+        "sha256_hash": "e2cfde53b2ba3ac4d6751c2457e036db9c65d102c69db17720f79033807c57db",
+        "size_bytes": 195,
+        "subject": "After the rescan",
+        "to_addrs": "live@example.test",
+        "uid": 1,
+        "uid_generation": 0
+      }
+    ],
+    "messages_fts": [
+      {
+        "account_id": "acct-live",
+        "attachment_names": "",
+        "body_text": "The zebrafish numbers are in.",
+        "from_addr": "fixture@example.test",
+        "message_id": "55c04370-4302-4849-a40f-0e55271d4e85",
+        "rowid": 1,
+        "subject": "Quarterly report zebrafish",
+        "to_addrs": "live@example.test"
+      },
+      {
+        "account_id": "acct-live",
+        "attachment_names": "budget-2026.pdf",
+        "body_text": "See the budget.",
+        "from_addr": "fixture@example.test",
+        "message_id": "f3fd3a08-aaec-48f0-bacf-7d192f6ea2c3",
+        "rowid": 2,
+        "subject": "Budget attached",
+        "to_addrs": "live@example.test"
+      },
+      {
+        "account_id": "acct-live",
+        "attachment_names": "",
+        "body_text": "Grüße aus Köln, ünïcödé quokka",
+        "from_addr": "fixture@example.test",
+        "message_id": "fb7b5c8e-968a-405e-ab1c-e4e84ea3590f",
+        "rowid": 3,
+        "subject": "Grüße aus Köln",
+        "to_addrs": "live@example.test"
+      },
+      {
+        "account_id": "acct-live",
+        "attachment_names": "",
+        "body_text": "The zebrafish numbers are in.",
+        "from_addr": "fixture@example.test",
+        "message_id": "3de0c0cd-cada-4925-a699-a03ed7fc71d3",
+        "rowid": 4,
+        "subject": "Quarterly report zebrafish",
+        "to_addrs": "live@example.test"
+      },
+      {
+        "account_id": "acct-live",
+        "attachment_names": "",
+        "body_text": "The zebrafish numbers are in.",
+        "from_addr": "fixture@example.test",
+        "message_id": "be55448a-f556-498f-a82e-e655037abe38",
+        "rowid": 5,
+        "subject": "Quarterly report zebrafish",
+        "to_addrs": "live@example.test"
+      },
+      {
+        "account_id": "acct-live",
+        "attachment_names": "",
+        "body_text": "Arrived after the UIDVALIDITY change.",
+        "from_addr": "fixture@example.test",
+        "message_id": "bb5e1de2-ea58-4911-a54f-e88e50c97a35",
+        "rowid": 6,
+        "subject": "After the rescan",
+        "to_addrs": "live@example.test"
+      },
+      {
+        "account_id": "acct-moved~archive-20261104-1",
+        "attachment_names": "budget-2026.pdf",
+        "body_text": "See the budget.",
+        "from_addr": "fixture@example.test",
+        "message_id": "a849616f-826a-4c94-b989-6d7264bedd47",
+        "rowid": 7,
+        "subject": "Budget attached",
+        "to_addrs": "live@example.test"
+      },
+      {
+        "account_id": "acct-moved",
+        "attachment_names": "",
+        "body_text": "Grüße aus Köln, ünïcödé quokka",
+        "from_addr": "fixture@example.test",
+        "message_id": "9c11935d-f803-45ea-abcd-da76ff4b441b",
+        "rowid": 8,
+        "subject": "Grüße aus Köln",
+        "to_addrs": "live@example.test"
+      },
+      {
+        "account_id": "acct-pending~archive-20261104-1",
+        "attachment_names": "",
+        "body_text": "Arrived after the UIDVALIDITY change.",
+        "from_addr": "fixture@example.test",
+        "message_id": "f609998e-c6c4-4821-8f2e-d03a0ca27b46",
+        "rowid": 9,
+        "subject": "After the rescan",
+        "to_addrs": "live@example.test"
+      }
+    ],
+    "server_id_disabled": [
+      {
+        "account_id": "acct-live",
+        "detected_at": "2026-11-04T15:35:28.675537227+00:00",
+        "kind": "gm-msgid",
+        "reason": "synthetic: unparseable response",
+        "source": "imap.example.test:993:live@example.test"
+      }
+    ],
+    "server_id_distrust": [
+      {
+        "account_id": "acct-live",
+        "detected_at": "2026-11-04T15:35:28.675457901+00:00",
+        "kind": "emailid",
+        "reason": "synthetic: an id named other content",
+        "source": "imap.example.test:993:live@example.test"
+      }
+    ],
+    "server_id_rebinds": [
+      {
+        "account_id": "acct-live",
+        "folder_id": "70049cad-e5c6-4d70-b654-d14990a029ae",
+        "kind": "emailid",
+        "message_id": "f3fd3a08-aaec-48f0-bacf-7d192f6ea2c3",
+        "needs_check": 1,
+        "prev_generation": 0,
+        "prev_uid": 2,
+        "source": "imap.example.test:993:live@example.test",
+        "verified": 0
+      },
+      {
+        "account_id": "acct-live",
+        "folder_id": "70049cad-e5c6-4d70-b654-d14990a029ae",
+        "kind": "emailid",
+        "message_id": "fb7b5c8e-968a-405e-ab1c-e4e84ea3590f",
+        "needs_check": 0,
+        "prev_generation": 0,
+        "prev_uid": 3,
+        "source": "imap.example.test:993:live@example.test",
+        "verified": 1
+      }
+    ],
+    "sync_history": [
+      {
+        "account_id": "acct-live",
+        "bytes_downloaded": 195,
+        "end_time": "2026-11-04T15:35:28.675611151+00:00",
+        "error_message": null,
+        "id": "73c7d088-98d8-4efc-8f37-7842c02c6154",
+        "messages_downloaded": 1,
+        "start_time": "2026-11-04T15:35:28.675574195+00:00",
+        "status": "success"
+      }
+    ]
+  },
+  "user_version": 3
+}

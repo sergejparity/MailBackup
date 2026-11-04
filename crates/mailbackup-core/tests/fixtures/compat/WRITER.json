@@ -1,0 +1,6 @@
+{
+  "commit": "6c3b5d4df45e0ae00afb3b1b99869c54ed18bdf4",
+  "mailbackup_version": "0.6.4",
+  "note": "Written once by tests/compat_generate.rs with this version. Do not regenerate with upgraded dependencies.",
+  "written_at": "2026-11-04T15:35:28.688512026+00:00"
+}

@@ -23,3 +23,5 @@ WORKLOG/*
 # Created when the vendored crate's own tests run
 /vendor/imap-proto/Cargo.lock
 /vendor/imap-proto/target
+# Compatibility fixtures (issue #40) are committed on purpose
+!/crates/mailbackup-core/tests/fixtures/**

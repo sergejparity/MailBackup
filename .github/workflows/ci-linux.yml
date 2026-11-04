@@ -72,6 +72,25 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --exclude mailbackup-gui --all-targets --locked -- -D warnings
 
+  # Declared but unused dependencies (issue #40). Informational until the
+  # cleanup in #41: findings don't fail CI yet
+  unused-deps:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
+      - name: Find unused dependencies
+        run: cargo machete
+
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 15
