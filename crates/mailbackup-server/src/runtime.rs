@@ -177,10 +177,9 @@ fn handshake_request_by(port: u16, nonce: &str, deadline: Instant) -> Option<Vec
     // (end of headers, body length) once the headers are in
     let mut framing: Option<(usize, usize)> = None;
     loop {
-        if let Some((header_end, length)) = framing {
-            if response.len() >= header_end + 4 + length {
-                break;
-            }
+        if let Some((header_end, length)) = framing
+            && response.len() >= header_end + 4 + length {
+            break;
         }
         // Each read may only wait for what is left of the deadline
         stream.set_read_timeout(Some(remaining()?)).ok()?;
@@ -192,10 +191,9 @@ fn handshake_request_by(port: u16, nonce: &str, deadline: Instant) -> Option<Vec
         if response.len() > MAX_RESPONSE_BYTES {
             return None;
         }
-        if framing.is_none() {
-            if let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
-                framing = Some((header_end, parse_head(&response[..header_end])?));
-            }
+        if framing.is_none()
+            && let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+            framing = Some((header_end, parse_head(&response[..header_end])?));
         }
     }
     let (header_end, length) = framing?;

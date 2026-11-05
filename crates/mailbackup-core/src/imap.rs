@@ -1016,11 +1016,10 @@ impl ImapSyncEngine {
     ) -> Result<()> {
         let sha256 = StorageEngine::compute_sha256(raw_body);
         let sourced = server_id.map(|id| SourcedId { id, source: target.source });
-        if let Some(s) = sourced {
-            if self.db.server_id_conflicts(target.folder_id, s, &sha256)? {
-                let reason = format!("{} {} was seen with different content", s.id.kind.fetch_item(), s.id.value);
-                self.distrust(target, s.id.kind, &reason)?;
-            }
+        if let Some(s) = sourced
+            && self.db.server_id_conflicts(target.folder_id, s, &sha256)? {
+            let reason = format!("{} {} was seen with different content", s.id.kind.fetch_item(), s.id.value);
+            self.distrust(target, s.id.kind, &reason)?;
         }
 
         // Already archived under an earlier generation: bind that copy to

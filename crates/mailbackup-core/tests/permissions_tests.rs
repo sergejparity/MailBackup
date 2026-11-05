@@ -372,7 +372,7 @@ fn restrict_skips_fifos_without_blocking() {
     assert!(!private_fs::restrict(&fifo).unwrap());
 }
 
-extern "C" {
+unsafe extern "C" {
     #[link_name = "mkfifo"]
     fn libc_mkfifo(path: *const std::os::raw::c_char, mode: u32) -> i32;
 }

@@ -109,10 +109,9 @@ fn main() {
                 }
             }
             "--port" | "-p" => {
-                if let Some(val) = args.next() {
-                    if let Ok(p) = val.parse::<u16>() {
-                        port = Some(p);
-                    }
+                if let Some(val) = args.next()
+                    && let Ok(p) = val.parse::<u16>() {
+                    port = Some(p);
                 }
             }
             "--gui" => {
@@ -195,10 +194,9 @@ fn main() {
             }
 
             // Sync OS autostart registration if configured
-            if let Ok(cfg) = mailbackup_core::config::AppConfig::load_or_create(None) {
-                if cfg.settings.autostart {
-                    let _ = mailbackup_core::autostart::set_autostart(true);
-                }
+            if let Ok(cfg) = mailbackup_core::config::AppConfig::load_or_create(None)
+                && cfg.settings.autostart {
+                let _ = mailbackup_core::autostart::set_autostart(true);
             }
 
             build_tray(app)?;

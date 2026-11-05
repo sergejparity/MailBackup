@@ -72,6 +72,30 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  # The minimum supported Rust version (`rust-version` in Cargo.toml, issue
+  # #47): the whole workspace, GUI included, built and tested on exactly that
+  # toolchain with the committed lockfile. Keep the version here and in
+  # Cargo.toml in step
+  msrv:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install GUI system libraries
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Test on the minimum supported Rust version
+        run: cargo test --workspace --all-targets --locked
+
   # Declared but unused dependencies (issues #40, #41)
   unused-deps:
     if: github.event_name != 'schedule'

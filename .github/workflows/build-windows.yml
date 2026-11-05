@@ -50,3 +50,21 @@ jobs:
             **/target/release/bundle/nsis/*.exe
             **/target/release/bundle/msi/*.msi
           if-no-files-found: warn
+
+  # The minimum supported Rust version on Windows (issue #47): the whole
+  # workspace, including the GUI's Windows-only dependencies, checked on
+  # exactly the `rust-version` toolchain with the committed lockfile
+  msrv-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90.0
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check on the minimum supported Rust version
+        run: cargo check --workspace --all-targets --locked

@@ -889,19 +889,18 @@ impl Database {
 
         if let Some(folder) = existing {
             // Check if UIDVALIDITY changed
-            if let Some(new_uv) = uidvalidity {
-                if folder.uidvalidity.is_some() && folder.uidvalidity != Some(new_uv) {
-                    conn.execute(
-                        "UPDATE folders SET uidvalidity = ?1, last_synced_uid = 0, updated_at = ?2 WHERE id = ?3",
-                        params![new_uv, now, folder.id],
-                    )?;
-                    return Ok(FolderRecord {
-                        uidvalidity: Some(new_uv),
-                        last_synced_uid: 0,
-                        updated_at: Utc::now(),
-                        ..folder
-                    });
-                }
+            if let Some(new_uv) = uidvalidity
+                && folder.uidvalidity.is_some() && folder.uidvalidity != Some(new_uv) {
+                conn.execute(
+                    "UPDATE folders SET uidvalidity = ?1, last_synced_uid = 0, updated_at = ?2 WHERE id = ?3",
+                    params![new_uv, now, folder.id],
+                )?;
+                return Ok(FolderRecord {
+                    uidvalidity: Some(new_uv),
+                    last_synced_uid: 0,
+                    updated_at: Utc::now(),
+                    ..folder
+                });
             }
             return Ok(folder);
         }
@@ -1690,11 +1689,10 @@ impl Database {
             conditions.push("m.is_remote_deleted = 0".to_string());
         }
 
-        if let Some(min_size) = filter.min_size_bytes {
-            if min_size > 0 {
-                conditions.push("m.size_bytes >= ?".to_string());
-                params.push(rusqlite::types::Value::Integer(min_size as i64));
-            }
+        if let Some(min_size) = filter.min_size_bytes
+            && min_size > 0 {
+            conditions.push("m.size_bytes >= ?".to_string());
+            params.push(rusqlite::types::Value::Integer(min_size as i64));
         }
 
         if filter.has_attachments == Some(true) {

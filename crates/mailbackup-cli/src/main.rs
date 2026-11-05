@@ -778,23 +778,22 @@ async fn handle_sync(
 
         // Apply retention policy
         let retention = RetentionManager::new(db, storage);
-        if let Ok(report) = retention.enforce_retention(&acc.id, acc.retention_days) {
-            if report.pruned_count > 0 {
-                let mb = (report.reclaimed_bytes as f64) / (1024.0 * 1024.0);
-                mailbackup_core::event_log::log_event(
-                    "RETENTION_CLEANUP",
-                    &format!(
-                        "Retention cleanup for account '{}': pruned {} message(s), {:.2} MB reclaimed",
-                        acc.name, report.pruned_count, mb
-                    ),
-                );
-                println!(
-                    "{} Retention policy: pruned {} expired messages ({:.2} MB reclaimed)",
-                    CHECK_EMOJI,
-                    report.pruned_count,
-                    mb
-                );
-            }
+        if let Ok(report) = retention.enforce_retention(&acc.id, acc.retention_days)
+            && report.pruned_count > 0 {
+            let mb = (report.reclaimed_bytes as f64) / (1024.0 * 1024.0);
+            mailbackup_core::event_log::log_event(
+                "RETENTION_CLEANUP",
+                &format!(
+                    "Retention cleanup for account '{}': pruned {} message(s), {:.2} MB reclaimed",
+                    acc.name, report.pruned_count, mb
+                ),
+            );
+            println!(
+                "{} Retention policy: pruned {} expired messages ({:.2} MB reclaimed)",
+                CHECK_EMOJI,
+                report.pruned_count,
+                mb
+            );
         }
     }
 

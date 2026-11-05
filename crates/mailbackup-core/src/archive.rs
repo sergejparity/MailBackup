@@ -201,10 +201,9 @@ fn undo(db: &Database, credentials: &CredentialStore, transition: i64, staged_re
         warn!("Couldn't undo account transition {}: {}; it will be undone at the next start", transition, e);
         return;
     }
-    if let Err(e) = credentials.delete_password(staged_ref) {
-        if !e.is_not_found() {
-            warn!("Couldn't delete the staged password {}: {}", staged_ref, e);
-        }
+    if let Err(e) = credentials.delete_password(staged_ref)
+        && !e.is_not_found() {
+        warn!("Couldn't delete the staged password {}: {}", staged_ref, e);
     }
 }
 
@@ -213,10 +212,9 @@ fn finish(db: &Database, credentials: &CredentialStore, transition: i64, old_ref
         warn!("Couldn't record account transition {} as done: {}; it will be at the next start", transition, e);
         return;
     }
-    if let Err(e) = credentials.delete_password(old_ref) {
-        if !e.is_not_found() {
-            warn!("Couldn't delete the replaced password {}: {}", old_ref, e);
-        }
+    if let Err(e) = credentials.delete_password(old_ref)
+        && !e.is_not_found() {
+        warn!("Couldn't delete the replaced password {}: {}", old_ref, e);
     }
 }
 

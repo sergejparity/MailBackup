@@ -49,21 +49,19 @@ fn detect_log_file_date(path: &Path) -> Option<NaiveDate> {
         let reader = BufReader::new(file);
         for line in reader.lines().map_while(std::result::Result::ok) {
             let trimmed = line.trim();
-            if trimmed.starts_with('[') {
-                if let Some(end) = trimmed.find(']') {
-                    let ts_str = &trimmed[1..end];
-                    if let Ok(dt) = DateTime::parse_from_rfc3339(ts_str) {
-                        return Some(dt.date_naive());
-                    }
+            if trimmed.starts_with('[')
+                && let Some(end) = trimmed.find(']') {
+                let ts_str = &trimmed[1..end];
+                if let Ok(dt) = DateTime::parse_from_rfc3339(ts_str) {
+                    return Some(dt.date_naive());
                 }
             }
         }
     }
-    if let Ok(meta) = fs::metadata(path) {
-        if let Ok(mtime) = meta.modified() {
-            let dt: DateTime<Utc> = mtime.into();
-            return Some(dt.date_naive());
-        }
+    if let Ok(meta) = fs::metadata(path)
+        && let Ok(mtime) = meta.modified() {
+        let dt: DateTime<Utc> = mtime.into();
+        return Some(dt.date_naive());
     }
     None
 }
@@ -76,10 +74,9 @@ fn extract_date_from_filename(name: &str) -> Option<NaiveDate> {
     }
     for i in 0..=bytes.len() - 10 {
         let slice = &name[i..i + 10];
-        if slice.chars().nth(4) == Some('-') && slice.chars().nth(7) == Some('-') {
-            if let Ok(d) = NaiveDate::parse_from_str(slice, "%Y-%m-%d") {
-                return Some(d);
-            }
+        if slice.chars().nth(4) == Some('-') && slice.chars().nth(7) == Some('-')
+            && let Ok(d) = NaiveDate::parse_from_str(slice, "%Y-%m-%d") {
+            return Some(d);
         }
     }
     None
@@ -177,13 +174,12 @@ pub fn prune_logs(retention_days: Option<u32>) -> Result<LogPruneReport> {
             })
         });
 
-        if let Some(date) = file_date {
-            if date < cutoff_date {
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                if fs::remove_file(&path).is_ok() {
-                    report.pruned_files.push(file_name);
-                    report.reclaimed_bytes += size;
-                }
+        if let Some(date) = file_date
+            && date < cutoff_date {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if fs::remove_file(&path).is_ok() {
+                report.pruned_files.push(file_name);
+                report.reclaimed_bytes += size;
             }
         }
     }
@@ -218,15 +214,14 @@ pub fn check_and_rotate_daily() {
     }
 
     let today = Utc::now().date_naive();
-    if let Some(log_date) = detect_log_file_date(&active_path) {
-        if log_date < today {
-            let _ = rotate_active_log();
-            let retention_days = crate::config::AppConfig::load_or_create(None)
-                .ok()
-                .and_then(|cfg| cfg.settings.log_retention_days)
-                .unwrap_or(30);
-            let _ = prune_logs(Some(retention_days));
-        }
+    if let Some(log_date) = detect_log_file_date(&active_path)
+        && log_date < today {
+        let _ = rotate_active_log();
+        let retention_days = crate::config::AppConfig::load_or_create(None)
+            .ok()
+            .and_then(|cfg| cfg.settings.log_retention_days)
+            .unwrap_or(30);
+        let _ = prune_logs(Some(retention_days));
     }
 }
 
@@ -350,27 +345,25 @@ pub fn parse_log_entries_from_file(path: &Path) -> Vec<LogEntry> {
         }
 
         // Format: [2026-09-22T03:00:00Z] [EVENT_TYPE] Details...
-        if let Some(rest) = trimmed.strip_prefix('[') {
-            if let Some(ts_end) = rest.find(']') {
-                let ts_str = &rest[..ts_end];
-                let after_ts = rest[ts_end + 1..].trim_start();
-                if let Some(after_bracket) = after_ts.strip_prefix('[') {
-                    if let Some(type_end) = after_bracket.find(']') {
-                        let event_type = after_bracket[..type_end].to_string();
-                        let details = after_bracket[type_end + 1..].trim().to_string();
+        if let Some(rest) = trimmed.strip_prefix('[')
+            && let Some(ts_end) = rest.find(']') {
+            let ts_str = &rest[..ts_end];
+            let after_ts = rest[ts_end + 1..].trim_start();
+            if let Some(after_bracket) = after_ts.strip_prefix('[')
+                && let Some(type_end) = after_bracket.find(']') {
+                    let event_type = after_bracket[..type_end].to_string();
+                    let details = after_bracket[type_end + 1..].trim().to_string();
 
-                        let timestamp = DateTime::parse_from_rfc3339(ts_str)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now());
+                    let timestamp = DateTime::parse_from_rfc3339(ts_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now());
 
-                        entries.push(LogEntry {
-                            timestamp,
-                            event_type,
-                            details,
-                        });
-                    }
+                    entries.push(LogEntry {
+                        timestamp,
+                        event_type,
+                        details,
+                    });
                 }
-            }
         }
     }
     entries
@@ -382,18 +375,17 @@ pub fn get_recent_logs(limit: usize) -> Result<Vec<LogEntry>> {
     let mut entries = parse_log_entries_from_file(&log_file_path());
 
     // Backfill from rotated logs if current active file has fewer entries than requested limit
-    if entries.len() < limit {
-        if let Ok(files) = list_log_files() {
-            for file_info in files {
-                if file_info.is_active {
-                    continue;
-                }
-                let rotated_path = log_dir().join(&file_info.name);
-                let rotated_entries = parse_log_entries_from_file(&rotated_path);
-                entries.splice(0..0, rotated_entries);
-                if entries.len() >= limit {
-                    break;
-                }
+    if entries.len() < limit
+        && let Ok(files) = list_log_files() {
+        for file_info in files {
+            if file_info.is_active {
+                continue;
+            }
+            let rotated_path = log_dir().join(&file_info.name);
+            let rotated_entries = parse_log_entries_from_file(&rotated_path);
+            entries.splice(0..0, rotated_entries);
+            if entries.len() >= limit {
+                break;
             }
         }
     }

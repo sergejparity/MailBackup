@@ -445,18 +445,33 @@ fn privileged_process_installs_for_the_config_owner() {
     if std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(1) != 0 {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.yaml");
-    std::fs::write(&config, "x").unwrap();
-    let status = std::process::Command::new("/bin/chown").args(["nobody", config.to_str().unwrap()]).status().unwrap();
-    assert!(status.success());
+    // The old root service runs with USER=root. The body runs in a child
+    // process started with it, so this binary's other (parallel) tests never
+    // see a changed environment
+    const CHILD_DIR: &str = "MAILBACKUP_TEST_CHILD_DIR";
+    let Some(dir) = std::env::var_os(CHILD_DIR) else {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        std::fs::write(&config, "x").unwrap();
+        let status = std::process::Command::new("/bin/chown").args(["nobody", config.to_str().unwrap()]).status().unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "privileged_process_installs_for_the_config_owner", "--nocapture"])
+            .env(CHILD_DIR, dir.path())
+            .env("USER", "root")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the test body failed in the child process");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let config = dir.join("config.yaml");
 
-    // The old root service: USER=root, but the config belongs to `nobody`
-    std::env::set_var("USER", "root");
+    // USER=root, but the config belongs to `nobody`
     assert_eq!(mailbackup_core::service::service_user(&config).unwrap(), "nobody");
 
     // A config that only root owns gives no safe account to install for
-    let root_only = dir.path().join("root.yaml");
+    let root_only = dir.join("root.yaml");
     std::fs::write(&root_only, "x").unwrap();
     assert!(mailbackup_core::service::service_user(&root_only).is_err());
 }

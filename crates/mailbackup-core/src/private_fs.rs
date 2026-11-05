@@ -413,13 +413,11 @@ pub fn sensitive_targets_in(config_path: &Path, base: &Path) -> Vec<Target> {
     if let Some(cfg) = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|text| serde_norway::from_str::<crate::config::AppConfig>(&text).ok())
-    {
-        if let (Some(dir), Some(name)) = (cfg.db_path.parent(), cfg.db_path.file_name()) {
-            let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
-            let name = name.to_string_lossy();
-            for suffix in ["", "-wal", "-shm", "-journal"] {
-                targets.push(Target::new(dir, format!("{}{}", name, suffix)));
-            }
+        && let (Some(dir), Some(name)) = (cfg.db_path.parent(), cfg.db_path.file_name()) {
+        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        let name = name.to_string_lossy();
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            targets.push(Target::new(dir, format!("{}{}", name, suffix)));
         }
     }
     targets.push(Target::new(base, ""));
