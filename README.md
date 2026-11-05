@@ -232,9 +232,10 @@ cargo run -p mailbackup-gui
 cargo test --workspace
 ```
 
-Browser test for the mail viewer (needs Node, Playwright and its Chromium):
+Browser tests for the mail viewer, the dialogs and attachment downloads (need Node, Playwright and its Chromium):
 
 ```bash
 cargo build -p mailbackup-server
 NODE_PATH="$(npm root -g)" node scripts/browser-tests/remote-content.mjs
+NODE_PATH="$(npm root -g)" node scripts/browser-tests/ui-dialogs-attachments.mjs
 ```

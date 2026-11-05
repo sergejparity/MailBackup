@@ -763,11 +763,25 @@ function initEventListeners() {
     });
   }
 
-  // Backdrop click to dismiss modals
+  // Backdrop click to dismiss modals. Only a press and a release both on the
+  // backdrop count: when they land on different elements (a text selection
+  // dragged out of the dialog, or the reverse) the browser fires `click` on
+  // their nearest common ancestor, the backdrop, which must not close it.
   [el.settingsModal, el.editAccountModal, el.exportModal].forEach(modal => {
     if (modal) {
+      let pressedOnBackdrop = false;
+      let releasedOnBackdrop = false;
+      modal.addEventListener('pointerdown', (e) => {
+        pressedOnBackdrop = e.target === modal;
+        releasedOnBackdrop = false;
+      });
+      modal.addEventListener('pointerup', (e) => {
+        releasedOnBackdrop = e.target === modal;
+      });
       modal.addEventListener('click', (e) => {
-        if (e.target === modal && !document.body.classList.contains('is-modal-resizing')) {
+        const onBackdrop = pressedOnBackdrop && releasedOnBackdrop;
+        pressedOnBackdrop = releasedOnBackdrop = false;
+        if (e.target === modal && onBackdrop && !document.body.classList.contains('is-modal-resizing')) {
           closeModal(modal);
         }
       });
@@ -1433,12 +1447,18 @@ async function selectMessage(messageId) {
       el.viewAttachmentsBar.style.display = 'flex';
       el.viewAttCount.textContent = msg.attachments.length;
       el.viewAttachmentsList.innerHTML = '';
-      msg.attachments.forEach(att => {
-        const chip = document.createElement('div');
+      msg.attachments.forEach((att, index) => {
+        const chip = document.createElement('button');
+        chip.type = 'button';
         chip.className = 'att-chip';
         const kb = (att.size_bytes / 1024).toFixed(1);
         chip.innerHTML = `📎 ${escapeHtml(att.filename)} (${kb} KB)`;
-        chip.title = `MIME: ${att.mime_type}`;
+        chip.title = `Download ${att.filename} (${att.mime_type})`;
+        // The index is the attachment's position in this list, which the
+        // download route uses too
+        chip.addEventListener('click', () => {
+          downloadViaTicket(`/api/messages/${encodeURIComponent(msg.id)}/attachments/${index}`);
+        });
         el.viewAttachmentsList.appendChild(chip);
       });
     } else {

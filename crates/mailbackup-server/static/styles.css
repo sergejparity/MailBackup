@@ -989,10 +989,16 @@ body.is-modal-resizing * {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   padding: 4px 10px;
-  font-size: 0.76rem;
   color: var(--text-main);
+  font: inherit;
+  font-size: 0.76rem;
   cursor: pointer;
   transition: var(--transition-fast);
+}
+
+.att-chip:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
 }
 
 .att-chip:hover {
