@@ -61,6 +61,27 @@ fn show_main_window<R: tauri::Runtime>(manager: &impl Manager<R>) {
     }
 }
 
+/// Tray "Sync Now": presses the window's own Sync Now button, which syncs
+/// every account that isn't a read-only archive through the verified server
+/// the window shows (embedded or already running) with the UI's token. The
+/// window keeps running while hidden in the tray. On the error page there is
+/// no server to sync with, so the window is shown instead.
+fn sync_from_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    // The UI is served from 127.0.0.1; the error page is an app page
+    // (tauri://localhost, or http://tauri.localhost on Windows)
+    let on_server = window.url().is_ok_and(|url| url.host_str() == Some("127.0.0.1"));
+    if !on_server {
+        show_main_window(app);
+        return;
+    }
+    if let Err(e) = window.eval("document.getElementById('btn-sync-all')?.click()") {
+        eprintln!("Couldn't start the sync from the tray: {}", e);
+    }
+}
+
 /// The tray icon and its menu. Built in `setup`, never declared in
 /// tauri.conf.json: a configured tray is created before plugins run, so a
 /// second instance would show one before single-instance hands it off.
@@ -78,7 +99,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "quit" => app.exit(0),
             "show" => show_main_window(app),
-            "sync" => println!("Sync triggered from system tray"),
+            "sync" => sync_from_tray(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

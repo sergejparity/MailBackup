@@ -28,9 +28,15 @@ pub fn is_download_path(path: &str) -> bool {
     if matches!(path, "/api/export/mbox/download" | "/api/logs/download" | "/api/accounts/csv-template") {
         return true;
     }
-    path.strip_prefix("/api/messages/")
-        .and_then(|rest| rest.strip_suffix("/download"))
-        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    let Some(rest) = path.strip_prefix("/api/messages/") else {
+        return false;
+    };
+    // `<id>/download` (the .eml) or `<id>/attachments/<index>`
+    match rest.split('/').collect::<Vec<_>>().as_slice() {
+        [id, "download"] => !id.is_empty(),
+        [id, "attachments", index] => !id.is_empty() && !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()),
+        _ => false,
+    }
 }
 
 /// One complete download target: path plus its query with empty pairs
@@ -172,6 +178,8 @@ mod tests {
         for url in [
             "/api/messages/42/download",
             "/api/messages/a%2Fb/download",
+            "/api/messages/42/attachments/0",
+            "/api/messages/42/attachments/12",
             "/api/export/mbox/download?account_id=a&folder_id=b",
             "/api/logs/download",
             "/api/logs/download?file=events.log",
@@ -187,6 +195,12 @@ mod tests {
             "/api/messages//download",
             "/api/messages/1/2/download",
             "/api/messages/1",
+            "/api/messages/1/attachments",
+            "/api/messages/1/attachments/",
+            "/api/messages/1/attachments/x",
+            "/api/messages/1/attachments/-1",
+            "/api/messages/1/attachments/0/download",
+            "/api/messages//attachments/0",
             "/api/logs/download/",
             "api/logs/download",
             "//evil.example/api/logs/download",

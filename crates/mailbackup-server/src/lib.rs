@@ -149,6 +149,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/folders/{id}/messages", get(api_get_messages))
         .route("/api/messages/{id}", get(api_get_message_detail))
         .route("/api/messages/{id}/download", get(api_download_eml))
+        .route("/api/messages/{id}/attachments/{index}", get(api_download_attachment))
         .route("/api/search", get(api_search))
         .route("/api/sync/status", get(api_get_sync_status))
         .route("/api/sync/{account_id}", post(api_sync_account))
@@ -1233,6 +1234,58 @@ async fn api_download_eml(
             res
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// One attachment of an archived message, decoded: the `index`-th entry of
+/// the message detail's `attachments` (`mailbackup_core::attachments`).
+/// Always a download (`application/octet-stream`, `Content-Disposition:
+/// attachment`), so no attachment is ever rendered on this origin.
+async fn api_download_attachment(
+    State(state): State<AppState>,
+    Path((message_id, index)): Path<(String, usize)>,
+) -> Response {
+    let msg = match state.db.get_message_by_id(&message_id) {
+        Ok(Some(m)) => m,
+        _ => return (StatusCode::NOT_FOUND, "Message not found").into_response(),
+    };
+    let eml = match state.storage.read_eml(&msg.relative_path) {
+        Ok(bytes) => bytes,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let Some(parsed) = MessageParser::default().parse(&eml) else {
+        return (StatusCode::NOT_FOUND, "Attachment not found").into_response();
+    };
+    let Some(part) = mailbackup_core::attachments::parts(&parsed).nth(index) else {
+        return (StatusCode::NOT_FOUND, "Attachment not found").into_response();
+    };
+    let filename = attachment_filename(part.attachment_name(), part.content_type().as_ref(), index);
+    let mut res = Response::new(Body::from(part.decoded().into_owned()));
+    res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    res.headers_mut().insert(header::CONTENT_DISPOSITION, attachment_disposition(&filename));
+    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
+}
+
+/// The name an attachment is saved under: its own name (without any
+/// directory part), else `attachment-<n>` with an extension for its type.
+fn attachment_filename(name: Option<&str>, ctype: Option<&mail_parser::ContentType<'_>>, index: usize) -> String {
+    let own = name
+        .map(|n| n.rsplit(['/', '\\']).next().unwrap_or("").trim())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..");
+    if let Some(own) = own {
+        return own.to_string();
+    }
+    let ext = ctype.and_then(|c| {
+        let essence = format!("{}/{}", c.ctype(), c.subtype()?).to_ascii_lowercase();
+        if essence == "message/rfc822" {
+            return Some("eml");
+        }
+        mime_guess::get_mime_extensions_str(&essence)?.first().copied()
+    });
+    match ext {
+        Some(ext) => format!("attachment-{}.{}", index + 1, ext),
+        None => format!("attachment-{}", index + 1),
     }
 }
 
@@ -3067,6 +3120,62 @@ mod tests {
         let mbox = "/api/export/mbox/download?account_id=acc1&folder_id=";
         let ticket = ticket_for(&router, mbox).await;
         assert_ne!(get_with_ticket(&router, mbox, &ticket).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn attachments_download_decoded_under_their_names_and_never_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let raw = "From: a@example.com\r\nSubject: atts\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n\
+                   --B\r\nContent-Type: text/plain\r\n\r\nSee attached\r\n\
+                   --B\r\nContent-Type: image/png\r\nContent-Disposition: inline\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n\
+                   --B\r\nContent-Type: text/html; name=\"..\\\\evil\\\\page.html\"\r\nContent-Disposition: attachment; filename=\"..\\\\evil\\\\page.html\"\r\n\r\n<script>alert(1)</script>\r\n\
+                   --B\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQ=\r\n\
+                   --B--\r\n";
+        let stored = state.storage.store_eml("acc1", "INBOX", 1, None, raw.as_bytes()).unwrap();
+        state.db.upsert_account("acc1", "A", "a@example.com", "generic_imap").unwrap();
+        let folder = state.db.get_or_create_folder("acc1", "INBOX", "inbox", Some(1)).unwrap();
+        let id = state
+            .db
+            .insert_message(
+                "acc1", &folder.id, 1, None, Some("atts"), Some("a@example.com"), None, None, None,
+                raw.len() as u64, &stored.relative_path.to_string_lossy(), &stored.sha256, None, &[],
+            )
+            .unwrap();
+        let router = create_router(state);
+
+        // The detail lists them in the order the download indexes use
+        let res = router.clone().oneshot(authed("GET", &format!("/api/messages/{}", id), None)).await.unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let names: Vec<&str> = detail["attachments"].as_array().unwrap().iter().map(|a| a["filename"].as_str().unwrap()).collect();
+        assert_eq!(names, ["unnamed", "..\\evil\\page.html", "résumé.pdf"]);
+
+        let expected: [(&str, &[u8]); 3] = [
+            ("attachment; filename=\"attachment-1.png\"; filename*=UTF-8''attachment-1.png", b"\x89PNG\r\n\x1a\n"),
+            ("attachment; filename=\"page.html\"; filename*=UTF-8''page.html", b"<script>alert(1)</script>"),
+            ("attachment; filename=\"r_sum_.pdf\"; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf", b"%PDF-1.4"),
+        ];
+        for (index, (disposition, bytes)) in expected.iter().enumerate() {
+            let url = format!("/api/messages/{}/attachments/{}", id, index);
+            assert_eq!(
+                router.clone().oneshot(anonymous("GET", &url)).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "no ticket, no download"
+            );
+            let ticket = ticket_for(&router, &url).await;
+            let res = get_with_ticket(&router, &url, &ticket).await;
+            assert_eq!(res.status(), StatusCode::OK, "{}", url);
+            assert_eq!(res.headers()[header::CONTENT_TYPE], "application/octet-stream");
+            assert_eq!(res.headers()[header::CONTENT_DISPOSITION], *disposition);
+            assert_eq!(res.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&body[..], *bytes, "{}", url);
+        }
+
+        for url in [format!("/api/messages/{}/attachments/3", id), "/api/messages/missing/attachments/0".to_string()] {
+            let ticket = ticket_for(&router, &url).await;
+            assert_eq!(get_with_ticket(&router, &url, &ticket).await.status(), StatusCode::NOT_FOUND, "{}", url);
+        }
     }
 
     #[tokio::test]
