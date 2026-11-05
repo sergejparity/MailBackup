@@ -200,19 +200,33 @@ fn download_in_process<R: tauri::Runtime>(app: tauri::AppHandle<R>, url: tauri::
             notify("Download cancelled");
             return;
         };
-        let written = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .and_then(|mut file| std::io::Write::write_all(&mut file, response.body()));
-        if let Err(e) = &written {
-            eprintln!("Couldn't save {}: {}", path.display(), e);
-            let _ = std::fs::remove_file(&path);
-        }
-        if let Some(message) = finish_message(reservations.finish(&key, Some(path), written.is_ok())) {
-            notify(&message);
+        match write_new_file(&path, response.body()) {
+            Ok(()) => {
+                if let Some(message) = finish_message(reservations.finish(&key, Some(path), true)) {
+                    notify(&message);
+                }
+            }
+            Err(e) => {
+                eprintln!("Couldn't save {}: {}", path.display(), e);
+                // Whatever is at `path` now isn't ours to remove
+                reservations.abandon(&key);
+                notify("The download failed");
+            }
         }
     });
+}
+
+/// Writes `bytes` to a new file at `path`. Fails if anything exists there
+/// (another program may have created it since the name was chosen), and
+/// then leaves it alone; a file it created but couldn't fill is removed.
+fn write_new_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    if let Err(e) = std::io::Write::write_all(&mut file, bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// The file name a `Content-Disposition` header gives (`filename*` in
@@ -427,6 +441,12 @@ impl Reservations {
         path
     }
 
+    /// Ends the download `key` without touching any file: none of them is
+    /// known to be its own (it couldn't create its file).
+    fn abandon(&self, key: &str) {
+        self.lock().remove(key);
+    }
+
     fn refuse(&self, key: &str) {
         self.lock().insert(key.to_string(), Download::Refused);
     }
@@ -438,10 +458,13 @@ impl Reservations {
         match entry {
             Some(Download::Refused) => Finish::Refused,
             Some(Download::Running { path: part, replaces: Some(target) }) => {
+                // On failure the `.part` file is left alone: whoever wrote it
+                // removes their own partial file (the webviews do, and
+                // `write_new_file` does), and if the failure was that another
+                // program had created it first, it isn't ours
                 if success && std::fs::rename(&part, &target).is_ok() {
                     Finish::Saved(Some(target))
                 } else {
-                    let _ = std::fs::remove_file(&part);
                     Finish::Failed
                 }
             }
@@ -762,12 +785,13 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
         assert!(!part.exists());
 
-        // A failed replacement leaves the original as it was
+        // A failed replacement leaves the original as it was, and doesn't
+        // remove a `.part` file it can't know to be its own
         let part = r.reserve_chosen(target.clone(), "fail");
-        std::fs::write(&part, b"partial").unwrap();
+        std::fs::write(&part, b"another program's").unwrap();
         assert!(matches!(r.finish("fail", None, false), Finish::Failed));
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
-        assert!(!part.exists());
+        assert_eq!(std::fs::read(&part).unwrap(), b"another program's");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -801,6 +825,37 @@ mod tests {
         assert_eq!(name("attachment; filename*=UTF-8''%2E%2E").as_deref(), None);
         assert_eq!(name("attachment").as_deref(), None);
         assert_eq!(name("attachment; filename*=UTF-8''%ZZ; filename=\"x.bin\"").as_deref(), Some("x.bin"));
+    }
+
+    #[test]
+    fn a_download_never_removes_a_file_it_did_not_create() {
+        use super::write_new_file;
+        let dir = temp_dir("write-new");
+        let r = Reservations::default();
+        // Reserved, but another program creates the name before the write
+        let path = r.reserve(&dir, "report.pdf", "key");
+        std::fs::write(&path, b"someone else's").unwrap();
+        let err = write_new_file(&path, b"ours").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        r.abandon("key");
+        assert_eq!(std::fs::read(&path).unwrap(), b"someone else's", "left as it was");
+        // Its reservation is gone; the name stays taken through the file
+        assert_eq!(r.reserve(&dir, "report.pdf", "next"), dir.join("report (1).pdf"));
+
+        // The same for a `.part` file replacing a chosen file
+        std::fs::write(dir.join("keep.txt"), b"original").unwrap();
+        let part = r.reserve_chosen(dir.join("keep.txt"), "replace");
+        std::fs::write(&part, b"another program's").unwrap();
+        assert!(write_new_file(&part, b"ours").is_err());
+        r.abandon("replace");
+        assert_eq!(std::fs::read(&part).unwrap(), b"another program's");
+        assert_eq!(std::fs::read(dir.join("keep.txt")).unwrap(), b"original");
+
+        // A new file is written whole
+        let fresh = r.reserve(&dir, "new.bin", "fresh");
+        write_new_file(&fresh, b"content").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"content");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

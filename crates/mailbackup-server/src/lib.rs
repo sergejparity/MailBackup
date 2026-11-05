@@ -585,7 +585,40 @@ pub struct WebListener {
 struct Listening {
     port: u16,
     stop: tokio::sync::oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<()>,
+    /// Fires when the listening socket is closed (see [`ClosingListener`])
+    closed: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// The listening socket, with the runtime file published for it: both go
+/// away together when axum drops the listener, which it does as soon as a
+/// graceful shutdown starts, before open connections finish. That moment
+/// is reported on `closed`, so a stop needn't wait for requests in progress
+/// (one of which may be the request asking for the stop).
+struct ClosingListener {
+    inner: tokio::net::TcpListener,
+    _published: Option<runtime::PublishedRuntime>,
+    closed: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for ClosingListener {
+    fn drop(&mut self) {
+        if let Some(closed) = self.closed.take() {
+            let _ = closed.send(());
+        }
+    }
+}
+
+impl axum::serve::Listener for ClosingListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+
+    fn accept(&mut self) -> impl std::future::Future<Output = (Self::Io, Self::Addr)> + Send {
+        axum::serve::Listener::accept(&mut self.inner)
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
 }
 
 impl WebListener {
@@ -623,25 +656,30 @@ impl WebListener {
             }
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
+        let (closed_tx, closed) = tokio::sync::oneshot::channel::<()>();
+        let listener = ClosingListener { inner: listener, _published: published, closed: Some(closed_tx) };
+        // Requests in progress finish in this task after the socket closed
+        tokio::spawn(async move {
             let shutdown = async move {
                 let _ = stopped.await;
             };
             if let Err(e) = axum::serve(listener, router).with_graceful_shutdown(shutdown).await {
                 error!("The web server stopped: {}", e);
             }
-            drop(published);
         });
-        *running = Some(Listening { port, stop, task });
+        *running = Some(Listening { port, stop, closed });
         Ok(port)
     }
 
-    /// Stops listening; requests in progress finish first.
+    /// Stops listening: returns once the port is closed and free again.
+    /// Requests in progress still finish, in the background; a request may
+    /// therefore stop the listener it came through. Holds the same lock as
+    /// [`WebListener::start`] throughout, so on/off changes apply in order.
     pub async fn stop(&self) {
-        let listening = self.running.lock().await.take();
-        if let Some(listening) = listening {
+        let mut running = self.running.lock().await;
+        if let Some(listening) = running.take() {
             let _ = listening.stop.send(());
-            let _ = listening.task.await;
+            let _ = listening.closed.await;
             info!("Web server on port {} stopped", listening.port);
         }
     }
@@ -2290,10 +2328,9 @@ async fn api_update_settings(
                             .into_response();
                     }
                 } else {
-                    // In the background: this request may have come through
-                    // the listener, which waits for its requests to finish
-                    let web = web.clone();
-                    tokio::spawn(async move { web.stop().await });
+                    // Returns once the port is closed, without waiting for
+                    // requests in progress (this one may use the listener)
+                    web.stop().await;
                 }
             }
             cfg.settings.web_server_enabled = enabled;
@@ -3399,11 +3436,15 @@ mod tests {
 
     /// A router whose state has a web listener on a free port.
     async fn router_with_listener(dir: &std::path::Path, always: bool) -> (Router, Arc<WebListener>) {
+        router_with_listener_on(dir, always, 0).await
+    }
+
+    async fn router_with_listener_on(dir: &std::path::Path, always: bool, port: u16) -> (Router, Arc<WebListener>) {
         let mut state = test_state(dir, Vec::new()).await;
         let web = Arc::new(WebListener {
             router: std::sync::OnceLock::new(),
             bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: 0,
+            port,
             always,
             config_dir: dir.to_path_buf(),
             identity: state.identity.clone(),
@@ -3420,16 +3461,6 @@ mod tests {
         serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap()
     }
 
-    async fn wait_until_stopped(web: &WebListener) {
-        for _ in 0..50 {
-            if web.port().await.is_none() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        panic!("the listener didn't stop");
-    }
-
     // Multi-threaded: the handshake check blocks while the listener answers
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn web_access_turns_the_listener_on_and_off() {
@@ -3442,7 +3473,8 @@ mod tests {
 
         let put = |enabled: bool| json_request("PUT", "/api/settings", serde_json::json!({ "web_server_enabled": enabled }));
         assert_eq!(status(&router, put(false)).await, StatusCode::OK);
-        wait_until_stopped(&web).await;
+        // Closed by the time the request returns
+        assert_eq!(web.port().await, None);
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "nothing listens");
         assert!(!runtime::runtime_path(dir.path(), port).exists(), "runtime file removed");
         let off = settings_json(&router).await;
@@ -3455,6 +3487,54 @@ mod tests {
         let port = web.port().await.expect("listening again");
         assert!(runtime::verify_genuine(dir.path(), port).is_some(), "the handshake proves the new port");
         assert_eq!(settings_json(&router).await["web_server_port"], port);
+        web.stop().await;
+    }
+
+    // Multi-threaded: the handshake check blocks while the listener answers
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rapid_off_and_on_end_in_the_last_state_on_the_same_port() {
+        let dir = tempfile::tempdir().unwrap();
+        // A fixed port, so each start must rebind the one the stop released
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (router, web) = router_with_listener_on(dir.path(), false, port).await;
+        assert_eq!(web.start().await.unwrap(), port);
+
+        // "Off" over real HTTP through the listener it turns off: returns,
+        // rather than waiting for itself
+        let off_over_http = move || {
+            use std::io::{Read, Write};
+            let body = r#"{"web_server_enabled":false}"#;
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+            write!(
+                stream,
+                "PUT /api/settings HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                port, API_TOKEN_HEADER, TOKEN, body.len(), body
+            )
+            .unwrap();
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            response.lines().next().unwrap_or_default().to_string()
+        };
+        let on = || json_request("PUT", "/api/settings", serde_json::json!({ "web_server_enabled": true }));
+        for round in 0..5 {
+            let status_line = tokio::task::spawn_blocking(off_over_http).await.unwrap();
+            assert!(status_line.contains("200"), "round {}: {}", round, status_line);
+            // Immediately on again: the port is already free
+            assert_eq!(status(&router, on()).await, StatusCode::OK, "round {}", round);
+            assert_eq!(web.port().await, Some(port), "round {}", round);
+            assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(), "round {}: listening", round);
+        }
+
+        // Concurrent requests: whichever runs last decides, and the listener
+        // matches the saved setting
+        let put = |enabled: bool| json_request("PUT", "/api/settings", serde_json::json!({ "web_server_enabled": enabled }));
+        for _ in 0..5 {
+            let (a, b) = tokio::join!(status(&router, put(false)), status(&router, put(true)));
+            assert_eq!((a, b), (StatusCode::OK, StatusCode::OK));
+            let enabled = settings_json(&router).await["web_server_enabled"].as_bool().unwrap();
+            assert_eq!(web.port().await.is_some(), enabled, "the listener matches the saved setting");
+        }
         web.stop().await;
     }
 
