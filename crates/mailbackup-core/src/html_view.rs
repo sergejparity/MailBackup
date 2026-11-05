@@ -6,7 +6,8 @@
 //! that can't be resolved stay `cid:`, which loads nothing.
 
 use base64::Engine;
-use mail_parser::{Message, MimeHeaders};
+use mail_parser::Message;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Largest single image inlined as a `data:` URI.
@@ -19,9 +20,9 @@ pub const MAX_INLINE_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 /// `html` with `cid:` references to `message`'s image parts replaced by
 /// `data:` URIs (see the module docs).
 pub fn inline_cid_images(html: &str, message: &Message) -> String {
-    let images: HashMap<String, (String, &[u8])> = message
-        .parts
-        .iter()
+    let images: HashMap<String, (String, Cow<[u8]>)> = message
+        .root()
+        .parts()
         .filter_map(|part| {
             let id = normalize_content_id(part.content_id()?);
             let ctype = part.content_type()?;
@@ -34,13 +35,13 @@ pub fn inline_cid_images(html: &str, message: &Message) -> String {
                 return None;
             }
             let mime = format!("image/{}", subtype.to_ascii_lowercase());
-            Some((id, (mime, part.contents())))
+            Some((id, (mime, part.decoded())))
         })
         .collect();
     if images.is_empty() {
         return html.to_string();
     }
-    inline_with(html, |id| images.get(&normalize_content_id(id)).map(|(m, b)| (m.as_str(), *b)))
+    inline_with(html, |id| images.get(&normalize_content_id(id)).map(|(m, b)| (m.as_str(), b.as_ref())))
 }
 
 /// Replaces each `cid:<id>` (case-insensitive scheme) for which `lookup`

@@ -8,7 +8,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use mail_parser::{MessageParser, MimeHeaders};
+use mail_parser::MessageParser;
 use mailbackup_core::config::{AccountConfig, AppConfig, AuthType, FolderFilter, ProviderType};
 use mailbackup_core::db::{AdvancedSearchFilter, Database};
 use mailbackup_core::imap::ImapSyncEngine;
@@ -1184,14 +1184,10 @@ async fn api_get_message_detail(
         let html_content = p.body_html(0).map(|s| mailbackup_core::html_view::inline_cid_images(&s, &p));
         let text_content = p.body_text(0).map(|s| s.to_string());
 
-        let mut atts = Vec::new();
-        for att in p.attachments() {
-            atts.push(AttachmentDetail {
-                filename: att.attachment_name().unwrap_or("unnamed").to_string(),
-                mime_type: att.content_type().map(|c| c.ctype().to_string()).unwrap_or_else(|| "application/octet-stream".to_string()),
-                size_bytes: att.contents().len() as u64,
-            });
-        }
+        let atts = mailbackup_core::attachments::summaries(&p)
+            .into_iter()
+            .map(|(filename, mime_type, size_bytes)| AttachmentDetail { filename, mime_type, size_bytes })
+            .collect();
         (html_content, text_content, atts)
     } else {
         (None, None, Vec::new())
