@@ -595,13 +595,19 @@ struct Listening {
 /// is reported on `closed`, so a stop needn't wait for requests in progress
 /// (one of which may be the request asking for the stop).
 struct ClosingListener {
-    inner: tokio::net::TcpListener,
-    _published: Option<runtime::PublishedRuntime>,
+    /// Always `Some` until dropped
+    inner: Option<tokio::net::TcpListener>,
+    published: Option<runtime::PublishedRuntime>,
     closed: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Drop for ClosingListener {
     fn drop(&mut self) {
+        // Fields are dropped only after this returns, so close the socket and
+        // remove the runtime file first: once `closed` fires, the port is free
+        // and a new runtime file for it can't be removed by this one
+        drop(self.inner.take());
+        drop(self.published.take());
         if let Some(closed) = self.closed.take() {
             let _ = closed.send(());
         }
@@ -613,11 +619,11 @@ impl axum::serve::Listener for ClosingListener {
     type Addr = SocketAddr;
 
     fn accept(&mut self) -> impl std::future::Future<Output = (Self::Io, Self::Addr)> + Send {
-        axum::serve::Listener::accept(&mut self.inner)
+        axum::serve::Listener::accept(self.inner.as_mut().expect("open until dropped"))
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.inner.local_addr()
+        self.inner.as_ref().expect("open until dropped").local_addr()
     }
 }
 
@@ -657,7 +663,7 @@ impl WebListener {
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let (closed_tx, closed) = tokio::sync::oneshot::channel::<()>();
-        let listener = ClosingListener { inner: listener, _published: published, closed: Some(closed_tx) };
+        let listener = ClosingListener { inner: Some(listener), published, closed: Some(closed_tx) };
         // Requests in progress finish in this task after the socket closed
         tokio::spawn(async move {
             let shutdown = async move {
@@ -3536,6 +3542,25 @@ mod tests {
             assert_eq!(web.port().await.is_some(), enabled, "the listener matches the saved setting");
         }
         web.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_closed_signal_comes_after_the_socket_and_runtime_file_are_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        for _ in 0..20 {
+            let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = socket.local_addr().unwrap().port();
+            let identity = runtime::ServerIdentity::new(port);
+            let published = runtime::PublishedRuntime::publish(dir.path(), &identity).unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let listener = ClosingListener { inner: Some(socket), published: Some(published), closed: Some(tx) };
+            // Dropped on another thread while this one waits for the signal
+            let dropper = std::thread::spawn(move || drop(listener));
+            rx.await.unwrap();
+            assert!(!runtime::runtime_path(dir.path(), port).exists(), "runtime file gone before the signal");
+            assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(), "port free before the signal");
+            dropper.join().unwrap();
+        }
     }
 
     // Multi-threaded: the handshake check blocks while the listener answers
