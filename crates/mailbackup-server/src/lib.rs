@@ -1861,6 +1861,11 @@ pub struct SettingsResponse {
     pub log_retention_days: Option<u32>,
     pub service_status: mailbackup_core::service::ServiceStatus,
     pub default_export_dir: String,
+    /// The desktop app's download folder; empty for the system Downloads folder
+    pub download_dir: String,
+    /// The folder downloads go to when `download_dir` is empty
+    pub default_download_dir: String,
+    pub ask_download_location: bool,
     pub version: String,
 }
 
@@ -1885,6 +1890,9 @@ async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
         log_retention_days: cfg.settings.log_retention_days,
         service_status: mailbackup_core::service::get_service_status(),
         default_export_dir: mailbackup_core::config::default_export_dir().to_string_lossy().to_string(),
+        download_dir: cfg.settings.download_dir.as_deref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+        default_download_dir: mailbackup_core::config::default_download_dir().to_string_lossy().to_string(),
+        ask_download_location: cfg.settings.ask_download_location,
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
     Json(res).into_response()
@@ -1900,6 +1908,9 @@ pub struct UpdateSettingsPayload {
     pub autostart: Option<bool>,
     pub run_as_service: Option<bool>,
     pub log_retention_days: Option<u32>,
+    /// The desktop app's download folder; empty resets it to Downloads
+    pub download_dir: Option<String>,
+    pub ask_download_location: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -1912,6 +1923,8 @@ pub struct UpdateSettingsResponse {
     pub autostart: bool,
     pub run_as_service: bool,
     pub log_retention_days: Option<u32>,
+    pub download_dir: String,
+    pub ask_download_location: bool,
     pub service_status: mailbackup_core::service::ServiceStatus,
     pub message: String,
 }
@@ -1944,6 +1957,18 @@ async fn api_update_settings(
     let (requested_dir, requested_db) = match (requested_dir, requested_db) {
         (Ok(dir), Ok(db)) => (dir, db),
         (Err(e), _) | (_, Err(e)) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    // Some(None): back to the Downloads folder
+    let requested_download_dir = match payload.download_dir.as_deref().map(str::trim) {
+        None => None,
+        Some("") => Some(None),
+        Some(raw) => {
+            let cfg = state.config.read().await;
+            match PathPolicy::for_exports(&cfg).validate_download_dir(&mailbackup_core::config::resolve_path(raw)) {
+                Ok(dir) => Some(Some(dir)),
+                Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+            }
+        }
     };
 
     // 1. Move the archive data directory if requested
@@ -2011,6 +2036,8 @@ async fn api_update_settings(
     let current_autostart;
     let current_run_as_service;
     let current_log_retention;
+    let current_download_dir;
+    let current_ask_download;
 
     // 3. Update config and save to disk
     {
@@ -2060,6 +2087,25 @@ async fn api_update_settings(
             );
         }
 
+        if let Some(dir) = requested_download_dir {
+            mailbackup_core::event_log::log_event(
+                "SETTINGS_UPDATED",
+                &format!(
+                    "Download folder set to {}",
+                    dir.as_deref().map(|d| d.display().to_string()).unwrap_or_else(|| "the Downloads folder".to_string())
+                ),
+            );
+            cfg.settings.download_dir = dir;
+        }
+
+        if let Some(ask) = payload.ask_download_location {
+            cfg.settings.ask_download_location = ask;
+            mailbackup_core::event_log::log_event(
+                "SETTINGS_UPDATED",
+                &format!("Ask where to save each download set to {}", ask),
+            );
+        }
+
         if let Some(log_retention) = payload.log_retention_days {
             cfg.settings.log_retention_days = if log_retention == 0 { None } else { Some(log_retention) };
             let _ = mailbackup_core::event_log::prune_logs(cfg.settings.log_retention_days);
@@ -2086,6 +2132,8 @@ async fn api_update_settings(
         current_autostart = cfg.settings.autostart;
         current_run_as_service = cfg.settings.run_as_service;
         current_log_retention = cfg.settings.log_retention_days;
+        current_download_dir = cfg.settings.download_dir.as_deref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        current_ask_download = cfg.settings.ask_download_location;
     }
 
     // 4. If storage or db location changed, reload scheduler
@@ -2117,6 +2165,8 @@ async fn api_update_settings(
         autostart: current_autostart,
         run_as_service: current_run_as_service,
         log_retention_days: current_log_retention,
+        download_dir: current_download_dir,
+        ask_download_location: current_ask_download,
         service_status: mailbackup_core::service::get_service_status(),
         message: messages.join(" "),
     })
@@ -2849,6 +2899,63 @@ mod tests {
             StatusCode::OK
         );
         assert!(new_data.is_dir());
+    }
+
+    #[tokio::test]
+    async fn download_settings_round_trip_and_are_confined() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+        let settings = |router: Router| async move {
+            let res = router.oneshot(authed("GET", "/api/settings", None)).await.unwrap();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+        let initial = settings(router.clone()).await;
+        assert_eq!(initial["download_dir"], "");
+        assert_eq!(initial["ask_download_location"], false);
+        assert!(!initial["default_download_dir"].as_str().unwrap().is_empty());
+
+        let put = |body| json_request("PUT", "/api/settings", body);
+        // Only existing folders inside the allowed locations (here `exports`)
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        for bad in [outside.clone(), dir.path().join("exports/missing"), PathBuf::from("relative")] {
+            assert_eq!(
+                status(&router, put(serde_json::json!({ "download_dir": bad }))).await,
+                StatusCode::BAD_REQUEST,
+                "{}",
+                bad.display()
+            );
+        }
+        let target = dir.path().join("exports/mail");
+        std::fs::create_dir_all(&target).unwrap();
+        assert_eq!(
+            status(&router, put(serde_json::json!({ "download_dir": target, "ask_download_location": true }))).await,
+            StatusCode::OK
+        );
+        let after = settings(router.clone()).await;
+        assert_eq!(after["download_dir"], target.canonicalize().unwrap().to_string_lossy().as_ref());
+        assert_eq!(after["ask_download_location"], true);
+        // Saved for the desktop app, which reads the config file
+        let saved = AppConfig::load_or_create(Some(&dir.path().join("config.yaml"))).unwrap();
+        assert_eq!(saved.settings.download_dir, Some(target.canonicalize().unwrap()));
+        assert!(saved.settings.ask_download_location);
+
+        // A rejected folder changes nothing else in the same request
+        assert_eq!(
+            status(&router, put(serde_json::json!({ "download_dir": outside, "ask_download_location": false }))).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(settings(router.clone()).await["ask_download_location"], true);
+
+        // Empty: back to Downloads
+        assert_eq!(
+            status(&router, put(serde_json::json!({ "download_dir": "", "ask_download_location": false }))).await,
+            StatusCode::OK
+        );
+        let reset = settings(router.clone()).await;
+        assert_eq!(reset["download_dir"], "");
+        assert_eq!(reset["ask_download_location"], false);
     }
 
     async fn get_account_json(router: &Router, id: &str) -> serde_json::Value {

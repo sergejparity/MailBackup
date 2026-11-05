@@ -2772,7 +2772,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-cli"
-version = "0.7.3"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2789,7 +2789,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-core"
-version = "0.7.3"
+version = "0.7.5"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2823,11 +2823,12 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-gui"
-version = "0.7.3"
+version = "0.7.5"
 dependencies = [
  "dirs",
  "mailbackup-core",
  "mailbackup-server",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",
@@ -2837,7 +2838,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-server"
-version = "0.7.3"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "axum",

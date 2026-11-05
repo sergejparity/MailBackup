@@ -209,6 +209,11 @@ const el = {
   settingsCurrentStorage: document.getElementById('settings-current-storage'),
   btnSaveStorage: document.getElementById('btn-save-storage'),
   settingsCloseToTray: document.getElementById('settings-close-to-tray'),
+  settingsDownloadDir: document.getElementById('settings-download-dir'),
+  settingsDownloadDirNote: document.getElementById('settings-download-dir-note'),
+  btnBrowseDownloadDir: document.getElementById('btn-browse-download-dir'),
+  btnResetDownloadDir: document.getElementById('btn-reset-download-dir'),
+  settingsAskDownload: document.getElementById('settings-ask-download'),
   traySettingStatus: document.getElementById('tray-setting-status'),
   settingsAutostart: document.getElementById('settings-autostart'),
   autostartSettingStatus: document.getElementById('autostart-setting-status'),
@@ -791,6 +796,11 @@ function initEventListeners() {
   // Storage Settings Form
   if (el.settingsStorageForm) el.settingsStorageForm.addEventListener('submit', handleSaveStorageSettings);
   if (el.settingsCloseToTray) el.settingsCloseToTray.addEventListener('change', handleToggleCloseToTray);
+  if (el.btnBrowseDownloadDir) el.btnBrowseDownloadDir.addEventListener('click', handleBrowseDownloadDir);
+  if (el.btnResetDownloadDir) el.btnResetDownloadDir.addEventListener('click', () => saveDownloadSettings({ download_dir: '' }));
+  if (el.settingsAskDownload) {
+    el.settingsAskDownload.addEventListener('change', (e) => saveDownloadSettings({ ask_download_location: e.target.checked }));
+  }
   if (el.settingsAutostart) el.settingsAutostart.addEventListener('change', handleToggleAutostart);
   if (el.settingsRunAsService) el.settingsRunAsService.addEventListener('change', handleToggleService);
   if (el.btnCopyServiceCmd) el.btnCopyServiceCmd.addEventListener('click', handleCopyServiceCmd);
@@ -2351,6 +2361,7 @@ async function loadSettings() {
       el.settingsCloseToTray.checked = data.close_to_tray !== false;
       updateTrayBadge(el.settingsCloseToTray.checked);
     }
+    showDownloadSettings(data);
     if (el.settingsAutostart) {
       el.settingsAutostart.checked = !!data.autostart;
       updateAutostartBadge(data.autostart);
@@ -2449,6 +2460,46 @@ function updateServiceBadge(status, configured) {
     el.serviceSettingStatus.style.background = 'rgba(148, 163, 184, 0.15)';
     el.serviceSettingStatus.style.color = 'var(--text-secondary)';
   }
+}
+
+// Desktop app download folder and "ask every time" (issue #65)
+function showDownloadSettings(data) {
+  if (data.default_download_dir !== undefined) state.defaultDownloadDir = data.default_download_dir;
+  if (el.settingsDownloadDir) el.settingsDownloadDir.value = data.download_dir || state.defaultDownloadDir || '';
+  if (el.settingsDownloadDirNote) {
+    el.settingsDownloadDirNote.textContent = data.download_dir ? '' : 'The Downloads folder (default).';
+  }
+  if (el.btnResetDownloadDir) el.btnResetDownloadDir.disabled = !data.download_dir;
+  if (el.settingsAskDownload) el.settingsAskDownload.checked = !!data.ask_download_location;
+}
+
+async function saveDownloadSettings(change) {
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(change),
+    });
+    if (!res.ok) {
+      showToast(`Couldn't save the download setting: ${await res.text()}`);
+    } else {
+      const data = await res.json();
+      showDownloadSettings(data);
+      if ('ask_download_location' in change) {
+        showToast(change.ask_download_location ? 'The app will ask where to save each download' : 'Downloads are saved without asking');
+      } else {
+        showToast(`Downloads will be saved to ${data.download_dir || state.defaultDownloadDir}`);
+      }
+      return;
+    }
+  } catch (err) {
+    showToast(`Couldn't save the download setting: ${err.message}`);
+  }
+  await loadSettings();
+}
+
+async function handleBrowseDownloadDir() {
+  await browseIntoInput(el.btnBrowseDownloadDir, (path) => saveDownloadSettings({ download_dir: path }));
 }
 
 async function handleToggleCloseToTray(e) {
