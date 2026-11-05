@@ -1,7 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::time::Duration;
-use tauri::{CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem};
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::webview::NewWindowResponse;
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 /// The port of a server the window may show: a running MailBackup server of
 /// this user that proves itself (see `mailbackup_server::runtime`), else one
@@ -51,23 +54,40 @@ fn start_embedded_server(port: u16) -> Result<u16, String> {
 }
 
 fn show_main_window<R: tauri::Runtime>(manager: &impl Manager<R>) {
-    if let Some(window) = manager.get_window("main") {
+    if let Some(window) = manager.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
 }
 
-fn build_tray() -> SystemTray {
-    let quit = CustomMenuItem::new("quit".to_string(), "Quit MailBackup");
-    let show = CustomMenuItem::new("show".to_string(), "Open Studio");
-    let sync = CustomMenuItem::new("sync".to_string(), "Sync Now");
-    let tray_menu = SystemTrayMenu::new()
-        .add_item(show)
-        .add_item(sync)
-        .add_native_item(SystemTrayMenuItem::Separator)
-        .add_item(quit);
-    SystemTray::new().with_menu(tray_menu)
+/// The tray icon and its menu. Built in `setup`, never declared in
+/// tauri.conf.json: a configured tray is created before plugins run, so a
+/// second instance would show one before single-instance hands it off.
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show = MenuItemBuilder::with_id("show", "Open Studio").build(app)?;
+    let sync = MenuItemBuilder::with_id("sync", "Sync Now").build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit MailBackup").build(app)?;
+    let menu = MenuBuilder::new(app).items(&[&show, &sync]).separator().item(&quit).build()?;
+    TrayIconBuilder::with_id("main")
+        .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?)
+        .icon_as_template(true)
+        .menu(&menu)
+        // Left click opens the window; the menu is on right click
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "quit" => app.exit(0),
+            "show" => show_main_window(app),
+            "sync" => println!("Sync triggered from system tray"),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
 }
 
 fn main() {
@@ -157,9 +177,10 @@ fn main() {
 
     // Nothing with side effects (server, config, autostart, tray) may run
     // before the single-instance check, or a second launch would do it too
-    // before handing off. Tauri 1 runs plugin setup before `setup` below and
-    // builds a builder-registered tray before plugins, so all of it lives in
-    // `setup`, which a second instance never reaches (the plugin exits it).
+    // before handing off. Tauri runs plugin setup (in `Builder::build`)
+    // before `setup` below, and creates a tray declared in the config before
+    // plugins, so all of it lives in `setup`, which a second instance never
+    // reaches (the plugin exits it).
     tauri::Builder::default()
         // One desktop instance per user: a later launch (desktop link, Start
         // menu, autostart) hands off to the running one, which shows its
@@ -180,55 +201,42 @@ fn main() {
                 }
             }
 
-            // Events reach the builder's `on_system_tray_event` handler
-            build_tray().build(app)?;
+            build_tray(app)?;
 
-            // The window is created here, only for the verified server
+            // The window is created here, only for the verified server. It
+            // gets no capabilities (no IPC): the UI only talks HTTP to it.
             let builder = match server {
                 Ok(port) => {
                     let origin = format!("http://127.0.0.1:{}", port);
                     let url = format!("{}/", origin).parse().expect("valid URL");
-                    tauri::WindowBuilder::new(app, "main", tauri::WindowUrl::External(url))
+                    WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                         // Never leave the verified server
                         .on_navigation(move |url| url.origin().ascii_serialization() == origin)
                 }
-                Err(_) => tauri::WindowBuilder::new(app, "main", tauri::WindowUrl::App("gui-error.html".into())),
+                Err(_) => WebviewWindowBuilder::new(app, "main", WebviewUrl::App("gui-error.html".into())),
             };
-            builder.title("MailBackup Studio").inner_size(1280.0, 840.0).resizable(true).build()?;
+            builder
+                // Nor through window.open / target=_blank: the UI opens no
+                // windows, so every request is refused
+                .on_new_window(|_, _| NewWindowResponse::Deny)
+                .title("MailBackup Studio")
+                .inner_size(1280.0, 840.0)
+                .resizable(true)
+                .build()?;
             Ok(())
         })
-        .on_system_tray_event(|app, event| match event {
-            SystemTrayEvent::LeftClick { .. } => {
-                show_main_window(app);
-            }
-            SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
-                "quit" => {
-                    std::process::exit(0);
-                }
-                "show" => {
-                    show_main_window(app);
-                }
-                "sync" => {
-                    println!("Sync triggered from system tray");
-                }
-                _ => {}
-            },
-            _ => {}
-        })
-        .on_window_event(|event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
                 let close_to_tray = mailbackup_core::config::AppConfig::load_or_create(None)
                     .map(|cfg| cfg.settings.close_to_tray)
                     .unwrap_or(true);
 
                 if close_to_tray {
                     api.prevent_close();
-                    let _ = event.window().hide();
+                    let _ = window.hide();
                 }
             }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
-

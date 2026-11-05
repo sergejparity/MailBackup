@@ -1,8 +1,7 @@
 name: CI (Linux)
 
-# Tests, lints and a dependency audit for the non-GUI crates. The desktop GUI
-# needs Tauri 1's GTK/WebKit stack (webkit2gtk-4.0, absent from current
-# Ubuntu), so it's excluded here; the Windows workflow builds it.
+# Tests, lints and a dependency audit for the whole workspace, the desktop
+# GUI included (Tauri 2 uses webkit2gtk-4.1, which current Ubuntu ships).
 
 on:
   push:
@@ -43,8 +42,11 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Install GUI system libraries
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+
       - name: Run tests
-        run: cargo test --workspace --exclude mailbackup-gui --locked
+        run: cargo test --workspace --locked
 
   clippy:
     if: github.event_name != 'schedule'
@@ -64,8 +66,11 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Install GUI system libraries
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+
       - name: Run clippy
-        run: cargo clippy --workspace --exclude mailbackup-gui --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # Declared but unused dependencies (issues #40, #41)
   unused-deps:

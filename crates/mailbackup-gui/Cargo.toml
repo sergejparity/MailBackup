@@ -6,13 +6,13 @@ authors.workspace = true
 license.workspace = true
 
 [build-dependencies]
-tauri-build = { version = "1.5", features = [] }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
 mailbackup-core = { path = "../mailbackup-core" }
 mailbackup-server = { path = "../mailbackup-server" }
-tauri = { version = "1.6", features = ["system-tray"] }
-tauri-plugin-single-instance = { git = "https://github.com/tauri-apps/plugins-workspace", rev = "1e407ed56455558cf751022fd68eca3b9e3713a0" }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
 tokio.workspace = true
 tracing-subscriber = { workspace = true }
 dirs = { workspace = true }

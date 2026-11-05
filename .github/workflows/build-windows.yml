@@ -30,7 +30,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^1.6"
+        run: cargo install tauri-cli --version "^2" --locked
 
       - name: Build CLI & Server binaries
         run: cargo build --release --workspace
