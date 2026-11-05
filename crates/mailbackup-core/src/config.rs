@@ -196,6 +196,16 @@ pub struct GlobalSettings {
     /// The desktop app asks where to save each download.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ask_download_location: bool,
+    /// The desktop app's web server listens on `bind_address:web_port`, so
+    /// the UI and API are reachable from a browser. Off, the desktop app
+    /// opens no port and serves its window in-process. Headless/service
+    /// mode always listens. Written only when off.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub web_server_enabled: bool,
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn default_schedule() -> String {
@@ -230,6 +240,7 @@ impl Default for GlobalSettings {
             tighten_permissions: true,
             download_dir: None,
             ask_download_location: false,
+            web_server_enabled: true,
         }
     }
 }

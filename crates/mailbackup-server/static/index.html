@@ -768,6 +768,31 @@
               </div>
             </div>
 
+            <!-- Web access (issue #66) -->
+            <div class="settings-card">
+              <div class="settings-header">
+                <div>
+                  <h3>Web Access</h3>
+                  <p class="settings-desc">Whether MailBackup's web interface and REST API are reachable from a browser on this computer.</p>
+                </div>
+              </div>
+              <div style="margin-top: 14px; display: flex; flex-direction: column; gap: 10px;">
+                <div class="setting-toggle-row">
+                  <input type="checkbox" id="settings-web-server" style="width: 18px; height: 18px; margin-top: 2px; accent-color: var(--primary); cursor: pointer;">
+                  <div>
+                    <label for="settings-web-server" style="cursor: pointer; font-size: 0.9rem; font-weight: 500; display: flex; align-items: center; gap: 8px;">
+                      Allow access from a web browser
+                      <span id="web-server-status" class="badge" style="font-size: 0.72rem; padding: 2px 7px; border-radius: 9999px;"></span>
+                    </label>
+                    <div style="font-size: 0.78rem; color: var(--text-secondary); margin-top: 4px; line-height: 1.45;">
+                      When off, MailBackup Studio opens no network port: the desktop window works on its own, scheduled backups keep running, and no browser or other program can reach the interface.
+                    </div>
+                    <div id="web-server-note" style="font-size: 0.78rem; color: var(--text-secondary); margin-top: 6px; line-height: 1.45;"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <!-- Desktop app downloads (issue #65) -->
             <div class="settings-card">
               <div class="settings-header">

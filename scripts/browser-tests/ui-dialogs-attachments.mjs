@@ -8,6 +8,7 @@
 // - #59: the script the tray's "Sync Now" runs in the window starts a sync of
 //   every account, like the window's own Sync Now button.
 // - #65: the desktop app's download folder and "ask every time" settings.
+// - #66: the web access switch, as the headless server shows it.
 //
 // Needs Node 18+, Playwright and a Chromium for it, and a built server:
 //   cargo build -p mailbackup-server
@@ -149,6 +150,16 @@ try {
   saved = await page.evaluate(async () => (await (await fetch('/api/settings')).json()));
   check(saved.download_dir === '', '"Use Downloads folder" resets it');
   await page.click('#settings-ask-download');
+
+  // --- #66: web access, as the headless server (always listening) shows it --
+  const web = await page.evaluate(() => ({
+    checked: document.getElementById('settings-web-server').checked,
+    disabled: document.getElementById('settings-web-server').disabled,
+    status: document.getElementById('web-server-status').textContent,
+    note: document.getElementById('web-server-note').textContent,
+  }));
+  check(web.checked && web.disabled && web.status === 'On' && /background service/.test(web.note),
+    `the headless server shows web access as always on (${JSON.stringify(web)})`);
   await page.keyboard.press('Escape');
 
   // --- #59: what the tray's Sync Now runs ------------------------------------
