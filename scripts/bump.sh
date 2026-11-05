@@ -118,12 +118,13 @@ import os
 if os.path.exists(tauri_conf_path):
     with open(tauri_conf_path, "r", encoding="utf-8") as f:
         tauri_content = f.read()
-    new_tauri = re.sub(
-        r'("package"\s*:\s*\{[\s\S]*?"version"\s*:\s*)"[^"]+"',
-        r'\g<1>"' + new_version + '"',
-        tauri_content,
-        count=1
-    )
+    # Tauri 2 keeps the version at the top level; Tauri 1 had it in "package"
+    pattern = r'("package"\s*:\s*\{[\s\S]*?"version"\s*:\s*)"[^"]+"' if '"package"' in tauri_content \
+        else r'^(\s{2}"version"\s*:\s*)"[^"]+"'
+    new_tauri, replaced = re.subn(pattern, r'\g<1>"' + new_version + '"', tauri_content, count=1, flags=re.M)
+    if replaced != 1:
+        print(f"Error: couldn't find the version in {tauri_conf_path}", file=sys.stderr)
+        sys.exit(1)
     with open(tauri_conf_path, "w", encoding="utf-8") as f:
         f.write(new_tauri)
 
