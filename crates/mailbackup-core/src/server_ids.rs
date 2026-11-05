@@ -18,6 +18,8 @@ pub enum ServerIdKind {
 }
 
 impl ServerIdKind {
+    pub const ALL: [ServerIdKind; 2] = [ServerIdKind::EmailId, ServerIdKind::GmailMsgId];
+
     /// The name stored in the catalog.
     pub fn as_str(self) -> &'static str {
         match self {

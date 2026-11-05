@@ -229,16 +229,16 @@ dependencies = [
 
 [[package]]
 name = "async-imap"
-version = "0.10.4"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca726c61b73c471f531b65e83e161776ba62c2b6ba4ec73d51fad357009ed00a"
+checksum = "f97b87216c9f0ccc63c516263169085fa34bba25633f6d96c6a9b9ca1fd5f70a"
 dependencies = [
  "async-channel 2.5.0",
  "async-compression",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
- "futures",
+ "futures-util",
  "imap-proto",
  "log",
  "nom",
@@ -511,12 +511,6 @@ name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
-
-[[package]]
-name = "base64"
-version = "0.22.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "base64"
@@ -1732,28 +1726,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "futures"
-version = "0.3.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a31d2a3fbaaeb2af2368bbdd904aa8e812d3c04a1ee10d3171f52d556e5d0a3"
-dependencies = [
- "futures-channel",
- "futures-core",
- "futures-executor",
- "futures-io",
- "futures-sink",
- "futures-task",
- "futures-util",
-]
-
-[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
 dependencies = [
  "futures-core",
- "futures-sink",
 ]
 
 [[package]]
@@ -1836,7 +1814,6 @@ version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
- "futures-channel",
  "futures-core",
  "futures-io",
  "futures-macro",
@@ -2542,7 +2519,9 @@ dependencies = [
 
 [[package]]
 name = "imap-proto"
-version = "0.16.7"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ccf963d57074747b455398a1763d174da80bcaba6f51e3671a82252b531a68b"
 dependencies = [
  "nom",
 ]
@@ -2983,7 +2962,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-cli"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3000,7 +2979,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-core"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3033,7 +3012,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-gui"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "dirs",
  "mailbackup-core",
@@ -3047,7 +3026,7 @@ dependencies = [
 
 [[package]]
 name = "mailbackup-server"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -3156,12 +3135,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "minimal-lexical"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
-
-[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3265,12 +3238,11 @@ checksum = "72ef4a56884ca558e5ddb05a1d1e7e1bfd9a68d9ed024c21704cc98872dae1bb"
 
 [[package]]
 name = "nom"
-version = "7.1.3"
+version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
+checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
 dependencies = [
  "memchr",
- "minimal-lexical",
 ]
 
 [[package]]

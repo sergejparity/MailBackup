@@ -5,11 +5,10 @@ members = [
     "crates/mailbackup-server",
     "crates/mailbackup-gui",
 ]
-exclude = ["vendor/imap-proto"]
 resolver = "2"
 
 [workspace.package]
-version = "0.6.8"
+version = "0.6.9"
 edition = "2021"
 authors = ["SP"]
 license = "MIT OR Apache-2.0"
@@ -40,7 +39,7 @@ axum = "0.8"
 tower-http = { version = "0.7", features = ["trace"] }
 rust-embed = { version = "8.5", features = ["mime-guess"] }
 mime_guess = "2.0"
-async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio", "compress"] }
+async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio", "compress"] }
 tokio-rustls = "0.26"
 rustls-pki-types = "1.8"
 webpki-roots = "1.0"
@@ -49,8 +48,3 @@ aes-gcm = "0.10"
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 base64 = "0.23"
 csv = "1.3"
-
-# imap-proto with RFC 8474 EMAILID parsing (issue #33); see
-# vendor/imap-proto/PATCHES.md. Drop once an upstream release has it.
-[patch.crates-io]
-imap-proto = { path = "vendor/imap-proto" }
