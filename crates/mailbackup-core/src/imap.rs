@@ -8,7 +8,7 @@ use crate::storage::StorageEngine;
 use async_imap::imap_proto::{AttributeValue, Response, Status};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
-use mail_parser::{Address, MessageParser, MimeHeaders};
+use mail_parser::{AddressList, MessageParser};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -126,14 +126,7 @@ fn parse_message(raw_body: &[u8], internal_date: Option<DateTime<Utc>>) -> Parse
             attachments: Vec::new(),
         };
     };
-    let attachments = p
-        .attachments()
-        .map(|att| {
-            let name = att.attachment_name().unwrap_or("unnamed");
-            let mime = att.content_type().map(|c| c.ctype().to_string()).unwrap_or_else(|| "application/octet-stream".to_string());
-            (name.to_string(), mime, att.contents().len() as u64)
-        })
-        .collect();
+    let attachments = crate::attachments::summaries(&p);
     ParsedMessage {
         message_id: p.message_id().map(|s| s.to_string()),
         subject: p.subject().map(|s| s.to_string()),
@@ -197,19 +190,9 @@ fn plan_batches(uids: &[u32], sizes: &HashMap<u32, u32>, max_messages: usize, ta
     batches
 }
 
-fn format_address(addr: &Address<'_>) -> String {
-    match addr {
-        Address::List(list) => list
-            .iter()
-            .filter_map(|a| a.address.as_deref())
-            .collect::<Vec<_>>()
-            .join(", "),
-        Address::Group(groups) => groups
-            .iter()
-            .flat_map(|g| g.addresses.iter().filter_map(|a| a.address.as_deref()))
-            .collect::<Vec<_>>()
-            .join(", "),
-    }
+/// The addresses of `list`, group members included, comma-separated.
+fn format_address(list: AddressList<'_>) -> String {
+    list.mailboxes().filter_map(|m| m.address()).collect::<Vec<_>>().join(", ")
 }
 
 impl ImapSyncEngine {

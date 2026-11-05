@@ -119,10 +119,7 @@ fn is_from_line(line: &[u8]) -> bool {
 /// `MAILER-DAEMON` and now.
 fn envelope(eml: &[u8]) -> (String, DateTime<Utc>) {
     let parsed = MessageParser::default().parse(eml);
-    let address = parsed.as_ref().and_then(|m| match m.from()? {
-        mail_parser::Address::List(list) => list.first()?.address.clone(),
-        mail_parser::Address::Group(groups) => groups.first()?.addresses.first()?.address.clone(),
-    });
+    let address = parsed.as_ref().and_then(|m| m.from()?.first()?.address().map(str::to_string));
     let date = parsed
         .as_ref()
         .and_then(|m| m.date())
