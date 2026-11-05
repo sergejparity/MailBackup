@@ -14,7 +14,7 @@
 //! read the runtime file. A challenge-response also doesn't authenticate the
 //! transport against a live relay to a genuine server.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::{Read, Write};
@@ -78,7 +78,7 @@ fn valid_nonce(nonce: &str) -> bool {
 }
 
 fn proof(secret: &[u8], port: u16, nonce: &str) -> String {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("HMAC accepts any key length");
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(format!("{}{}:{}", PROOF_CONTEXT, port, nonce.to_ascii_lowercase()).as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }

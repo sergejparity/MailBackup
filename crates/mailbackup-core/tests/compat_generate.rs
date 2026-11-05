@@ -13,7 +13,7 @@
 
 mod compat;
 
-use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
+use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key};
 use compat::*;
 use mailbackup_core::config::{AppConfig, ArchiveInfo, GlobalSettings};
@@ -177,9 +177,10 @@ fn credentials_legacy(dir: &Path) {
 }
 
 fn legacy_encrypt(secret: &str, key: &[u8; 32]) -> String {
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    let ct = cipher.encrypt(&nonce, secret.as_bytes()).unwrap();
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*key));
+    let mut nonce = [0u8; 12];
+    getrandom::fill(&mut nonce).unwrap();
+    let ct = cipher.encrypt(&aes_gcm::aead::Nonce::<Aes256Gcm>::from(nonce), secret.as_bytes()).unwrap();
     format!("enc:v1:{}:{}", hex::encode(nonce), hex::encode(ct))
 }
 

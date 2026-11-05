@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.6.9"
+version = "0.6.10"
 edition = "2021"
 authors = ["SP"]
 license = "MIT OR Apache-2.0"
@@ -21,10 +21,10 @@ serde_norway = "0.9"
 rusqlite = { version = "0.41", features = ["bundled", "bundled-full", "chrono", "uuid", "fallible_uint"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 mail-parser = "0.9"
-keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+keyring = "4.2"
 thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
@@ -44,7 +44,7 @@ tokio-rustls = "0.26"
 rustls-pki-types = "1.8"
 webpki-roots = "1.0"
 futures-util = "0.3"
-aes-gcm = "0.10"
-argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+aes-gcm = "0.11"
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 base64 = "0.23"
 csv = "1.3"

@@ -28,9 +28,12 @@
 use crate::config::AccountConfig;
 use crate::error::{CredentialErrorKind as Kind, Error, Result};
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
-    Aes256Gcm, Key, Nonce,
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Key,
 };
+
+/// AES-GCM nonce of `Aes256Gcm` (96 bits).
+type Nonce = aes_gcm::aead::Nonce<Aes256Gcm>;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -895,7 +898,7 @@ impl CredentialStore {
                 if let Some(current @ StoreKey { kdf: Some(_), .. }) = current {
                     return Ok(current.clone());
                 }
-                let kdf = KdfParams::generate();
+                let kdf = KdfParams::generate()?;
                 let salt = kdf.validate()?;
                 let key = self.derive(passphrase, &kdf, &salt)?;
                 Ok(StoreKey { key, kdf: Some(kdf) })
@@ -949,12 +952,10 @@ impl CredentialStore {
             return Ok(key);
         }
         let from_keyring = self.kr_get(MASTER_KEY_ENTRY).ok().and_then(|hex_key| parse_key(&hex_key));
-        let key = from_keyring.unwrap_or_else(|| {
-            let generated = Aes256Gcm::generate_key(&mut OsRng);
-            let mut key = [0u8; 32];
-            key.copy_from_slice(generated.as_slice());
-            key
-        });
+        let key = match from_keyring {
+            Some(key) => key,
+            None => random_bytes::<32>()?,
+        };
         if let Some(parent) = self.key_path.parent() {
             crate::private_fs::create_dir_all(parent).map_err(|e| key_file_error(&self.key_path, e))?;
         }
@@ -1041,18 +1042,16 @@ struct KdfParams {
 }
 
 impl KdfParams {
-    fn generate() -> Self {
-        use aes_gcm::aead::rand_core::RngCore;
-        let mut salt = [0u8; SALT_LEN];
-        OsRng.fill_bytes(&mut salt);
-        Self {
+    fn generate() -> Result<Self> {
+        let salt = random_bytes::<SALT_LEN>()?;
+        Ok(Self {
             alg: "argon2id".to_string(),
             version: 0x13,
             m_cost: ARGON2_M_COST_KIB,
             t_cost: ARGON2_T_COST,
             p_cost: ARGON2_P_COST,
             salt: hex::encode(salt),
-        }
+        })
     }
 
     /// Checks the parameters against fixed limits (so a tampered store can't
@@ -1250,12 +1249,19 @@ pub fn connection_binding(account: &AccountConfig) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// `N` bytes from the operating system's random number generator.
+fn random_bytes<const N: usize>() -> Result<[u8; N]> {
+    let mut bytes = [0u8; N];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| Error::credential(Kind::Unavailable, format!("The system random number generator failed: {}", e)))?;
+    Ok(bytes)
+}
+
 fn encrypt_secret(secret: &str, master_key: &[u8; 32]) -> Result<String> {
-    let key = Key::<Aes256Gcm>::from_slice(master_key);
-    let cipher = Aes256Gcm::new(key);
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*master_key));
+    let nonce = random_bytes::<12>()?;
     let ciphertext = cipher
-        .encrypt(&nonce, secret.as_bytes())
+        .encrypt(&Nonce::from(nonce), secret.as_bytes())
         .map_err(|e| Error::Keyring(format!("Encryption error: {}", e)))?;
 
     Ok(format!("{}{}:{}", ENC_PREFIX, hex::encode(nonce), hex::encode(ciphertext)))
@@ -1271,13 +1277,14 @@ fn decrypt_secret(encoded: &str, master_key: &[u8; 32]) -> Result<String> {
     let nonce_bytes = hex::decode(nonce_hex).map_err(|e| Error::Keyring(format!("Invalid nonce hex: {}", e)))?;
     let ciphertext_bytes =
         hex::decode(ciphertext_hex).map_err(|e| Error::Keyring(format!("Invalid ciphertext hex: {}", e)))?;
-    if nonce_bytes.len() != 12 {
-        return Err(Error::Keyring("Invalid nonce length for AES-GCM".to_string()));
-    }
+    let nonce: [u8; 12] = nonce_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Keyring("Invalid nonce length for AES-GCM".to_string()))?;
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master_key));
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*master_key));
     let decrypted_bytes = cipher
-        .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext_bytes.as_ref())
+        .decrypt(&Nonce::from(nonce), ciphertext_bytes.as_ref())
         .map_err(|e| Error::Keyring(format!("Decryption failed: {}", e)))?;
 
     String::from_utf8(decrypted_bytes).map_err(|e| Error::Keyring(format!("Corrupted UTF-8 secret: {}", e)))
