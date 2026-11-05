@@ -54,26 +54,35 @@ fn start_embedded_server(port: u16) -> Result<u16, String> {
 }
 
 /// Downloads in the window (attachments, .eml, mbox, logs): only from the
-/// verified server at `origin`, saved where the webview proposes (the
-/// Downloads folder, with ` (1)` etc. added rather than overwriting), and
+/// verified server at `origin`, saved in the folder the webview proposes
+/// (Downloads; the home folder when none is known, instead of the working
+/// directory) under a name no other file or running download has, and
 /// reported in the window. Without a handler the webview has no destination
-/// on Linux and the download is lost or lands in the working directory.
-fn handle_download<R: tauri::Runtime>(webview: &tauri::Webview<R>, event: DownloadEvent<'_>, origin: &str) -> bool {
+/// on Linux and the download is lost.
+fn handle_download<R: tauri::Runtime>(
+    webview: &tauri::Webview<R>,
+    event: DownloadEvent<'_>,
+    origin: &str,
+    reservations: &Reservations,
+) -> bool {
     match event {
         DownloadEvent::Requested { url, destination } => {
-            let allowed = url.origin().ascii_serialization() == origin;
-            if !allowed {
+            if url.origin().ascii_serialization() != origin {
                 eprintln!("Refused a download from outside the MailBackup server: {}", url);
-            } else if dirs::download_dir().is_none() {
+                return false;
+            }
+            let dir = match destination.parent() {
+                Some(dir) if destination.is_absolute() && dirs::download_dir().is_some() => dir.to_path_buf(),
                 // No Downloads folder (Linux without XDG user dirs): the
                 // webview would fall back to the working directory
-                if let (Some(home), Some(name)) = (dirs::home_dir(), destination.file_name()) {
-                    *destination = unused_path(&home, &name.to_string_lossy());
-                }
-            }
-            allowed
+                _ => dirs::home_dir().unwrap_or_default(),
+            };
+            let name = destination.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "download".into());
+            *destination = reservations.reserve(&dir, &name, url.as_str());
+            true
         }
-        DownloadEvent::Finished { path, success, .. } => {
+        DownloadEvent::Finished { url, path, success } => {
+            reservations.release(url.as_str());
             let message = match (success, path.as_deref()) {
                 (true, Some(path)) => format!("Saved {}", path.display()),
                 (true, None) => "Download saved".to_string(),
@@ -87,20 +96,35 @@ fn handle_download<R: tauri::Runtime>(webview: &tauri::Webview<R>, event: Downlo
     }
 }
 
-/// `dir/name`, or `dir/name (1)`, `dir/name (2)`… (before the extension)
-/// when that exists, the way the webviews name downloads.
-fn unused_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{}", ext)),
-        _ => (name, String::new()),
-    };
-    let mut path = dir.join(name);
-    let mut n = 1;
-    while path.exists() {
-        path = dir.join(format!("{} ({}){}", stem, n, ext));
-        n += 1;
+/// Destinations of downloads still running, by download URL (each carries
+/// its own single-use ticket, so URLs don't repeat). The webviews only
+/// avoid names already on disk, so two downloads of the same name started
+/// together would otherwise get the same destination.
+#[derive(Default)]
+struct Reservations(std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>>);
+
+impl Reservations {
+    /// `dir/name`, or `dir/name (1)`, `dir/name (2)`… (before the extension)
+    /// when that exists or is reserved; reserved for `key` until `release`.
+    fn reserve(&self, dir: &std::path::Path, name: &str, key: &str) -> std::path::PathBuf {
+        let mut reserved = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (stem, ext) = match name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{}", ext)),
+            _ => (name, String::new()),
+        };
+        let mut path = dir.join(name);
+        let mut n = 1;
+        while path.exists() || reserved.values().any(|p| *p == path) {
+            path = dir.join(format!("{} ({}){}", stem, n, ext));
+            n += 1;
+        }
+        reserved.insert(key.to_string(), path.clone());
+        path
     }
-    path
+
+    fn release(&self, key: &str) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+    }
 }
 
 fn show_main_window<R: tauri::Runtime>(manager: &impl Manager<R>) {
@@ -279,10 +303,11 @@ fn main() {
                     let origin = format!("http://127.0.0.1:{}", port);
                     let url = format!("{}/", origin).parse().expect("valid URL");
                     let download_origin = origin.clone();
+                    let reservations = Reservations::default();
                     WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                         // Never leave the verified server
                         .on_navigation(move |url| url.origin().ascii_serialization() == origin)
-                        .on_download(move |webview, event| handle_download(&webview, event, &download_origin))
+                        .on_download(move |webview, event| handle_download(&webview, event, &download_origin, &reservations))
                 }
                 // The error page downloads nothing
                 Err(_) => WebviewWindowBuilder::new(app, "main", WebviewUrl::App("gui-error.html".into()))
@@ -316,21 +341,54 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::unused_path;
+    use super::Reservations;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mailbackup-gui-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
-    fn unused_path_never_overwrites() {
-        let dir = std::env::temp_dir().join(format!("mailbackup-gui-unused-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(unused_path(&dir, "résumé.pdf"), dir.join("résumé.pdf"));
+    fn names_on_disk_are_never_reused() {
+        let dir = temp_dir("on-disk");
+        let r = Reservations::default();
         std::fs::write(dir.join("résumé.pdf"), b"").unwrap();
-        assert_eq!(unused_path(&dir, "résumé.pdf"), dir.join("résumé (1).pdf"));
         std::fs::write(dir.join("résumé (1).pdf"), b"").unwrap();
-        assert_eq!(unused_path(&dir, "résumé.pdf"), dir.join("résumé (2).pdf"));
+        assert_eq!(r.reserve(&dir, "résumé.pdf", "a"), dir.join("résumé (2).pdf"));
         std::fs::write(dir.join("README"), b"").unwrap();
-        assert_eq!(unused_path(&dir, "README"), dir.join("README (1)"));
+        assert_eq!(r.reserve(&dir, "README", "b"), dir.join("README (1)"));
         std::fs::write(dir.join(".hidden"), b"").unwrap();
-        assert_eq!(unused_path(&dir, ".hidden"), dir.join(".hidden (1)"));
+        assert_eq!(r.reserve(&dir, ".hidden", "c"), dir.join(".hidden (1)"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_downloads_of_one_name_get_distinct_destinations() {
+        let dir = temp_dir("concurrent");
+        let r = std::sync::Arc::new(Reservations::default());
+        // Many downloads of the same name start before any file exists
+        let paths: Vec<_> = (0..8)
+            .map(|i| {
+                let (r, dir) = (r.clone(), dir.clone());
+                std::thread::spawn(move || r.reserve(&dir, "report.pdf", &format!("url-{}", i)))
+            })
+            .map(|t| t.join().unwrap())
+            .collect();
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), 8, "{:?}", paths);
+        assert!(paths.contains(&dir.join("report.pdf")) && paths.contains(&dir.join("report (7).pdf")));
+
+        // A finished download frees its name only once its file is gone
+        std::fs::write(dir.join("report.pdf"), b"").unwrap();
+        let first = paths.iter().position(|p| *p == dir.join("report.pdf")).unwrap();
+        r.release(&format!("url-{}", first));
+        assert_eq!(r.reserve(&dir, "report.pdf", "late"), dir.join("report (8).pdf"));
+        // A failed download (no file) frees its name for the next one
+        let failed = paths.iter().position(|p| *p == dir.join("report (3).pdf")).unwrap();
+        r.release(&format!("url-{}", failed));
+        assert_eq!(r.reserve(&dir, "report.pdf", "retry"), dir.join("report (3).pdf"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
