@@ -391,7 +391,7 @@ fn legacy_keys_are_never_tried_on_a_version_2_store() {
     // Same with a passphrase store and the old SHA-256 of the passphrase
     let fx = Fixture::new();
     let old = legacy_passphrase_key("pw");
-    let mut kdf = serde_json::to_value(KdfParams::generate()).unwrap();
+    let mut kdf = serde_json::to_value(KdfParams::generate().unwrap()).unwrap();
     kdf["m_cost"] = serde_json::json!(64);
     kdf["t_cost"] = serde_json::json!(1);
     fx.write_raw(&serde_json::json!({

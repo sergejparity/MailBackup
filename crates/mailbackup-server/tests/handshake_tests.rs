@@ -129,9 +129,9 @@ fn a_squatter_using_the_public_page_token_is_rejected() {
 
     // The squatter answers exactly as a server whose secret was that token would
     let fake = fake_server(move |request, port| {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         let key = hex::decode(&token).unwrap();
-        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&key).unwrap();
+        let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(&key).unwrap();
         mac.update(format!("mailbackup-handshake:v1:{}:{}", port, nonce_of(request)).as_bytes());
         json_response(&format!(r#"{{"proof":"{}","port":{}}}"#, hex::encode(mac.finalize().into_bytes()), port))
     });
@@ -263,10 +263,10 @@ fn a_complete_answer_is_accepted_without_waiting_for_the_connection_to_close() {
 
     // Holds the secret, answers in full, then keeps the connection open
     let lingering = raw_server(move |mut stream| {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         let request = read_request(&mut stream);
         let port = stream.local_addr().unwrap().port();
-        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&secret).unwrap();
+        let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(&secret).unwrap();
         mac.update(format!("mailbackup-handshake:v1:{}:{}", port, nonce_of(&request)).as_bytes());
         let body = format!(r#"{{"proof":"{}","port":{}}}"#, hex::encode(mac.finalize().into_bytes()), port);
         let _ = stream.write_all(
