@@ -7,6 +7,7 @@
 //   renders in the app.
 // - #59: the script the tray's "Sync Now" runs in the window starts a sync of
 //   every account, like the window's own Sync Now button.
+// - #65: the desktop app's download folder and "ask every time" settings.
 //
 // Needs Node 18+, Playwright and a Chromium for it, and a built server:
 //   cargo build -p mailbackup-server
@@ -120,6 +121,35 @@ try {
     check((await fetch(url)).status === 401, `attachment ${i + 1}'s ticket works only once`);
   }
   check(page.url() === appUrl && (await page.title()) === titleBefore, 'the HTML attachment did not render in the app');
+
+  // --- #65: download settings ------------------------------------------------
+  await page.click('#btn-open-settings');
+  await page.click('#settings-modal .tab-btn[data-tab="tab-settings"]');
+  await page.waitForFunction(() => document.getElementById('settings-download-dir').value !== '');
+  const defaultDir = await page.inputValue('#settings-download-dir');
+  check(await page.isDisabled('#btn-reset-download-dir'), `the default folder is shown (${defaultDir}) with nothing to reset`);
+  check(!(await page.isChecked('#settings-ask-download')), '"Ask where to save" is off by default');
+  await page.click('#settings-ask-download');
+  await page.waitForFunction(() => document.getElementById('toast-message').textContent.includes('ask where'));
+  let saved = await page.evaluate(async () => (await (await fetch('/api/settings')).json()));
+  check(saved.ask_download_location === true, '"Ask where to save" is saved when ticked');
+  // A folder outside the allowed locations is refused by the server
+  const refused = await page.evaluate(async () =>
+    (await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ download_dir: '/etc' }) })).status);
+  check(refused === 400, `a folder outside the allowed locations is refused (${refused})`);
+  // The home folder is allowed; the card shows it after a reload of Settings
+  await page.evaluate(async (home) => {
+    await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ download_dir: home }) });
+    await loadSettings();
+  }, dir);
+  check((await page.inputValue('#settings-download-dir')).endsWith(dir.split('/').pop()) && !(await page.isDisabled('#btn-reset-download-dir')),
+    `a chosen folder is shown (${await page.inputValue('#settings-download-dir')}) and can be reset`);
+  await page.click('#btn-reset-download-dir');
+  await page.waitForFunction((d) => document.getElementById('settings-download-dir').value === d, defaultDir);
+  saved = await page.evaluate(async () => (await (await fetch('/api/settings')).json()));
+  check(saved.download_dir === '', '"Use Downloads folder" resets it');
+  await page.click('#settings-ask-download');
+  await page.keyboard.press('Escape');
 
   // --- #59: what the tray's Sync Now runs ------------------------------------
   const before = requests.length;

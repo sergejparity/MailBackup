@@ -186,6 +186,16 @@ pub struct GlobalSettings {
     /// deliberately shared with a group. New files are always owner-only.
     #[serde(default = "default_true")]
     pub tighten_permissions: bool,
+    /// Where the desktop app saves downloads (attachments, .eml, mbox, logs);
+    /// `None` is the system Downloads folder. Set through the API only to an
+    /// export location (see `safe_paths::PathPolicy::validate_download_dir`).
+    /// Like `ask_download_location`, written only when set, so configs that
+    /// don't use it are saved exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_dir: Option<PathBuf>,
+    /// The desktop app asks where to save each download.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ask_download_location: bool,
 }
 
 fn default_schedule() -> String {
@@ -218,6 +228,8 @@ impl Default for GlobalSettings {
             run_as_service: false,
             log_retention_days: default_log_retention_days(),
             tighten_permissions: true,
+            download_dir: None,
+            ask_download_location: false,
         }
     }
 }
@@ -267,6 +279,12 @@ pub fn resolve_path(input: &str) -> PathBuf {
         }
     }
     PathBuf::from(trimmed)
+}
+
+/// Where the desktop app saves downloads unless `settings.download_dir` says
+/// otherwise: the Downloads folder, else the home folder.
+pub fn default_download_dir() -> PathBuf {
+    dirs::download_dir().or_else(dirs::home_dir).unwrap_or_default()
 }
 
 pub fn default_export_dir() -> PathBuf {

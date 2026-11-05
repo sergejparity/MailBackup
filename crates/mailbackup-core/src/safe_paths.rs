@@ -116,6 +116,19 @@ impl PathPolicy {
         Ok(ExportTarget { path: target, exists })
     }
 
+    /// Validates a folder for the desktop app's downloads: an existing folder
+    /// inside the roots (use [`PathPolicy::for_exports`]).
+    pub fn validate_download_dir(&self, path: &Path) -> Result<PathBuf> {
+        require_absolute(path)?;
+        // Without the trailing separator `confine_dir` leaves on an existing folder
+        let dir: PathBuf = self.confine_dir(path)?.components().collect();
+        match std::fs::metadata(&dir) {
+            Ok(meta) if meta.is_dir() => Ok(dir),
+            Ok(_) => Err(invalid(format!("'{}' is not a folder.", dir.display()))),
+            Err(_) => Err(invalid(format!("'{}' doesn't exist.", dir.display()))),
+        }
+    }
+
     /// Validates a new archive data folder. It must be the current folder, not
     /// exist yet, or be empty (ignoring OS metadata files). An existing MailBackup
     /// archive is also accepted when it is used in place (`move_existing == false`).
@@ -397,6 +410,31 @@ mod tests {
         let ext = tmp.path().join("outside");
         let policy = PathPolicy::new([root, ext.clone()]);
         assert!(policy.validate_export_target(&ext.join("a.mbox")).is_ok());
+    }
+
+    #[test]
+    fn download_dir_must_be_an_existing_folder_inside_a_root() {
+        let (tmp, policy, root) = setup();
+        assert_eq!(policy.validate_download_dir(&root).unwrap(), root);
+        std::fs::create_dir(root.join("mail")).unwrap();
+        assert_eq!(policy.validate_download_dir(&root.join("mail")).unwrap(), root.join("mail"));
+
+        assert!(rejected(policy.validate_download_dir(&root.join("missing"))).contains("doesn't exist"));
+        std::fs::write(root.join("file"), b"x").unwrap();
+        rejected(policy.validate_download_dir(&root.join("file")));
+        rejected(policy.validate_download_dir(&tmp.path().join("outside")));
+        rejected(policy.validate_download_dir(&root.join("../outside")));
+        rejected(policy.validate_download_dir(Path::new("relative/dir")));
+        std::fs::create_dir(root.join(".hidden")).unwrap();
+        rejected(policy.validate_download_dir(&root.join(".hidden")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_dir_through_a_symlink_out_is_rejected() {
+        let (tmp, policy, root) = setup();
+        std::os::unix::fs::symlink(tmp.path().join("outside"), root.join("link")).unwrap();
+        rejected(policy.validate_download_dir(&root.join("link")));
     }
 
     #[test]
