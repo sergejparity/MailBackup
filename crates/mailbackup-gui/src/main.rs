@@ -271,13 +271,20 @@ impl Reservations {
         path
     }
 
-    /// Where to write a download the user chose to save as `chosen`: there,
-    /// or, when that file exists (the dialog asked before replacing it), a
-    /// `.part` file next to it that replaces it on success.
+    /// Where to write a download the user chose to save as `chosen`: there;
+    /// when another running download has that name, the next free name
+    /// (the dialog couldn't ask about a file that didn't exist yet); when
+    /// the file exists (the dialog asked before replacing it), a `.part`
+    /// file next to it that replaces it on success.
     fn reserve_chosen(&self, chosen: std::path::PathBuf, key: &str) -> std::path::PathBuf {
         let mut downloads = self.lock();
-        let (path, replaces) = match (chosen.exists(), chosen.parent(), chosen.file_name()) {
-            (true, Some(dir), Some(name)) => {
+        let in_flight = downloads.values().any(|d| match d {
+            Download::Running { path, replaces } => *path == chosen || replaces.as_ref() == Some(&chosen),
+            Download::Refused => false,
+        });
+        let (path, replaces) = match (chosen.parent(), chosen.file_name()) {
+            (Some(dir), Some(name)) if in_flight => (Self::free_path(&downloads, dir, &name.to_string_lossy()), None),
+            (Some(dir), Some(name)) if chosen.exists() => {
                 let part = format!("{}.part", name.to_string_lossy());
                 (Self::free_path(&downloads, dir, &part), Some(chosen))
             }
@@ -602,6 +609,26 @@ mod tests {
         assert!(matches!(r.finish("fail", None, false), Finish::Failed));
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
         assert!(!part.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_chosen_name_another_download_has_gets_the_next_free_name() {
+        let dir = temp_dir("chosen-in-flight");
+        let r = Reservations::default();
+        let target = dir.join("notes.txt");
+        // Two Save dialogs pick the same new name before either file exists
+        assert_eq!(r.reserve_chosen(target.clone(), "first"), target);
+        assert_eq!(r.reserve_chosen(target.clone(), "second"), dir.join("notes (1).txt"));
+        // Nor may a chosen name collide with an automatically named download
+        assert_eq!(r.reserve(&dir, "notes.txt", "auto"), dir.join("notes (2).txt"));
+        assert_eq!(r.reserve_chosen(dir.join("notes (2).txt"), "third"), dir.join("notes (2) (1).txt"));
+
+        // While a download replaces an existing file, another choosing it gets a free name
+        std::fs::write(dir.join("old.txt"), b"old").unwrap();
+        let part = r.reserve_chosen(dir.join("old.txt"), "replace");
+        assert_eq!(part, dir.join("old.txt.part"));
+        assert_eq!(r.reserve_chosen(dir.join("old.txt"), "again"), dir.join("old (1).txt"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
