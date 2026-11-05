@@ -72,10 +72,9 @@ impl<'a> MboxExporter<'a> {
         overwrite: bool,
     ) -> Result<usize> {
         let output_path = output_path.as_ref();
-        if let Some(parent) = output_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                crate::private_fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = output_path.parent()
+            && !parent.as_os_str().is_empty() {
+            crate::private_fs::create_dir_all(parent)?;
         }
 
         let mut options = crate::private_fs::options();

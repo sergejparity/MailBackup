@@ -258,13 +258,12 @@ pub fn default_config_path() -> PathBuf {
 
 pub fn resolve_path(input: &str) -> PathBuf {
     let trimmed = input.trim();
-    if trimmed.starts_with("~/") || trimmed == "~" {
-        if let Some(home) = dirs::home_dir() {
-            if trimmed == "~" {
-                return home;
-            } else {
-                return home.join(&trimmed[2..]);
-            }
+    if (trimmed.starts_with("~/") || trimmed == "~")
+        && let Some(home) = dirs::home_dir() {
+        if trimmed == "~" {
+            return home;
+        } else {
+            return home.join(&trimmed[2..]);
         }
     }
     PathBuf::from(trimmed)
@@ -388,10 +387,9 @@ impl AppConfig {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                crate::private_fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.exists() {
+            crate::private_fs::create_dir_all(parent)?;
         }
         let yaml = serde_norway::to_string(self)
             .map_err(|e| Error::Serialization(format!("Failed to serialize config: {}", e)))?;

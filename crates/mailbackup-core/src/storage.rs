@@ -162,18 +162,17 @@ impl StorageEngine {
         let absolute_path = base.join(&relative_path);
 
         // If target already exists and size matches, verify hash
-        if absolute_path.exists() {
-            if let Ok(existing_bytes) = std::fs::read(&absolute_path) {
-                let existing_hash = Self::compute_sha256(&existing_bytes);
-                if existing_hash == sha256 {
-                    debug!("File {} already exists and matches checksum", absolute_path.display());
-                    return Ok(StoredMessageInfo {
-                        relative_path,
-                        absolute_path,
-                        sha256,
-                        size_bytes,
-                    });
-                }
+        if absolute_path.exists()
+            && let Ok(existing_bytes) = std::fs::read(&absolute_path) {
+            let existing_hash = Self::compute_sha256(&existing_bytes);
+            if existing_hash == sha256 {
+                debug!("File {} already exists and matches checksum", absolute_path.display());
+                return Ok(StoredMessageInfo {
+                    relative_path,
+                    absolute_path,
+                    sha256,
+                    size_bytes,
+                });
             }
         }
 

@@ -58,10 +58,9 @@ pub fn find_server_executable() -> PathBuf {
     }
 
     // 2. If current binary is already mailbackup-server
-    if let Some(file_name) = current_exe.file_name() {
-        if file_name.to_string_lossy().starts_with("mailbackup-server") {
-            return current_exe;
-        }
+    if let Some(file_name) = current_exe.file_name()
+        && file_name.to_string_lossy().starts_with("mailbackup-server") {
+        return current_exe;
     }
 
     // 3. Check /usr/local/bin or standard paths

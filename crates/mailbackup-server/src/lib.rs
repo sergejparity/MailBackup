@@ -451,10 +451,9 @@ async fn serve(
         },
     )));
 
-    if let Err(e) = scheduler.start().await {
-        error!("Failed to start backup scheduler: {}", e);
-    } else {
-        info!("Background backup scheduler successfully activated");
+    match scheduler.start().await {
+        Ok(()) => info!("Background backup scheduler successfully activated"),
+        Err(e) => error!("Failed to start backup scheduler: {}", e),
     }
 
     let scheduler_arc = Arc::new(Mutex::new(scheduler));
@@ -982,13 +981,11 @@ async fn api_update_account(
         acc.trust_server_ids = trust;
     }
 
-    if archived.is_none() {
-        if let Some(pw) = new_password {
-            if let Err(e) = state.credentials.set_account_password(acc, &pw) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update secret: {}", e)).into_response();
-            }
+    if archived.is_none()
+        && let Some(pw) = new_password
+            && let Err(e) = state.credentials.set_account_password(acc, &pw) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update secret: {}", e)).into_response();
         }
-    }
 
     let updated_name = acc.name.clone();
     let updated_email = acc.email.clone();
@@ -1736,12 +1733,10 @@ fn pick_directory_native() -> Option<PathBuf> {
         if let Ok(output) = std::process::Command::new("zenity")
             .args(["--file-selection", "--directory", "--title=Select Export Destination Folder"])
             .output()
-        {
-            if output.status.success() {
-                let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path_str.is_empty() {
-                    return Some(PathBuf::from(path_str));
-                }
+            && output.status.success() {
+            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path_str.is_empty() {
+                return Some(PathBuf::from(path_str));
             }
         }
     }
@@ -1945,21 +1940,20 @@ async fn api_update_settings(
     }
 
     // 2. Relocate the database catalog if requested
-    if let Some(target_db) = requested_db {
-        if target_db != current_db {
-            if let Err(e) = state.db.relocate(&target_db, move_db) {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to relocate database: {}", e),
-                )
-                    .into_response();
-            }
-            mailbackup_core::event_log::log_event(
-                "DATABASE_MOVED",
-                &format!("Database catalog relocated from {} to {}", current_db.display(), target_db.display()),
-            );
-            resolved_db_path = Some(target_db);
+    if let Some(target_db) = requested_db
+        && target_db != current_db {
+        if let Err(e) = state.db.relocate(&target_db, move_db) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to relocate database: {}", e),
+            )
+                .into_response();
         }
+        mailbackup_core::event_log::log_event(
+            "DATABASE_MOVED",
+            &format!("Database catalog relocated from {} to {}", current_db.display(), target_db.display()),
+        );
+        resolved_db_path = Some(target_db);
     }
 
     let current_data_dir_str;

@@ -705,10 +705,9 @@ impl CredentialStore {
         // migration does; without a lock (read-only folder) just read.
         let lock = self.lock().ok();
         let Some(loaded) = self.load()? else { return Err(not_found(key)) };
-        if loaded.needs_migration && lock.is_some() {
-            if let Err(e) = self.save(&loaded.entries, Some(&loaded)) {
-                tracing::warn!("Couldn't upgrade the credential store (left unchanged): {}", e);
-            }
+        if loaded.needs_migration && lock.is_some()
+            && let Err(e) = self.save(&loaded.entries, Some(&loaded)) {
+            tracing::warn!("Couldn't upgrade the credential store (left unchanged): {}", e);
         }
         loaded.entries.get(key).cloned().ok_or_else(|| not_found(key))
     }
@@ -880,10 +879,9 @@ impl CredentialStore {
         })
         .map_err(|e| io_error(path, e))?;
 
-        if let Some(legacy) = loaded.and_then(|l| l.legacy_path.as_ref()) {
-            if legacy != path {
-                let _ = std::fs::remove_file(legacy);
-            }
+        if let Some(legacy) = loaded.and_then(|l| l.legacy_path.as_ref())
+            && legacy != path {
+            let _ = std::fs::remove_file(legacy);
         }
         Ok(())
     }
@@ -984,10 +982,9 @@ impl CredentialStore {
             .chain_update(serde_json::to_vec(kdf).unwrap_or_default())
             .finalize()
             .into();
-        if let Some((cached, key)) = *self.derived.lock().unwrap() {
-            if cached == fingerprint {
-                return Ok(key);
-            }
+        if let Some((cached, key)) = *self.derived.lock().unwrap()
+            && cached == fingerprint {
+            return Ok(key);
         }
         let params = argon2::Params::new(kdf.m_cost, kdf.t_cost, kdf.p_cost, Some(32))
             .map_err(|e| corrupt(format!("Invalid key derivation parameters: {}", e)))?;

@@ -236,10 +236,9 @@ pub fn parse_accounts_csv(content: &str) -> CsvImportReport {
         let raw_str = row.iter().collect::<Vec<_>>().join(if delimiter == b';' { ";" } else { "," });
 
         // Skip comment lines starting with #
-        if let Some(first_field) = row.get(0) {
-            if first_field.trim_start().starts_with('#') {
-                continue;
-            }
+        if let Some(first_field) = row.get(0)
+            && first_field.trim_start().starts_with('#') {
+            continue;
         }
 
         let email = email_idx.and_then(|idx| row.get(idx)).unwrap_or("").trim().to_string();

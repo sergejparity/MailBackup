@@ -89,10 +89,9 @@ impl FakeImap {
                 let connection = {
                     let mut mb = shared.lock().unwrap();
                     mb.connections += 1;
-                    if let Some((n, v)) = mb.uidvalidity_on_connection {
-                        if n == mb.connections {
-                            mb.uidvalidity = Some(v);
-                        }
+                    if let Some((n, v)) = mb.uidvalidity_on_connection
+                        && n == mb.connections {
+                        mb.uidvalidity = Some(v);
                     }
                     mb.connections
                 };
