@@ -3,7 +3,7 @@
 use std::time::Duration;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::webview::NewWindowResponse;
+use tauri::webview::{DownloadEvent, NewWindowResponse};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 /// The port of a server the window may show: a running MailBackup server of
@@ -51,6 +51,56 @@ fn start_embedded_server(port: u16) -> Result<u16, String> {
     ready_rx
         .recv_timeout(Duration::from_secs(30))
         .map_err(|_| "the server didn't start in time".to_string())?
+}
+
+/// Downloads in the window (attachments, .eml, mbox, logs): only from the
+/// verified server at `origin`, saved where the webview proposes (the
+/// Downloads folder, with ` (1)` etc. added rather than overwriting), and
+/// reported in the window. Without a handler the webview has no destination
+/// on Linux and the download is lost or lands in the working directory.
+fn handle_download<R: tauri::Runtime>(webview: &tauri::Webview<R>, event: DownloadEvent<'_>, origin: &str) -> bool {
+    match event {
+        DownloadEvent::Requested { url, destination } => {
+            let allowed = url.origin().ascii_serialization() == origin;
+            if !allowed {
+                eprintln!("Refused a download from outside the MailBackup server: {}", url);
+            } else if dirs::download_dir().is_none() {
+                // No Downloads folder (Linux without XDG user dirs): the
+                // webview would fall back to the working directory
+                if let (Some(home), Some(name)) = (dirs::home_dir(), destination.file_name()) {
+                    *destination = unused_path(&home, &name.to_string_lossy());
+                }
+            }
+            allowed
+        }
+        DownloadEvent::Finished { path, success, .. } => {
+            let message = match (success, path.as_deref()) {
+                (true, Some(path)) => format!("Saved {}", path.display()),
+                (true, None) => "Download saved".to_string(),
+                (false, _) => "The download failed".to_string(),
+            };
+            let js = format!("typeof showToast === 'function' && showToast({}, 6000)", serde_json::Value::from(message));
+            let _ = webview.eval(&js);
+            true
+        }
+        _ => true,
+    }
+}
+
+/// `dir/name`, or `dir/name (1)`, `dir/name (2)`… (before the extension)
+/// when that exists, the way the webviews name downloads.
+fn unused_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{}", ext)),
+        _ => (name, String::new()),
+    };
+    let mut path = dir.join(name);
+    let mut n = 1;
+    while path.exists() {
+        path = dir.join(format!("{} ({}){}", stem, n, ext));
+        n += 1;
+    }
+    path
 }
 
 fn show_main_window<R: tauri::Runtime>(manager: &impl Manager<R>) {
@@ -228,11 +278,15 @@ fn main() {
                 Ok(port) => {
                     let origin = format!("http://127.0.0.1:{}", port);
                     let url = format!("{}/", origin).parse().expect("valid URL");
+                    let download_origin = origin.clone();
                     WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                         // Never leave the verified server
                         .on_navigation(move |url| url.origin().ascii_serialization() == origin)
+                        .on_download(move |webview, event| handle_download(&webview, event, &download_origin))
                 }
-                Err(_) => WebviewWindowBuilder::new(app, "main", WebviewUrl::App("gui-error.html".into())),
+                // The error page downloads nothing
+                Err(_) => WebviewWindowBuilder::new(app, "main", WebviewUrl::App("gui-error.html".into()))
+                    .on_download(|_, _| false),
             };
             builder
                 // Nor through window.open / target=_blank: the UI opens no
@@ -258,4 +312,25 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unused_path;
+
+    #[test]
+    fn unused_path_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("mailbackup-gui-unused-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(unused_path(&dir, "résumé.pdf"), dir.join("résumé.pdf"));
+        std::fs::write(dir.join("résumé.pdf"), b"").unwrap();
+        assert_eq!(unused_path(&dir, "résumé.pdf"), dir.join("résumé (1).pdf"));
+        std::fs::write(dir.join("résumé (1).pdf"), b"").unwrap();
+        assert_eq!(unused_path(&dir, "résumé.pdf"), dir.join("résumé (2).pdf"));
+        std::fs::write(dir.join("README"), b"").unwrap();
+        assert_eq!(unused_path(&dir, "README"), dir.join("README (1)"));
+        std::fs::write(dir.join(".hidden"), b"").unwrap();
+        assert_eq!(unused_path(&dir, ".hidden"), dir.join(".hidden (1)"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
