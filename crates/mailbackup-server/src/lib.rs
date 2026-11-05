@@ -61,8 +61,22 @@ pub struct AppState {
     /// Single-use tickets for download links (see `tickets`).
     pub download_tickets: Arc<tickets::DownloadTickets>,
     /// Handshake secret proving to the desktop GUI that this is a genuine
-    /// server (see `runtime`). Never sent to clients.
-    pub identity: Arc<runtime::ServerIdentity>,
+    /// server (see `runtime`), with the port it listens on. Never sent to
+    /// clients.
+    pub identity: Arc<StdRwLock<runtime::ServerIdentity>>,
+    /// The HTTP listener, which the desktop app turns on and off with the
+    /// `web_server_enabled` setting; `None` when nothing can switch it
+    /// (tests).
+    pub web: Option<Arc<WebListener>>,
+}
+
+/// Marks a request the desktop app handed to [`Server::handle_in_process`]:
+/// its own window's, through a private protocol, never from the network
+/// (extensions can't be set by a client). `origin` is that protocol's
+/// origin, the only one such a request may send.
+#[derive(Clone, Debug)]
+pub struct InProcess {
+    pub origin: String,
 }
 
 pub mod runtime;
@@ -184,6 +198,18 @@ pub fn create_router(state: AppState) -> Router {
 async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let headers = req.headers();
 
+    // The desktop window through its private protocol: no Host to check,
+    // and only its own origin (token and tickets are still required below)
+    if let Some(in_process) = req.extensions().get::<InProcess>() {
+        let own_origin = headers
+            .get(header::ORIGIN)
+            .is_none_or(|o| o.to_str().is_ok_and(|o| o.eq_ignore_ascii_case(&in_process.origin)));
+        if !own_origin {
+            return (StatusCode::FORBIDDEN, "Cross-origin request rejected").into_response();
+        }
+        return guarded(&state, req, next).await;
+    }
+
     let allowed = {
         let cfg = state.config.read().await;
         match headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
@@ -210,6 +236,13 @@ async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> R
         }
     }
 
+    guarded(&state, req, next).await
+}
+
+/// The API token (or ticket) check and the security headers, for requests
+/// whose Host and Origin passed.
+async fn guarded(state: &AppState, req: Request, next: Next) -> Response {
+    let headers = req.headers();
     // The handshake proves the server's identity to a client that has no
     // credentials yet (see `runtime`); Host/Origin checks above still apply
     if req.uri().path().starts_with("/api/") && req.uri().path() != "/api/handshake" {
@@ -217,7 +250,7 @@ async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> R
             .get(API_TOKEN_HEADER)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|t| constant_time_eq(t.as_bytes(), state.api_token.as_bytes()));
-        if !valid && !ticket_authorizes(&state, &req) {
+        if !valid && !ticket_authorizes(state, &req) {
             return (StatusCode::UNAUTHORIZED, "Missing or invalid API token").into_response();
         }
     }
@@ -332,46 +365,65 @@ pub async fn run_server(
     }
 }
 
+/// Runs the server for headless/service mode: it always listens (a process
+/// without a window is reachable only this way) until Ctrl-C/SIGTERM.
 async fn serve(
     port_override: Option<u16>,
     config_path_override: Option<PathBuf>,
     report: &dyn Fn(std::result::Result<u16, String>),
 ) -> Result<()> {
-    let config_path = config_path_override.unwrap_or_else(mailbackup_core::config::default_config_path);
-    let config = AppConfig::load_or_create(Some(&config_path))?;
-    mailbackup_core::private_fs::tighten_at_startup(&config_path, &config.settings, true);
-    let db = Database::open(&config.db_path)?;
-    let storage = StorageEngine::new(&config.data_dir);
-    // Same store as the CLI and the background service for this config
-    let credentials = Arc::new(CredentialStore::for_config(&config_path, &config.settings));
-    // Settle "start a new archive" switches a crash left half-done
-    match mailbackup_core::archive::recover(&db, &credentials, &config_path) {
-        Ok(0) => {}
-        Ok(n) => info!("Settled {} interrupted account archive switch(es)", n),
-        Err(e) => error!("Couldn't check for interrupted account archive switches: {}", e),
-    }
-    let port = port_override.unwrap_or(config.settings.web_port);
-    let bind_ip = resolve_bind_ip(&config.settings.bind_address);
-    // Bind before anything else starts, so a taken port fails fast and
-    // nothing is published for it
-    let addr = SocketAddr::new(bind_ip, port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let port = listener.local_addr()?.port();
-    let addr = SocketAddr::new(bind_ip, port);
-    let identity = Arc::new(runtime::ServerIdentity::new(port));
+    let server = Server::build(config_path_override, port_override, true).await?;
+    let port = server.web().start().await?;
+    report(Ok(port));
+    shutdown_signal().await;
+    server.web().stop().await;
+    Ok(())
+}
 
-    let config_arc = Arc::new(RwLock::new(config.clone()));
-    let active_syncs = Arc::new(StdRwLock::new(HashMap::new()));
+/// A MailBackup server: catalog, archive, credentials, the backup scheduler
+/// and the router for the web UI and REST API. The router is reached over
+/// HTTP through [`Server::web`] and, in the desktop app, in-process through
+/// [`Server::handle_in_process`].
+pub struct Server {
+    router: Router,
+    web: Arc<WebListener>,
+}
 
-    // Initialize and start background scheduler
-    let mut scheduler = BackupScheduler::new(
-        Arc::new(config),
-        db.clone(),
-        storage.clone(),
-        credentials.clone(),
-    )
-    .await?
-    .with_config_path(&config_path);
+impl Server {
+    /// Opens the configuration (`config_path`, else the default) and starts
+    /// the scheduler. Doesn't listen yet. `port` overrides the configured
+    /// port; `always_listen` (headless/service mode) makes the listener
+    /// ignore `web_server_enabled`.
+    pub async fn build(config_path: Option<PathBuf>, port: Option<u16>, always_listen: bool) -> Result<Arc<Server>> {
+        let config_path = config_path.unwrap_or_else(mailbackup_core::config::default_config_path);
+        let config = AppConfig::load_or_create(Some(&config_path))?;
+        mailbackup_core::private_fs::tighten_at_startup(&config_path, &config.settings, true);
+        let db = Database::open(&config.db_path)?;
+        let storage = StorageEngine::new(&config.data_dir);
+        // Same store as the CLI and the background service for this config
+        let credentials = Arc::new(CredentialStore::for_config(&config_path, &config.settings));
+        // Settle "start a new archive" switches a crash left half-done
+        match mailbackup_core::archive::recover(&db, &credentials, &config_path) {
+            Ok(0) => {}
+            Ok(n) => info!("Settled {} interrupted account archive switch(es)", n),
+            Err(e) => error!("Couldn't check for interrupted account archive switches: {}", e),
+        }
+        let port = port.unwrap_or(config.settings.web_port);
+        let bind_ip = resolve_bind_ip(&config.settings.bind_address);
+        let identity = Arc::new(StdRwLock::new(runtime::ServerIdentity::new(port)));
+
+        let config_arc = Arc::new(RwLock::new(config.clone()));
+        let active_syncs = Arc::new(StdRwLock::new(HashMap::new()));
+
+        // Initialize and start background scheduler
+        let mut scheduler = BackupScheduler::new(
+            Arc::new(config),
+            db.clone(),
+            storage.clone(),
+            credentials.clone(),
+        )
+        .await?
+        .with_config_path(&config_path);
 
     let active_syncs_for_sched = active_syncs.clone();
     scheduler.set_status_listener(Some(Arc::new(
@@ -453,50 +505,203 @@ async fn serve(
     )));
 
     match scheduler.start().await {
-        Ok(()) => info!("Background backup scheduler successfully activated"),
-        Err(e) => error!("Failed to start backup scheduler: {}", e),
-    }
-
-    let scheduler_arc = Arc::new(Mutex::new(scheduler));
-
-    let state = AppState {
-        config: config_arc,
-        config_path,
-        db,
-        storage,
-        credentials,
-        scheduler: scheduler_arc,
-        active_syncs,
-        api_token: Arc::from(generate_api_token()),
-        download_tickets: Arc::new(tickets::DownloadTickets::default()),
-        identity: identity.clone(),
-    };
-
-    let config_dir = state.config_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
-    let app = create_router(state);
-    if !bind_ip.is_loopback() {
-        tracing::warn!(
-            "Web UI / REST API is exposed on {} (bind_address). It is reachable from other machines on the network.",
-            addr
-        );
-    }
-    info!("🚀 MailBackup Studio running on http://127.0.0.1:{} (listening on {})", port, addr);
-
-    // Published only now that the port is ours; removed again on shutdown
-    let published = match runtime::PublishedRuntime::publish(&config_dir, &identity) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            tracing::warn!("Couldn't publish the server runtime file in {}: {}", config_dir.display(), e);
-            None
+            Ok(()) => info!("Background backup scheduler successfully activated"),
+            Err(e) => error!("Failed to start backup scheduler: {}", e),
         }
-    };
-    report(Ok(port));
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
-    drop(published);
-    Ok(())
+
+        let config_dir = config_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+        let web = Arc::new(WebListener {
+            router: std::sync::OnceLock::new(),
+            bind_ip,
+            port,
+            always: always_listen,
+            config_dir,
+            identity: identity.clone(),
+            running: Mutex::new(None),
+        });
+        let state = AppState {
+            config: config_arc,
+            config_path,
+            db,
+            storage,
+            credentials,
+            scheduler: Arc::new(Mutex::new(scheduler)),
+            active_syncs,
+            api_token: Arc::from(generate_api_token()),
+            download_tickets: Arc::new(tickets::DownloadTickets::default()),
+            identity,
+            web: Some(web.clone()),
+        };
+        let router = create_router(state);
+        let _ = web.router.set(router.clone());
+        Ok(Arc::new(Server { router, web }))
+    }
+
+    /// The HTTP listener.
+    pub fn web(&self) -> &Arc<WebListener> {
+        &self.web
+    }
+
+    /// Answers a request of the desktop window's private protocol, whose
+    /// origin is `origin`, without any socket (see [`InProcess`]). The
+    /// response body is collected whole: the protocol takes no streams.
+    pub async fn handle_in_process(
+        &self,
+        req: axum::http::Request<Vec<u8>>,
+        origin: &str,
+    ) -> axum::http::Response<Vec<u8>> {
+        let mut req = req.map(Body::from);
+        req.extensions_mut().insert(InProcess { origin: origin.to_string() });
+        let res = match tower::ServiceExt::oneshot(self.router.clone(), req).await {
+            Ok(res) => res,
+            Err(never) => match never {},
+        };
+        let (parts, body) = res.into_parts();
+        match axum::body::to_bytes(body, usize::MAX).await {
+            Ok(bytes) => axum::http::Response::from_parts(parts, bytes.to_vec()),
+            Err(e) => {
+                error!("Couldn't read a response for the window: {}", e);
+                let mut res = axum::http::Response::new(b"Internal error".to_vec());
+                *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                res
+            }
+        }
+    }
 }
 
-/// Ctrl-C, or SIGTERM on unix (what systemd and launchd send).
+/// The server's HTTP listener on `bind_address:port`, started and stopped
+/// at runtime. While it listens, the runtime file proving the server's
+/// identity (see `runtime`) is published for its port.
+pub struct WebListener {
+    router: std::sync::OnceLock<Router>,
+    bind_ip: IpAddr,
+    port: u16,
+    always: bool,
+    config_dir: PathBuf,
+    identity: Arc<StdRwLock<runtime::ServerIdentity>>,
+    running: Mutex<Option<Listening>>,
+}
+
+struct Listening {
+    port: u16,
+    stop: tokio::sync::oneshot::Sender<()>,
+    /// Fires when the listening socket is closed (see [`ClosingListener`])
+    closed: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// The listening socket, with the runtime file published for it: both go
+/// away together when axum drops the listener, which it does as soon as a
+/// graceful shutdown starts, before open connections finish. That moment
+/// is reported on `closed`, so a stop needn't wait for requests in progress
+/// (one of which may be the request asking for the stop).
+struct ClosingListener {
+    /// Always `Some` until dropped
+    inner: Option<tokio::net::TcpListener>,
+    published: Option<runtime::PublishedRuntime>,
+    closed: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for ClosingListener {
+    fn drop(&mut self) {
+        // Fields are dropped only after this returns, so close the socket and
+        // remove the runtime file first: once `closed` fires, the port is free
+        // and a new runtime file for it can't be removed by this one
+        drop(self.inner.take());
+        drop(self.published.take());
+        if let Some(closed) = self.closed.take() {
+            let _ = closed.send(());
+        }
+    }
+}
+
+impl axum::serve::Listener for ClosingListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+
+    fn accept(&mut self) -> impl std::future::Future<Output = (Self::Io, Self::Addr)> + Send {
+        axum::serve::Listener::accept(self.inner.as_mut().expect("open until dropped"))
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.as_ref().expect("open until dropped").local_addr()
+    }
+}
+
+impl WebListener {
+    /// Starts listening (if not yet) and returns the bound port (a
+    /// configured port `0` binds a free one).
+    pub async fn start(&self) -> Result<u16> {
+        let mut running = self.running.lock().await;
+        if let Some(listening) = running.as_ref() {
+            return Ok(listening.port);
+        }
+        let router = self.router.get().cloned().ok_or_else(|| mailbackup_core::Error::Other("server not built".into()))?;
+        // Bind before anything is published, so a taken port fails fast and
+        // never replaces another instance's runtime file
+        let listener = tokio::net::TcpListener::bind(SocketAddr::new(self.bind_ip, self.port)).await?;
+        let port = listener.local_addr()?.port();
+        let identity = {
+            let mut identity = self.identity.write().unwrap_or_else(|e| e.into_inner());
+            *identity = identity.with_port(port);
+            identity.clone()
+        };
+        let addr = SocketAddr::new(self.bind_ip, port);
+        if !self.bind_ip.is_loopback() {
+            tracing::warn!(
+                "Web UI / REST API is exposed on {} (bind_address). It is reachable from other machines on the network.",
+                addr
+            );
+        }
+        info!("🚀 MailBackup Studio running on http://127.0.0.1:{} (listening on {})", port, addr);
+        // Published only now that the port is ours; removed again on stop
+        let published = match runtime::PublishedRuntime::publish(&self.config_dir, &identity) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!("Couldn't publish the server runtime file in {}: {}", self.config_dir.display(), e);
+                None
+            }
+        };
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let (closed_tx, closed) = tokio::sync::oneshot::channel::<()>();
+        let listener = ClosingListener { inner: Some(listener), published, closed: Some(closed_tx) };
+        // Requests in progress finish in this task after the socket closed
+        tokio::spawn(async move {
+            let shutdown = async move {
+                let _ = stopped.await;
+            };
+            if let Err(e) = axum::serve(listener, router).with_graceful_shutdown(shutdown).await {
+                error!("The web server stopped: {}", e);
+            }
+        });
+        *running = Some(Listening { port, stop, closed });
+        Ok(port)
+    }
+
+    /// Stops listening: returns once the port is closed and free again.
+    /// Requests in progress still finish, in the background; a request may
+    /// therefore stop the listener it came through. Holds the same lock as
+    /// [`WebListener::start`] throughout, so on/off changes apply in order.
+    pub async fn stop(&self) {
+        let mut running = self.running.lock().await;
+        if let Some(listening) = running.take() {
+            let _ = listening.stop.send(());
+            let _ = listening.closed.await;
+            info!("Web server on port {} stopped", listening.port);
+        }
+    }
+
+    /// The port it listens on, if it does.
+    pub async fn port(&self) -> Option<u16> {
+        self.running.lock().await.as_ref().map(|l| l.port)
+    }
+
+    /// Whether it listens whatever `web_server_enabled` says (headless and
+    /// service mode).
+    pub fn always_on(&self) -> bool {
+        self.always
+    }
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -527,10 +732,11 @@ struct HandshakeQuery {
 /// from its runtime file (see `runtime`). Needs no API token: the GUI must not
 /// disclose anything to a server it hasn't verified yet.
 async fn api_handshake(State(state): State<AppState>, Query(query): Query<HandshakeQuery>) -> impl IntoResponse {
-    match state.identity.proof(&query.nonce) {
+    let identity = state.identity.read().unwrap_or_else(|e| e.into_inner()).clone();
+    match identity.proof(&query.nonce) {
         Some(proof) => Json(serde_json::json!({
             "proof": proof,
-            "port": state.identity.port,
+            "port": identity.port,
             "version": env!("CARGO_PKG_VERSION"),
         }))
         .into_response(),
@@ -1866,6 +2072,13 @@ pub struct SettingsResponse {
     /// The folder downloads go to when `download_dir` is empty
     pub default_download_dir: String,
     pub ask_download_location: bool,
+    /// The `web_server_enabled` setting
+    pub web_server_enabled: bool,
+    /// The port the web server listens on right now, if it does
+    pub web_server_port: Option<u16>,
+    /// The web server can't be turned off here: this is the headless or
+    /// background-service server
+    pub web_server_always_on: bool,
     pub version: String,
 }
 
@@ -1893,6 +2106,12 @@ async fn api_get_settings(State(state): State<AppState>) -> impl IntoResponse {
         download_dir: cfg.settings.download_dir.as_deref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
         default_download_dir: mailbackup_core::config::default_download_dir().to_string_lossy().to_string(),
         ask_download_location: cfg.settings.ask_download_location,
+        web_server_enabled: cfg.settings.web_server_enabled,
+        web_server_port: match &state.web {
+            Some(web) => web.port().await,
+            None => None,
+        },
+        web_server_always_on: state.web.as_ref().is_some_and(|w| w.always_on()),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
     Json(res).into_response()
@@ -1911,6 +2130,9 @@ pub struct UpdateSettingsPayload {
     /// The desktop app's download folder; empty resets it to Downloads
     pub download_dir: Option<String>,
     pub ask_download_location: Option<bool>,
+    /// Turn the web server (browser access) on or off; see
+    /// `GlobalSettings::web_server_enabled`
+    pub web_server_enabled: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -1925,6 +2147,7 @@ pub struct UpdateSettingsResponse {
     pub log_retention_days: Option<u32>,
     pub download_dir: String,
     pub ask_download_location: bool,
+    pub web_server_enabled: bool,
     pub service_status: mailbackup_core::service::ServiceStatus,
     pub message: String,
 }
@@ -2038,6 +2261,7 @@ async fn api_update_settings(
     let current_log_retention;
     let current_download_dir;
     let current_ask_download;
+    let current_web_server;
 
     // 3. Update config and save to disk
     {
@@ -2098,6 +2322,30 @@ async fn api_update_settings(
             cfg.settings.download_dir = dir;
         }
 
+        if let Some(enabled) = payload.web_server_enabled
+            && enabled != cfg.settings.web_server_enabled {
+            if let Some(web) = state.web.as_ref().filter(|w| !w.always_on()) {
+                if enabled {
+                    if let Err(e) = web.start().await {
+                        return (
+                            StatusCode::CONFLICT,
+                            format!("Couldn't start the web server on port {}: {}", cfg.settings.web_port, e),
+                        )
+                            .into_response();
+                    }
+                } else {
+                    // Returns once the port is closed, without waiting for
+                    // requests in progress (this one may use the listener)
+                    web.stop().await;
+                }
+            }
+            cfg.settings.web_server_enabled = enabled;
+            mailbackup_core::event_log::log_event(
+                "SETTINGS_UPDATED",
+                &format!("Web server (browser access) {}", if enabled { "turned on" } else { "turned off" }),
+            );
+        }
+
         if let Some(ask) = payload.ask_download_location {
             cfg.settings.ask_download_location = ask;
             mailbackup_core::event_log::log_event(
@@ -2134,6 +2382,7 @@ async fn api_update_settings(
         current_log_retention = cfg.settings.log_retention_days;
         current_download_dir = cfg.settings.download_dir.as_deref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
         current_ask_download = cfg.settings.ask_download_location;
+        current_web_server = cfg.settings.web_server_enabled;
     }
 
     // 4. If storage or db location changed, reload scheduler
@@ -2167,6 +2416,7 @@ async fn api_update_settings(
         log_retention_days: current_log_retention,
         download_dir: current_download_dir,
         ask_download_location: current_ask_download,
+        web_server_enabled: current_web_server,
         service_status: mailbackup_core::service::get_service_status(),
         message: messages.join(" "),
     })
@@ -2486,7 +2736,8 @@ mod tests {
             active_syncs: Arc::new(StdRwLock::new(HashMap::new())),
             api_token: Arc::from(TOKEN),
             download_tickets: Arc::new(tickets::DownloadTickets::default()),
-            identity: Arc::new(runtime::ServerIdentity::new(8765)),
+            identity: Arc::new(StdRwLock::new(runtime::ServerIdentity::new(8765))),
+            web: None,
         }
     }
 
@@ -3143,6 +3394,187 @@ mod tests {
                 .unwrap(),
             None => builder.body(Body::empty()).unwrap(),
         }
+    }
+
+    // --- In-process requests and the web listener (issue #66) ---------------
+
+    const APP_ORIGIN: &str = "mailbackup://localhost";
+
+    fn in_process(mut req: HttpRequest<Body>) -> HttpRequest<Body> {
+        req.extensions_mut().insert(InProcess { origin: APP_ORIGIN.to_string() });
+        req
+    }
+
+    #[tokio::test]
+    async fn in_process_requests_need_no_host_but_their_own_origin_and_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).await;
+        let build = |token: bool, origin: Option<&str>| {
+            let mut b = HttpRequest::builder().uri("mailbackup://localhost/api/version");
+            if token {
+                b = b.header(API_TOKEN_HEADER, TOKEN);
+            }
+            if let Some(origin) = origin {
+                b = b.header(header::ORIGIN, origin);
+            }
+            b.body(Body::empty()).unwrap()
+        };
+        // No Host at all, as the private protocol sends
+        assert_eq!(status(&router, in_process(build(true, None))).await, StatusCode::OK);
+        assert_eq!(status(&router, in_process(build(true, Some(APP_ORIGIN)))).await, StatusCode::OK);
+        assert_eq!(status(&router, in_process(build(true, Some("MAILBACKUP://LOCALHOST")))).await, StatusCode::OK);
+        // Still a token (or ticket) for the API, and only its own origin
+        assert_eq!(status(&router, in_process(build(false, None))).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status(&router, in_process(build(true, Some("http://evil.example")))).await, StatusCode::FORBIDDEN);
+        assert_eq!(status(&router, in_process(build(true, Some("http://127.0.0.1:8765")))).await, StatusCode::FORBIDDEN);
+        // Security headers as for network requests
+        let res = router.clone().oneshot(in_process(build(true, None))).await.unwrap();
+        assert!(res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+        // The same request from the network (no marker) is held to Host/Origin
+        assert_eq!(status(&router, build(true, None)).await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            status(&router, HttpRequest::builder().uri("/api/version").header(header::HOST, "127.0.0.1:8765")
+                .header(header::ORIGIN, APP_ORIGIN).header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap()).await,
+            StatusCode::FORBIDDEN,
+            "a browser page can't claim the app's origin"
+        );
+    }
+
+    /// A router whose state has a web listener on a free port.
+    async fn router_with_listener(dir: &std::path::Path, always: bool) -> (Router, Arc<WebListener>) {
+        router_with_listener_on(dir, always, 0).await
+    }
+
+    async fn router_with_listener_on(dir: &std::path::Path, always: bool, port: u16) -> (Router, Arc<WebListener>) {
+        let mut state = test_state(dir, Vec::new()).await;
+        let web = Arc::new(WebListener {
+            router: std::sync::OnceLock::new(),
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            always,
+            config_dir: dir.to_path_buf(),
+            identity: state.identity.clone(),
+            running: Mutex::new(None),
+        });
+        state.web = Some(web.clone());
+        let router = create_router(state);
+        let _ = web.router.set(router.clone());
+        (router, web)
+    }
+
+    async fn settings_json(router: &Router) -> serde_json::Value {
+        let res = router.clone().oneshot(authed("GET", "/api/settings", None)).await.unwrap();
+        serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    // Multi-threaded: the handshake check blocks while the listener answers
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn web_access_turns_the_listener_on_and_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, web) = router_with_listener(dir.path(), false).await;
+        let port = web.start().await.unwrap();
+        assert_eq!(settings_json(&router).await["web_server_port"], port);
+        // Published for the GUI's verification while it listens
+        assert!(runtime::verify_genuine(dir.path(), port).is_some());
+
+        let put = |enabled: bool| json_request("PUT", "/api/settings", serde_json::json!({ "web_server_enabled": enabled }));
+        assert_eq!(status(&router, put(false)).await, StatusCode::OK);
+        // Closed by the time the request returns
+        assert_eq!(web.port().await, None);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "nothing listens");
+        assert!(!runtime::runtime_path(dir.path(), port).exists(), "runtime file removed");
+        let off = settings_json(&router).await;
+        assert_eq!(off["web_server_enabled"], false);
+        assert!(off["web_server_port"].is_null());
+        let saved = AppConfig::load_or_create(Some(&dir.path().join("config.yaml"))).unwrap();
+        assert!(!saved.settings.web_server_enabled);
+
+        assert_eq!(status(&router, put(true)).await, StatusCode::OK);
+        let port = web.port().await.expect("listening again");
+        assert!(runtime::verify_genuine(dir.path(), port).is_some(), "the handshake proves the new port");
+        assert_eq!(settings_json(&router).await["web_server_port"], port);
+        web.stop().await;
+    }
+
+    // Multi-threaded: the handshake check blocks while the listener answers
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rapid_off_and_on_end_in_the_last_state_on_the_same_port() {
+        let dir = tempfile::tempdir().unwrap();
+        // A fixed port, so each start must rebind the one the stop released
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (router, web) = router_with_listener_on(dir.path(), false, port).await;
+        assert_eq!(web.start().await.unwrap(), port);
+
+        // "Off" over real HTTP through the listener it turns off: returns,
+        // rather than waiting for itself
+        let off_over_http = move || {
+            use std::io::{Read, Write};
+            let body = r#"{"web_server_enabled":false}"#;
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+            write!(
+                stream,
+                "PUT /api/settings HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                port, API_TOKEN_HEADER, TOKEN, body.len(), body
+            )
+            .unwrap();
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            response.lines().next().unwrap_or_default().to_string()
+        };
+        let on = || json_request("PUT", "/api/settings", serde_json::json!({ "web_server_enabled": true }));
+        for round in 0..5 {
+            let status_line = tokio::task::spawn_blocking(off_over_http).await.unwrap();
+            assert!(status_line.contains("200"), "round {}: {}", round, status_line);
+            // Immediately on again: the port is already free
+            assert_eq!(status(&router, on()).await, StatusCode::OK, "round {}", round);
+            assert_eq!(web.port().await, Some(port), "round {}", round);
+            assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(), "round {}: listening", round);
+        }
+
+        // Concurrent requests: whichever runs last decides, and the listener
+        // matches the saved setting
+        let put = |enabled: bool| json_request("PUT", "/api/settings", serde_json::json!({ "web_server_enabled": enabled }));
+        for _ in 0..5 {
+            let (a, b) = tokio::join!(status(&router, put(false)), status(&router, put(true)));
+            assert_eq!((a, b), (StatusCode::OK, StatusCode::OK));
+            let enabled = settings_json(&router).await["web_server_enabled"].as_bool().unwrap();
+            assert_eq!(web.port().await.is_some(), enabled, "the listener matches the saved setting");
+        }
+        web.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_closed_signal_comes_after_the_socket_and_runtime_file_are_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        for _ in 0..20 {
+            let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = socket.local_addr().unwrap().port();
+            let identity = runtime::ServerIdentity::new(port);
+            let published = runtime::PublishedRuntime::publish(dir.path(), &identity).unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let listener = ClosingListener { inner: Some(socket), published: Some(published), closed: Some(tx) };
+            // Dropped on another thread while this one waits for the signal
+            let dropper = std::thread::spawn(move || drop(listener));
+            rx.await.unwrap();
+            assert!(!runtime::runtime_path(dir.path(), port).exists(), "runtime file gone before the signal");
+            assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(), "port free before the signal");
+            dropper.join().unwrap();
+        }
+    }
+
+    // Multi-threaded: the handshake check blocks while the listener answers
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_service_listener_ignores_the_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (router, web) = router_with_listener(dir.path(), true).await;
+        let port = web.start().await.unwrap();
+        assert_eq!(settings_json(&router).await["web_server_always_on"], true);
+        let off = json_request("PUT", "/api/settings", serde_json::json!({ "web_server_enabled": false }));
+        assert_eq!(status(&router, off).await, StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(web.port().await, Some(port), "still listening");
+        web.stop().await;
     }
 
     fn anonymous(method: &str, uri: &str) -> HttpRequest<Body> {

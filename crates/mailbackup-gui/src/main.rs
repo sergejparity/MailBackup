@@ -1,60 +1,79 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::time::Duration;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::{DownloadEvent, NewWindowResponse};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
-/// The port of a server the window may show: a running MailBackup server of
-/// this user that proves itself (see `mailbackup_server::runtime`), else one
-/// started here. A process holding the port that can't prove itself is never
-/// shown; the embedded server then runs on a free port instead.
-fn genuine_server(port: u16) -> Result<u16, String> {
+/// The private protocol the window loads the UI through when the server
+/// runs in this process (issue #66): no socket, so nothing else can reach it.
+const PROTOCOL: &str = "mailbackup";
+
+/// The origin of [`PROTOCOL`] pages, which differs by platform (Tauri maps
+/// custom protocols to `http://<name>.localhost` on Windows).
+#[cfg(windows)]
+const PROTOCOL_ORIGIN: &str = "http://mailbackup.localhost";
+#[cfg(not(windows))]
+const PROTOCOL_ORIGIN: &str = "mailbackup://localhost";
+
+/// The server built in this process, for the protocol handler.
+static SERVER: std::sync::OnceLock<std::sync::Arc<mailbackup_server::Server>> = std::sync::OnceLock::new();
+
+/// The URL the window shows: a running MailBackup server of this user on
+/// `port` that proves itself (the background service; see
+/// `mailbackup_server::runtime`), shown over loopback so two schedulers
+/// never share one archive; else a server built here, shown through
+/// [`PROTOCOL`] and listening on `port` only while `web_server_enabled`.
+fn ui_url(port: u16) -> Result<tauri::Url, String> {
     let config_path = mailbackup_core::config::default_config_path();
     let config_dir = config_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
     if mailbackup_server::runtime::verify_genuine(&config_dir, port).is_some() {
         println!("Using the MailBackup server already running on port {}", port);
-        return Ok(port);
+        return format!("http://127.0.0.1:{}/", port).parse().map_err(|e| format!("{}", e));
     }
-    let bound = match start_embedded_server(port) {
-        Ok(bound) => bound,
-        Err(e) => {
-            eprintln!(
-                "Port {} is in use by a process that isn't a verified MailBackup server ({}). Starting on a free port instead.",
-                port, e
-            );
-            start_embedded_server(0)?
+    let server = tauri::async_runtime::block_on(mailbackup_server::Server::build(None, Some(port), false))
+        .map_err(|e| e.to_string())?;
+    let web_enabled = mailbackup_core::config::AppConfig::load_or_create(None)
+        .map(|cfg| cfg.settings.web_server_enabled)
+        .unwrap_or(true);
+    if web_enabled {
+        // Browser access only; the window doesn't need the port
+        if let Err(e) = tauri::async_runtime::block_on(server.web().start()) {
+            eprintln!("Browser access is unavailable: port {} couldn't be opened ({})", port, e);
         }
-    };
-    mailbackup_server::runtime::verify_genuine(&config_dir, bound)
-        .map(|_| bound)
-        .ok_or_else(|| format!("The server on port {} couldn't be verified", bound))
+    } else {
+        println!("Web server off: no port is opened");
+    }
+    let _ = SERVER.set(server);
+    format!("{}/", PROTOCOL_ORIGIN).parse().map_err(|e| format!("{}", e))
 }
 
-/// Starts the server on its own thread; returns the port it bound (`0` binds
-/// a free one) or why it couldn't start.
-fn start_embedded_server(port: u16) -> Result<u16, String> {
-    println!("Starting embedded background server on port {}...", port);
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime for background server");
-        rt.block_on(async move {
-            if let Err(e) = mailbackup_server::run_server(Some(port), None, Some(ready_tx)).await {
-                eprintln!("Background server error: {}", e);
-            }
-        });
+/// Answers a [`PROTOCOL`] request from the in-process server.
+fn serve_protocol_request(request: tauri::http::Request<Vec<u8>>, responder: tauri::UriSchemeResponder) {
+    let Some(server) = SERVER.get().cloned() else {
+        let mut res = tauri::http::Response::new(b"MailBackup isn't running in this window".to_vec());
+        *res.status_mut() = tauri::http::StatusCode::SERVICE_UNAVAILABLE;
+        responder.respond(res);
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        responder.respond(server.handle_in_process(request, PROTOCOL_ORIGIN).await);
     });
-    ready_rx
-        .recv_timeout(Duration::from_secs(30))
-        .map_err(|_| "the server didn't start in time".to_string())?
 }
+
+/// Whether `url` belongs to the UI at `ui` (same scheme, host and port;
+/// `Url::origin` can't compare custom-protocol URLs, which are opaque).
+fn same_origin(url: &tauri::Url, ui: &tauri::Url) -> bool {
+    url.scheme() == ui.scheme() && url.host_str() == ui.host_str() && url.port_or_known_default() == ui.port_or_known_default()
+}
+
+/// The URL of the UI the window shows, for checks outside the window
+/// builder (tray).
+struct UiUrl(tauri::Url);
 
 /// Downloads in the window (attachments, .eml, mbox, logs): only from the
-/// verified server at `origin`, and reported in the window. Without a
+/// UI at `ui` (the verified or in-process server), and reported in the
+/// window. Without a
 /// handler the webview has no destination on Linux and the download is lost.
 ///
 /// Where they go (issue #65): with `ask_download_location`, where the user
@@ -64,73 +83,201 @@ fn start_embedded_server(port: u16) -> Result<u16, String> {
 fn handle_download<R: tauri::Runtime>(
     webview: &tauri::Webview<R>,
     event: DownloadEvent<'_>,
-    origin: &str,
+    ui: &tauri::Url,
     reservations: &Reservations,
 ) -> bool {
     match event {
         DownloadEvent::Requested { url, destination } => {
-            if url.origin().ascii_serialization() != origin {
+            if !same_origin(&url, ui) {
                 eprintln!("Refused a download from outside the MailBackup server: {}", url);
                 reservations.refuse(url.as_str());
                 return false;
             }
-            // Read on each download, so a change in Settings applies at once
-            let settings = mailbackup_core::config::AppConfig::load_or_create(None)
-                .map(|cfg| cfg.settings)
-                .unwrap_or_default();
-            let dir = download_folder(settings.download_dir.as_deref(), destination);
             let name = destination.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "download".into());
-            if settings.ask_download_location {
-                match save_dialog(&dir, &name) {
-                    SaveChoice::Chosen(path) => {
-                        *destination = reservations.reserve_chosen(path, url.as_str());
-                        return true;
-                    }
-                    SaveChoice::Cancelled => {
-                        reservations.refuse(url.as_str());
-                        toast(webview, "Download cancelled");
-                        return false;
-                    }
-                    SaveChoice::Unavailable => eprintln!("No Save dialog available; saving to {}", dir.display()),
+            match choose_destination(&name, Some(destination), reservations, url.as_str()) {
+                Some(path) => {
+                    *destination = path;
+                    true
+                }
+                None => {
+                    let _ = webview.eval(toast_script("Download cancelled"));
+                    false
                 }
             }
-            *destination = reservations.reserve(&dir, &name, url.as_str());
-            true
         }
         DownloadEvent::Finished { url, path, success } => {
-            let message = match reservations.finish(url.as_str(), path, success) {
-                // Refused or cancelled above, which said so already
-                Finish::Refused => return true,
-                Finish::Saved(Some(path)) => format!("Saved {}", path.display()),
-                Finish::Saved(None) => "Download saved".to_string(),
-                Finish::Failed => "The download failed".to_string(),
-            };
-            toast(webview, &message);
+            if let Some(message) = finish_message(reservations.finish(url.as_str(), path, success)) {
+                let _ = webview.eval(toast_script(&message));
+            }
             true
         }
         _ => true,
     }
 }
 
-/// Shows `message` in the window for 6 seconds.
-fn toast<R: tauri::Runtime>(webview: &tauri::Webview<R>, message: &str) {
-    let js = format!("typeof showToast === 'function' && showToast({}, 6000)", serde_json::Value::from(message));
-    let _ = webview.eval(&js);
+/// Where a download named `name` goes, reserved for `key` (see the
+/// settings in `handle_download`); `None` when the user cancelled the Save
+/// dialog (then `key` is refused). May show a modal dialog. `proposed` is
+/// the webview's own choice, if any.
+fn choose_destination(
+    name: &str,
+    proposed: Option<&std::path::Path>,
+    reservations: &Reservations,
+    key: &str,
+) -> Option<std::path::PathBuf> {
+    // Read on each download, so a change in Settings applies at once
+    let settings = mailbackup_core::config::AppConfig::load_or_create(None)
+        .map(|cfg| cfg.settings)
+        .unwrap_or_default();
+    let dir = download_folder(settings.download_dir.as_deref(), proposed);
+    if settings.ask_download_location {
+        match save_dialog(&dir, name) {
+            SaveChoice::Chosen(path) => return Some(reservations.reserve_chosen(path, key)),
+            SaveChoice::Cancelled => {
+                reservations.refuse(key);
+                return None;
+            }
+            SaveChoice::Unavailable => eprintln!("No Save dialog available; saving to {}", dir.display()),
+        }
+    }
+    Some(reservations.reserve(&dir, name, key))
+}
+
+/// The toast for a download's end; none for a refused or cancelled one,
+/// which said so already.
+fn finish_message(finish: Finish) -> Option<String> {
+    match finish {
+        Finish::Refused => None,
+        Finish::Saved(Some(path)) => Some(format!("Saved {}", path.display())),
+        Finish::Saved(None) => Some("Download saved".to_string()),
+        Finish::Failed => Some("The download failed".to_string()),
+    }
+}
+
+/// Script showing `message` in the window for 6 seconds.
+fn toast_script(message: &str) -> String {
+    format!("typeof showToast === 'function' && showToast({}, 6000)", serde_json::Value::from(message))
+}
+
+/// A download of the in-process UI (issue #66): WebKitGTK can't download
+/// from a custom protocol, so the window's navigation to a download URL is
+/// stopped and the file fetched from the in-process server here, then saved
+/// like any download (folder, Save dialog, free names, toast).
+fn download_in_process<R: tauri::Runtime>(app: tauri::AppHandle<R>, url: tauri::Url, reservations: std::sync::Arc<Reservations>) {
+    tauri::async_runtime::spawn(async move {
+        let notify = |message: &str| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.eval(toast_script(message));
+            }
+        };
+        let Some(server) = SERVER.get().cloned() else {
+            return;
+        };
+        let request = match tauri::http::Request::get(url.as_str()).body(Vec::new()) {
+            Ok(request) => request,
+            Err(_) => return,
+        };
+        let response = server.handle_in_process(request, PROTOCOL_ORIGIN).await;
+        if !response.status().is_success() {
+            eprintln!("Download of {} failed: {}", url.path(), response.status());
+            notify("The download failed");
+            return;
+        }
+        let name = response
+            .headers()
+            .get(tauri::http::header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(disposition_filename)
+            .unwrap_or_else(|| "download".to_string());
+        let key = url.as_str().to_string();
+        // The Save dialog blocks, so not on the async runtime
+        let chosen = {
+            let (reservations, key) = (reservations.clone(), key.clone());
+            tauri::async_runtime::spawn_blocking(move || choose_destination(&name, None, &reservations, &key)).await
+        };
+        let Ok(Some(path)) = chosen else {
+            reservations.finish(&key, None, false);
+            notify("Download cancelled");
+            return;
+        };
+        match write_new_file(&path, response.body()) {
+            Ok(()) => {
+                if let Some(message) = finish_message(reservations.finish(&key, Some(path), true)) {
+                    notify(&message);
+                }
+            }
+            Err(e) => {
+                eprintln!("Couldn't save {}: {}", path.display(), e);
+                // Whatever is at `path` now isn't ours to remove
+                reservations.abandon(&key);
+                notify("The download failed");
+            }
+        }
+    });
+}
+
+/// Writes `bytes` to a new file at `path`. Fails if anything exists there
+/// (another program may have created it since the name was chosen), and
+/// then leaves it alone; a file it created but couldn't fill is removed.
+fn write_new_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    if let Err(e) = std::io::Write::write_all(&mut file, bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// The file name a `Content-Disposition` header gives (`filename*` in
+/// UTF-8 first, then `filename`), reduced to a plain name: no folders.
+fn disposition_filename(value: &str) -> Option<String> {
+    let param = |key: &str| {
+        value.split(';').map(str::trim).find_map(|p| {
+            let (k, v) = p.split_once('=')?;
+            k.trim().eq_ignore_ascii_case(key).then(|| v.trim().to_string())
+        })
+    };
+    let decoded = param("filename*")
+        .and_then(|v| {
+            let encoded = v.strip_prefix("UTF-8''").or_else(|| v.strip_prefix("utf-8''"))?.to_string();
+            percent_decode(&encoded)
+        })
+        .or_else(|| param("filename").map(|v| v.trim_matches('"').to_string()))?;
+    let name = decoded.rsplit(['/', '\\']).next().unwrap_or("").trim().to_string();
+    (!name.is_empty() && name != "." && name != "..").then_some(name)
+}
+
+fn percent_decode(encoded: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// The folder downloads go to: the configured one while it is a folder,
-/// else the one the webview proposes (Downloads), else the home folder
-/// (Linux without XDG user dirs, where the webview would use the working
-/// directory).
-fn download_folder(configured: Option<&std::path::Path>, proposed: &std::path::Path) -> std::path::PathBuf {
+/// else the one the webview proposes (Downloads), else the default
+/// (Downloads, or the home folder on Linux without XDG user dirs, where the
+/// webview would use the working directory).
+fn download_folder(configured: Option<&std::path::Path>, proposed: Option<&std::path::Path>) -> std::path::PathBuf {
     if let Some(dir) = configured {
         if dir.is_dir() {
             return dir.to_path_buf();
         }
         eprintln!("The download folder {} doesn't exist; using the default", dir.display());
     }
-    match proposed.parent() {
-        Some(dir) if proposed.is_absolute() && dirs::download_dir().is_some() => dir.to_path_buf(),
+    match proposed.and_then(|p| p.parent().filter(|_| p.is_absolute())) {
+        Some(dir) if dirs::download_dir().is_some() => dir.to_path_buf(),
         _ => mailbackup_core::config::default_download_dir(),
     }
 }
@@ -294,6 +441,12 @@ impl Reservations {
         path
     }
 
+    /// Ends the download `key` without touching any file: none of them is
+    /// known to be its own (it couldn't create its file).
+    fn abandon(&self, key: &str) {
+        self.lock().remove(key);
+    }
+
     fn refuse(&self, key: &str) {
         self.lock().insert(key.to_string(), Download::Refused);
     }
@@ -305,10 +458,13 @@ impl Reservations {
         match entry {
             Some(Download::Refused) => Finish::Refused,
             Some(Download::Running { path: part, replaces: Some(target) }) => {
+                // On failure the `.part` file is left alone: whoever wrote it
+                // removes their own partial file (the webviews do, and
+                // `write_new_file` does), and if the failure was that another
+                // program had created it first, it isn't ours
                 if success && std::fs::rename(&part, &target).is_ok() {
                     Finish::Saved(Some(target))
                 } else {
-                    let _ = std::fs::remove_file(&part);
                     Finish::Failed
                 }
             }
@@ -335,9 +491,12 @@ fn sync_from_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
-    // The UI is served from 127.0.0.1; the error page is an app page
-    // (tauri://localhost, or http://tauri.localhost on Windows)
-    let on_server = window.url().is_ok_and(|url| url.host_str() == Some("127.0.0.1"));
+    // Not on the error page (an app page: tauri://localhost, or
+    // http://tauri.localhost on Windows)
+    let on_server = match (window.url(), app.try_state::<UiUrl>()) {
+        (Ok(url), Some(ui)) => same_origin(&url, &ui.0),
+        _ => false,
+    };
     if !on_server {
         show_main_window(app);
         return;
@@ -473,9 +632,13 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main_window(app);
         }))
+        // Answered only once `setup` built the server (else 503)
+        .register_asynchronous_uri_scheme_protocol(PROTOCOL, |_ctx, request, responder| {
+            serve_protocol_request(request, responder)
+        })
         .setup(move |app| {
-            let server = genuine_server(port_num);
-            if let Err(e) = &server {
+            let ui = ui_url(port_num);
+            if let Err(e) = &ui {
                 eprintln!("Not showing the MailBackup UI: {}", e);
             }
 
@@ -487,18 +650,37 @@ fn main() {
 
             build_tray(app)?;
 
-            // The window is created here, only for the verified server. It
-            // gets no capabilities (no IPC): the UI only talks HTTP to it.
-            let builder = match server {
-                Ok(port) => {
-                    let origin = format!("http://127.0.0.1:{}", port);
-                    let url = format!("{}/", origin).parse().expect("valid URL");
-                    let download_origin = origin.clone();
-                    let reservations = Reservations::default();
-                    WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
-                        // Never leave the verified server
-                        .on_navigation(move |url| url.origin().ascii_serialization() == origin)
-                        .on_download(move |webview, event| handle_download(&webview, event, &download_origin, &reservations))
+            // The window is created here, only for the verified or in-process
+            // server. It gets no capabilities (no IPC): the UI only talks
+            // HTTP (or the private protocol) to it.
+            let builder = match ui {
+                Ok(url) => {
+                    app.manage(UiUrl(url.clone()));
+                    let (nav_ui, download_ui) = (url.clone(), url.clone());
+                    let reservations = std::sync::Arc::new(Reservations::default());
+                    let nav_reservations = reservations.clone();
+                    let in_process = SERVER.get().is_some();
+                    let handle = app.handle().clone();
+                    let window_url = if in_process { WebviewUrl::CustomProtocol(url) } else { WebviewUrl::External(url) };
+                    WebviewWindowBuilder::new(app, "main", window_url)
+                        // Never leave the UI; the in-process UI's downloads
+                        // are done here (see `download_in_process`)
+                        .on_navigation(move |url| {
+                            // The mail body's sandboxed iframe (srcdoc): WebKitGTK
+                            // asks for frames too, and these load nothing
+                            if url.as_str() == "about:srcdoc" || url.as_str() == "about:blank" {
+                                return true;
+                            }
+                            if !same_origin(url, &nav_ui) {
+                                return false;
+                            }
+                            if in_process && mailbackup_server::tickets::is_download_path(url.path()) {
+                                download_in_process(handle.clone(), url.clone(), nav_reservations.clone());
+                                return false;
+                            }
+                            true
+                        })
+                        .on_download(move |webview, event| handle_download(&webview, event, &download_ui, &reservations))
                 }
                 // The error page downloads nothing
                 Err(_) => WebviewWindowBuilder::new(app, "main", WebviewUrl::App("gui-error.html".into()))
@@ -603,12 +785,13 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
         assert!(!part.exists());
 
-        // A failed replacement leaves the original as it was
+        // A failed replacement leaves the original as it was, and doesn't
+        // remove a `.part` file it can't know to be its own
         let part = r.reserve_chosen(target.clone(), "fail");
-        std::fs::write(&part, b"partial").unwrap();
+        std::fs::write(&part, b"another program's").unwrap();
         assert!(matches!(r.finish("fail", None, false), Finish::Failed));
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
-        assert!(!part.exists());
+        assert_eq!(std::fs::read(&part).unwrap(), b"another program's");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -629,6 +812,49 @@ mod tests {
         let part = r.reserve_chosen(dir.join("old.txt"), "replace");
         assert_eq!(part, dir.join("old.txt.part"));
         assert_eq!(r.reserve_chosen(dir.join("old.txt"), "again"), dir.join("old (1).txt"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_names_from_content_disposition() {
+        use super::disposition_filename as name;
+        assert_eq!(name("attachment; filename=\"r_sum_.pdf\"; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf").as_deref(), Some("résumé.pdf"));
+        assert_eq!(name("attachment; filename=\"1.eml\"").as_deref(), Some("1.eml"));
+        assert_eq!(name("attachment; filename*=UTF-8''..%2F..%2Fevil.sh").as_deref(), Some("evil.sh"));
+        assert_eq!(name("attachment; filename=\"a\\\\b.txt\"").as_deref(), Some("b.txt"));
+        assert_eq!(name("attachment; filename*=UTF-8''%2E%2E").as_deref(), None);
+        assert_eq!(name("attachment").as_deref(), None);
+        assert_eq!(name("attachment; filename*=UTF-8''%ZZ; filename=\"x.bin\"").as_deref(), Some("x.bin"));
+    }
+
+    #[test]
+    fn a_download_never_removes_a_file_it_did_not_create() {
+        use super::write_new_file;
+        let dir = temp_dir("write-new");
+        let r = Reservations::default();
+        // Reserved, but another program creates the name before the write
+        let path = r.reserve(&dir, "report.pdf", "key");
+        std::fs::write(&path, b"someone else's").unwrap();
+        let err = write_new_file(&path, b"ours").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        r.abandon("key");
+        assert_eq!(std::fs::read(&path).unwrap(), b"someone else's", "left as it was");
+        // Its reservation is gone; the name stays taken through the file
+        assert_eq!(r.reserve(&dir, "report.pdf", "next"), dir.join("report (1).pdf"));
+
+        // The same for a `.part` file replacing a chosen file
+        std::fs::write(dir.join("keep.txt"), b"original").unwrap();
+        let part = r.reserve_chosen(dir.join("keep.txt"), "replace");
+        std::fs::write(&part, b"another program's").unwrap();
+        assert!(write_new_file(&part, b"ours").is_err());
+        r.abandon("replace");
+        assert_eq!(std::fs::read(&part).unwrap(), b"another program's");
+        assert_eq!(std::fs::read(dir.join("keep.txt")).unwrap(), b"original");
+
+        // A new file is written whole
+        let fresh = r.reserve(&dir, "new.bin", "fresh");
+        write_new_file(&fresh, b"content").unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"content");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

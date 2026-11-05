@@ -134,6 +134,8 @@ cargo run -p mailbackup-server
 
 Open your browser at `http://127.0.0.1:8765` to access the full offline email browser, attachment previewer, and account manager.
 
+**Web access on/off (desktop app):** Settings → General Settings → *Web Access*. When off, MailBackup Studio opens no network port at all: its window gets the interface in-process through a private protocol, scheduled backups keep running, and no browser or other program can reach the UI or API. When on (the default), the same interface is also available in a browser at the address above. The headless server and the OS background service always listen, since that is the only way to reach them; while the background service runs, the desktop window shows it.
+
 **API access:** the server listens on `127.0.0.1` only. Every `/api/*` request must carry a random per-process token, which the server embeds in the page it serves, so other websites and DNS-rebinding attacks can't call the API. The token changes whenever the server restarts, so reload open browser tabs after a restart. The token is only ever sent in the `X-MailBackup-Token` header, never in a URL. Download links instead carry a ticket that the page requests right before each download: it works once, for that one file, within a minute.
 
 **Desktop app and the server it shows:** the desktop app only displays a MailBackup server that proves it was started by your account.
