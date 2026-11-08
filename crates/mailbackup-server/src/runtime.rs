@@ -67,6 +67,11 @@ impl ServerIdentity {
         }
     }
 
+    /// The same identity listening on `port` (a new listen session).
+    pub fn with_port(&self, port: u16) -> Self {
+        Self { port, ..self.clone() }
+    }
+
     /// The handshake answer for `nonce`, or `None` for a malformed nonce.
     pub fn proof(&self, nonce: &str) -> Option<String> {
         valid_nonce(nonce).then(|| proof(&self.secret, self.port, nonce))

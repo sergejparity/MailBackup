@@ -214,6 +214,9 @@ const el = {
   btnBrowseDownloadDir: document.getElementById('btn-browse-download-dir'),
   btnResetDownloadDir: document.getElementById('btn-reset-download-dir'),
   settingsAskDownload: document.getElementById('settings-ask-download'),
+  settingsWebServer: document.getElementById('settings-web-server'),
+  webServerStatus: document.getElementById('web-server-status'),
+  webServerNote: document.getElementById('web-server-note'),
   traySettingStatus: document.getElementById('tray-setting-status'),
   settingsAutostart: document.getElementById('settings-autostart'),
   autostartSettingStatus: document.getElementById('autostart-setting-status'),
@@ -801,6 +804,7 @@ function initEventListeners() {
   if (el.settingsAskDownload) {
     el.settingsAskDownload.addEventListener('change', (e) => saveDownloadSettings({ ask_download_location: e.target.checked }));
   }
+  if (el.settingsWebServer) el.settingsWebServer.addEventListener('change', handleToggleWebServer);
   if (el.settingsAutostart) el.settingsAutostart.addEventListener('change', handleToggleAutostart);
   if (el.settingsRunAsService) el.settingsRunAsService.addEventListener('change', handleToggleService);
   if (el.btnCopyServiceCmd) el.btnCopyServiceCmd.addEventListener('click', handleCopyServiceCmd);
@@ -2362,6 +2366,7 @@ async function loadSettings() {
       updateTrayBadge(el.settingsCloseToTray.checked);
     }
     showDownloadSettings(data);
+    showWebServerSettings(data);
     if (el.settingsAutostart) {
       el.settingsAutostart.checked = !!data.autostart;
       updateAutostartBadge(data.autostart);
@@ -2460,6 +2465,52 @@ function updateServiceBadge(status, configured) {
     el.serviceSettingStatus.style.background = 'rgba(148, 163, 184, 0.15)';
     el.serviceSettingStatus.style.color = 'var(--text-secondary)';
   }
+}
+
+// Web access on/off (issue #66)
+function showWebServerSettings(data) {
+  if (!el.settingsWebServer) return;
+  el.settingsWebServer.checked = data.web_server_always_on || !!data.web_server_enabled;
+  el.settingsWebServer.disabled = !!data.web_server_always_on;
+  const listening = data.web_server_port !== null && data.web_server_port !== undefined;
+  if (el.webServerStatus) {
+    el.webServerStatus.textContent = listening ? 'On' : 'Off';
+    el.webServerStatus.style.background = listening ? 'rgba(34, 197, 94, 0.15)' : 'rgba(148, 163, 184, 0.15)';
+    el.webServerStatus.style.color = listening ? '#4ade80' : 'var(--text-secondary)';
+  }
+  if (el.webServerNote) {
+    if (data.web_server_always_on) {
+      el.webServerNote.textContent = 'This window is served by the MailBackup background service, which always listens on its port so it can be reached.';
+    } else if (listening) {
+      el.webServerNote.textContent = `Open http://127.0.0.1:${data.web_server_port}/ in a browser on this computer.`;
+    } else if (data.web_server_enabled) {
+      el.webServerNote.textContent = `Port ${data.web_port} couldn't be opened (is another program using it?). Turn this off and on again to retry.`;
+    } else {
+      el.webServerNote.textContent = '';
+    }
+  }
+}
+
+async function handleToggleWebServer(e) {
+  const enabled = e.target.checked;
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ web_server_enabled: enabled }),
+    });
+    if (!res.ok) {
+      showToast(`Couldn't change web access: ${await res.text()}`);
+    } else {
+      showToast(enabled ? 'Web access is on' : 'Web access is off: no network port is open');
+    }
+  } catch (err) {
+    // Turning it off from a browser ends that browser's connection
+    if (!enabled) return;
+    showToast(`Couldn't change web access: ${err.message}`);
+  }
+  // The listener stops in the background; read its state once it has
+  setTimeout(loadSettings, 500);
 }
 
 // Desktop app download folder and "ask every time" (issue #65)

@@ -33,7 +33,7 @@ getrandom = "0.4"
 hmac = "0.13"
 sha2.workspace = true
 hex.workspace = true
+tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 tempfile = "3.12"
