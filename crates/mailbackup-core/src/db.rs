@@ -885,6 +885,19 @@ impl Database {
         Ok(conn.execute("UPDATE skipped_messages SET retry_requested = 1 WHERE account_id = ?1", params![account_id])?)
     }
 
+    /// The archived files of an account's messages (of one folder with
+    /// `Some`), in folder and UID order: what an export needs, nothing more.
+    pub fn message_paths(&self, account_id: &str, folder_id: Option<&str>) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT m.relative_path FROM messages m JOIN folders f ON f.id = m.folder_id
+               WHERE f.account_id = ?1 AND (?2 IS NULL OR m.folder_id = ?2)
+               ORDER BY f.remote_name, m.uid_generation, m.uid"#,
+        )?;
+        let paths = stmt.query_map(params![account_id, folder_id], |r| r.get(0))?;
+        Ok(paths.collect::<rusqlite::Result<Vec<String>>>()?)
+    }
+
     /// Whether the catalog knows `name` as an account id or as a name a
     /// "start a new archive" switch used (finished or not): any folder or
     /// message of that account, or any side of an account transition.

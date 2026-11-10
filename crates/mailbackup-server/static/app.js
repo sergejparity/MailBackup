@@ -2355,7 +2355,10 @@ async function handleExportMbox(e, forceOverwrite = false) {
 
     if (res.ok) {
       const result = await res.json();
-      showToast(`Exported ${result.exported_count} message(s) to ${result.output_path || 'archive'}! ✅`);
+      const missing = result.skipped_count
+        ? ` ${result.skipped_count} message(s) could not be read and are not in it.`
+        : '';
+      showToast(`Exported ${result.exported_count} message(s) to ${result.output_path || 'archive'}! ✅${missing}`, missing ? 8000 : 3000);
       closeModal(el.exportModal);
     } else if (res.status === 409) {
       const conflict = await res.json();

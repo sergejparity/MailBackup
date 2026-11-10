@@ -203,7 +203,9 @@ fn download_in_process<R: tauri::Runtime>(app: tauri::AppHandle<R>, url: tauri::
             Ok(request) => request,
             Err(_) => return,
         };
-        let response = server.handle_in_process(request, PROTOCOL_ORIGIN).await;
+        // Authorized (and its ticket used up) now, before the Save dialog;
+        // the body streams to the file afterwards, never all in memory (issue #78)
+        let response = server.handle_in_process_streaming(request, PROTOCOL_ORIGIN).await;
         if !response.status().is_success() {
             eprintln!("Download of {} failed: {}", url.path(), response.status());
             notify("The download failed");
@@ -222,11 +224,12 @@ fn download_in_process<R: tauri::Runtime>(app: tauri::AppHandle<R>, url: tauri::
             tauri::async_runtime::spawn_blocking(move || choose_destination(&name, None, &reservations, &key)).await
         };
         let Ok(Some(path)) = chosen else {
+            // Dropping the response stops whatever was producing it
             reservations.finish(&key, None, false);
             notify("Download cancelled");
             return;
         };
-        match write_new_file(&path, response.body()) {
+        match mailbackup_server::streaming::save_body(response.into_body(), &path).await {
             Ok(()) => {
                 let finish = reservations.finish(&key, Some(path), true);
                 let mark = mark_saved(url.path(), &finish);
@@ -244,17 +247,12 @@ fn download_in_process<R: tauri::Runtime>(app: tauri::AppHandle<R>, url: tauri::
     });
 }
 
-/// Writes `bytes` to a new file at `path`. Fails if anything exists there
-/// (another program may have created it since the name was chosen), and
-/// then leaves it alone; a file it created but couldn't fill is removed.
+/// What the #68 regression tests write through: the production path
+/// (`streaming::save_body`), which creates the file exclusively and removes
+/// only a file it created.
+#[cfg(test)]
 fn write_new_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-    if let Err(e) = std::io::Write::write_all(&mut file, bytes).and_then(|()| file.sync_all()) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(e);
-    }
-    Ok(())
+    tauri::async_runtime::block_on(mailbackup_server::streaming::save_body(bytes.to_vec().into(), path))
 }
 
 /// The file name a `Content-Disposition` header gives (`filename*` in
@@ -496,7 +494,7 @@ impl Reservations {
             Some(Download::Running { path: part, replaces: Some(target) }) => {
                 // On failure the `.part` file is left alone: whoever wrote it
                 // removes their own partial file (the webviews do, and
-                // `write_new_file` does), and if the failure was that another
+                // `streaming::save_body` does), and if the failure was that another
                 // program had created it first, it isn't ours
                 if success && std::fs::rename(&part, &target).is_ok() {
                     Finish::Saved(Some(target))
