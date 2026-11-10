@@ -491,9 +491,9 @@ impl ImapSyncEngine {
         }
         match outcome {
             Ok(outcome) => {
-                self.finish_history(&history_id, &progress, outcome.error.as_deref());
                 progress.error = outcome.error;
                 progress.skipped_messages = self.db.skipped_messages(Some(&account.id))?.len() as u32;
+                self.finish_history(&history_id, &progress);
                 Ok(progress)
             }
             Err(e) => {
@@ -575,15 +575,30 @@ impl ImapSyncEngine {
             None
         };
         let outcome = self.run_session(session, account, offered_ids, &mut progress, progress_callback.as_ref()).await?;
-        self.finish_history(&history_id, &progress, outcome.error.as_deref());
         progress.error = outcome.error;
         progress.skipped_messages = self.db.skipped_messages(Some(&account.id))?.len() as u32;
+        self.finish_history(&history_id, &progress);
         Ok(progress)
     }
 
-    fn finish_history(&self, history_id: &str, progress: &SyncProgress, error: Option<&str>) {
-        let status = if error.is_some() { "partial_or_failed" } else { "success" };
-        let _ = self.db.record_sync_finish(history_id, status, progress.processed_messages, progress.downloaded_bytes, error);
+    /// Records how the sync ended, from the finished `progress` (its error and
+    /// skipped messages already filled in): `success` only when nothing is
+    /// missing; messages left out for their size make it `incomplete`, with
+    /// the same reason the caller reports (issue #72).
+    fn finish_history(&self, history_id: &str, progress: &SyncProgress) {
+        let reason = progress.incomplete_reason();
+        let status = match (&progress.error, &reason) {
+            (Some(_), _) => "partial_or_failed",
+            (None, Some(_)) => "incomplete",
+            (None, None) => "success",
+        };
+        let _ = self.db.record_sync_finish(
+            history_id,
+            status,
+            progress.processed_messages,
+            progress.downloaded_bytes,
+            reason.as_deref(),
+        );
     }
 
     async fn run_session<S, F>(

@@ -2603,31 +2603,19 @@ async fn api_update_settings(
 
         if target_path != current_dir {
             let move_existing = payload.move_existing.unwrap_or(true);
-            if move_existing {
-                match state.storage.migrate_data(&target_path) {
-                    Ok(count) => migrated_files = count,
-                    Err(e) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to migrate storage data: {}", e),
-                        )
-                            .into_response();
-                    }
+            // Copy and switch in one step, with no archiver or pruning
+            // between them (issue #79)
+            match state.storage.relocate(&target_path, move_existing) {
+                Ok(count) => migrated_files = count,
+                Err(e) => {
+                    let what = if move_existing { "migrate storage data" } else { "create the storage directory" };
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to {} at {}: {}", what, target_path.display(), e),
+                    )
+                        .into_response();
                 }
-            } else if let Err(e) = mailbackup_core::private_fs::create_dir_all(&target_path) {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "Failed to create storage directory {}: {}",
-                        target_path.display(),
-                        e
-                    ),
-                )
-                    .into_response();
             }
-
-            // Update storage engine runtime path
-            state.storage.set_base_dir(&target_path);
             mailbackup_core::event_log::log_event(
                 "STORAGE_MOVED",
                 &format!("Archive storage directory changed to {}", target_path.display()),

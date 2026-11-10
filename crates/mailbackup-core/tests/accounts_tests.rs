@@ -174,6 +174,28 @@ fn accounts_another_process_saved_are_respected() {
     let account = create(&e, &mut ours, new("a_b@example.com", "ours")).unwrap();
     assert_eq!(account.id, "a_bexample_com-2");
     assert_eq!(e.credentials.get_password("a_bexample_com").unwrap(), "theirs");
+
+    // Both accounts are in the file: the older copy didn't replace theirs
+    let saved = AppConfig::load_existing(&e.config_path).unwrap().unwrap();
+    let mut ids: Vec<_> = saved.accounts.iter().map(|a| a.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, ["a_bexample_com", "a_bexample_com-2"]);
+    // and this process's copy now knows theirs too
+    assert!(ours.account_by_id("a_bexample_com").is_some());
+}
+
+#[test]
+fn a_creation_keeps_the_settings_another_process_saved() {
+    let e = env();
+    let mut theirs = config(&e.root);
+    theirs.settings.web_port = 9999;
+    theirs.save(&e.config_path).unwrap();
+
+    let mut ours = config(&e.root);
+    create(&e, &mut ours, new("me@example.com", "pw")).unwrap();
+    let saved = AppConfig::load_existing(&e.config_path).unwrap().unwrap();
+    assert_eq!(saved.settings.web_port, 9999, "their setting is kept");
+    assert_eq!(saved.accounts.len(), 1);
 }
 
 #[test]
@@ -199,6 +221,11 @@ fn concurrent_creations_with_colliding_slugs_keep_both_passwords() {
         for account in &created {
             assert_eq!(e.credentials.get_account_password(account).unwrap(), format!("pw of {}", account.email));
         }
+        // Every account survives in the file, whichever copy saved last
+        let saved = AppConfig::load_existing(&e.config_path).unwrap().unwrap();
+        let mut saved_ids: Vec<_> = saved.accounts.iter().map(|a| a.id.clone()).collect();
+        saved_ids.sort();
+        assert_eq!(saved_ids, ids, "all three accounts are in the saved config");
     }
 }
 
