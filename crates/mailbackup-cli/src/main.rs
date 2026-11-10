@@ -69,6 +69,16 @@ enum AccountCommands {
         account: String,
     },
 
+    #[command(
+        about = "List the account's messages that are not backed up because of their size, and fetch them on the next sync whatever the size limit"
+    )]
+    RetrySkipped {
+        #[arg(help = "Account ID or email address")]
+        account: String,
+        #[arg(long, help = "Only list them; don't mark them for retry")]
+        list: bool,
+    },
+
     #[command(about = "Remove an account configuration and stored credentials")]
     Remove {
         #[arg(help = "Account ID or email address")]
@@ -208,6 +218,30 @@ async fn main() -> Result<()> {
         }
         Commands::Account(AccountCommands::Remove { account }) => {
             handle_account_remove(&mut config, cli.config.as_deref(), &credentials, &account)?;
+        }
+        Commands::Account(AccountCommands::RetrySkipped { account, list }) => {
+            let acc = config.get_account(&account).context(format!("Account '{}' not found", account))?;
+            let skipped = db.skipped_messages(Some(&acc.id))?;
+            if skipped.is_empty() {
+                println!("{} Account '{}' has no skipped messages.", CHECK_EMOJI, acc.id);
+            } else {
+                println!("Messages of '{}' that are not backed up:", acc.id);
+                for s in &skipped {
+                    println!(
+                        "  {} UID {}: {:.1} MB (limit {:.0} MB), since {}{}",
+                        s.folder_name,
+                        s.uid,
+                        s.size_bytes as f64 / 1048576.0,
+                        s.limit_bytes as f64 / 1048576.0,
+                        s.first_skipped_at,
+                        if s.retry_requested { " (retry requested)" } else { "" }
+                    );
+                }
+                if !list {
+                    let marked = db.request_skipped_retry(&acc.id)?;
+                    println!("{} {} message(s) will be fetched on the next sync.", CHECK_EMOJI, marked);
+                }
+            }
         }
         Commands::Account(AccountCommands::ServerIds { account, trust, reset, source }) => {
             handle_account_server_ids(&mut config, cli.config.as_deref(), &db, &account, trust.as_deref(), reset, source.as_deref())?;
@@ -746,12 +780,13 @@ async fn handle_sync(
             ));
         };
 
-        // A sync that stopped part-way (a folder failed or timed out) is an error
+        // A sync that stopped part-way, or left messages out for their size,
+        // is incomplete: reported as an error
         let result = match sync_engine.sync_account(acc, &password, Some(progress_cb)).await {
-            Ok(p) if p.error.is_some() => Err(mailbackup_core::Error::Other(format!(
-                "stopped after {} message(s): {}",
+            Ok(p) if p.incomplete_reason().is_some() => Err(mailbackup_core::Error::Other(format!(
+                "incomplete after {} message(s): {}",
                 p.processed_messages,
-                p.error.as_deref().unwrap_or_default()
+                p.incomplete_reason().unwrap_or_default()
             ))),
             other => other,
         };

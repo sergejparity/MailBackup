@@ -168,6 +168,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/search", get(api_search))
         .route("/api/sync/status", get(api_get_sync_status))
         .route("/api/scheduler/status", get(api_scheduler_status))
+        .route("/api/skipped", get(api_skipped_messages))
+        .route("/api/accounts/{id}/skipped/retry", post(api_retry_skipped))
         .route("/api/sync/{account_id}", post(api_sync_account))
         .route("/api/export/mbox", post(api_export_mbox))
         .route("/api/export/mbox/download", get(api_download_mbox))
@@ -799,6 +801,27 @@ async fn reload_scheduler(state: &AppState, cfg: &AppConfig) -> Option<String> {
 /// 400) if the scheduler couldn't run it (issue #71).
 fn checked_schedule(schedule: &str) -> mailbackup_core::Result<String> {
     mailbackup_core::scheduler::validate_schedule(schedule).map(|_| schedule.trim().to_string())
+}
+
+/// Messages that are not backed up because of their size (issue #72), of
+/// every account.
+async fn api_skipped_messages(State(state): State<AppState>) -> impl IntoResponse {
+    match state.db.skipped_messages(None) {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// The account's skipped messages are fetched on its next sync, whatever
+/// the size limit.
+async fn api_retry_skipped(State(state): State<AppState>, Path(account_id): Path<String>) -> impl IntoResponse {
+    if state.config.read().await.account_by_id(&account_id).is_none() {
+        return (StatusCode::NOT_FOUND, "Account not found").into_response();
+    }
+    match state.db.request_skipped_retry(&account_id) {
+        Ok(marked) => Json(serde_json::json!({ "marked": marked })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// Which accounts have a scheduled backup, as of the scheduler's last
@@ -1713,12 +1736,13 @@ async fn api_sync_account(
             }
         };
 
-        // A sync that stopped part-way (a folder failed or timed out) is an error
+        // A sync that stopped part-way, or left messages out for their size,
+        // is incomplete: reported as an error
         let result = match sync_engine.sync_account(&acc, &password, Some(progress_cb)).await {
-            Ok(p) if p.error.is_some() => Err(mailbackup_core::Error::Other(format!(
-                "stopped after {} message(s): {}",
+            Ok(p) if p.incomplete_reason().is_some() => Err(mailbackup_core::Error::Other(format!(
+                "incomplete after {} message(s): {}",
                 p.processed_messages,
-                p.error.as_deref().unwrap_or_default()
+                p.incomplete_reason().unwrap_or_default()
             ))),
             other => other,
         };
@@ -4311,5 +4335,31 @@ mod tests {
         let old = cfg.account_by_id("oldexample_com").unwrap();
         assert_eq!(old.name, "Renamed");
         assert_eq!(state.credentials.get_account_password(old).unwrap(), "changed");
+    }
+
+    // ---- Skipped messages (issue #72) ----
+
+    #[tokio::test]
+    async fn skipped_messages_are_listed_and_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+        send(&router, "POST", "/api/accounts", new_account("me@example.com", "0 1 * * *")).await;
+        let folder = state.db.get_or_create_folder("meexample_com", "INBOX", "INBOX", Some(1)).unwrap();
+        state.db.record_skipped("meexample_com", &folder.id, 0, 7, "over_size_limit", 900, 100).unwrap();
+
+        let (status, body) = send(&router, "GET", "/api/skipped", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list[0]["uid"], 7, "{}", body);
+        assert_eq!(list[0]["folder_name"], "INBOX");
+
+        let (status, body) = send(&router, "POST", "/api/accounts/meexample_com/skipped/retry", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        assert!(body.contains("\"marked\":1"), "{}", body);
+        assert!(state.db.skipped_messages(None).unwrap()[0].retry_requested);
+
+        let (status, _) = send(&router, "POST", "/api/accounts/nobody/skipped/retry", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

@@ -27,6 +27,10 @@ pub struct SyncProgress {
     pub total_messages: u32,
     pub processed_messages: u32,
     pub downloaded_bytes: u64,
+    /// Messages of the account that are not backed up because they are
+    /// larger than the size limit (see `Database::skipped_messages`)
+    #[serde(default)]
+    pub skipped_messages: u32,
     /// Why the sync stopped before it was done (a folder failed, a timeout);
     /// `None` when it finished. What was archived before it is kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,6 +71,9 @@ pub const DEFAULT_LIMITS: Limits = Limits {
     min_rate: 4 * 1024,
     max_message_bytes: 256 * 1024 * 1024,
 };
+
+/// `skipped_messages.reason` of a message over the size limit.
+pub const SKIPPED_TOO_LARGE: &str = "over_size_limit";
 
 /// Responses of commands that return no message bodies may be this large.
 const SMALL_RESPONSE_BUDGET: u64 = 64 * 1024 * 1024;
@@ -486,6 +493,7 @@ impl ImapSyncEngine {
             Ok(outcome) => {
                 self.finish_history(&history_id, &progress, outcome.error.as_deref());
                 progress.error = outcome.error;
+                progress.skipped_messages = self.db.skipped_messages(Some(&account.id))?.len() as u32;
                 Ok(progress)
             }
             Err(e) => {
@@ -569,6 +577,7 @@ impl ImapSyncEngine {
         let outcome = self.run_session(session, account, offered_ids, &mut progress, progress_callback.as_ref()).await?;
         self.finish_history(&history_id, &progress, outcome.error.as_deref());
         progress.error = outcome.error;
+        progress.skipped_messages = self.db.skipped_messages(Some(&account.id))?.len() as u32;
         Ok(progress)
     }
 
@@ -719,6 +728,15 @@ impl ImapSyncEngine {
         // inconsistent (in an earlier sync, or another folder) come first
         self.reconcile_id_rebinds(session, &target, progress, progress_callback).await?;
 
+        // Skipped messages: records of other generations name UIDs that mean
+        // nothing now (this generation's scan evaluates every message again);
+        // this generation's are tried again if they fit now or a retry was asked
+        let dropped = self.db.delete_skipped_of_other_generations(&folder_rec.id, generation)?;
+        if dropped > 0 {
+            info!("Folder '{}': {} skipped-message records of an earlier UID generation dropped", folder_name, dropped);
+        }
+        self.retry_skipped(session, &target, progress, progress_callback).await?;
+
         let last_uid = folder_rec.last_synced_uid;
         debug!(
             "Folder '{}' (ID: {}): generation={}, last_synced_uid={}, uidvalidity={:?}",
@@ -773,6 +791,37 @@ impl ImapSyncEngine {
             pending.retain(|u| !resolved.contains(u));
         }
 
+        // Too large to fetch: recorded as not backed up, never fetched. The
+        // record lets the checkpoint pass the UID; it stays until a retry
+        // archives the message (see `retry_skipped`)
+        let max = self.limits.max_message_bytes;
+        let mut oversized = Vec::new();
+        pending.retain(|uid| match sizes.get(uid) {
+            Some(&size) if u64::from(size) > max => {
+                oversized.push((*uid, size));
+                false
+            }
+            _ => true,
+        });
+        for (uid, size) in oversized {
+            if self.db.record_skipped(&account.id, &folder_rec.id, generation, uid, SKIPPED_TOO_LARGE, size.into(), max)? {
+                warn!("Message UID {} in '{}' ({} bytes) is larger than the {} byte limit; not backed up", uid, folder_name, size, max);
+                crate::event_log::log_event(
+                    "MESSAGE_SKIPPED",
+                    &format!(
+                        "Account '{}': message UID {} in '{}' ({:.1} MB) is larger than the {:.0} MB limit and is not backed up",
+                        account.id,
+                        uid,
+                        folder_name,
+                        size as f64 / 1048576.0,
+                        max as f64 / 1048576.0
+                    ),
+                );
+            }
+            resolved.insert(uid);
+        }
+        self.advance_checkpoint(&target, &uids, &resolved, &mut checkpoint)?;
+
         for batch in plan_batches(&pending, &sizes, self.batch_max_messages, self.batch_target_bytes) {
             let outcome = self.fetch_batch(session, &target, &batch, &sizes, &mut resolved, progress, progress_callback).await;
             if let Err(e) = outcome {
@@ -792,6 +841,56 @@ impl ImapSyncEngine {
         // An inconsistency found during this scan also covers its earlier
         // re-binds by id
         self.reconcile_id_rebinds(session, &target, progress, progress_callback).await
+    }
+
+    /// Tries the folder's skipped messages again (see
+    /// `Database::skipped_to_retry`), each with a fetch of its own UID: an
+    /// archived message, or one the server no longer has, loses its record;
+    /// any other stays recorded (and is not retried again until the limit or
+    /// a new request says so). Never re-scans the folder.
+    async fn retry_skipped<S, F>(
+        &self,
+        session: &mut async_imap::Session<S>,
+        target: &FolderTarget<'_>,
+        progress: &mut SyncProgress,
+        progress_callback: Option<&F>,
+    ) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::fmt::Debug,
+        F: Fn(&SyncProgress) + Send + Sync + 'static,
+    {
+        let candidates = self.db.skipped_to_retry(target.folder_id, target.generation, self.limits.max_message_bytes)?;
+        for skipped in candidates {
+            let uid = skipped.uid;
+            info!("Retrying skipped message UID {} in '{}' ({} bytes)", uid, target.folder_name, skipped.size_bytes);
+            let sizes = HashMap::from([(uid, u32::try_from(skipped.size_bytes).unwrap_or(u32::MAX))]);
+            let mut resolved = HashSet::new();
+            self.fetch_batch(session, target, &[uid], &sizes, &mut resolved, progress, progress_callback).await?;
+            if resolved.contains(&uid) {
+                self.db.delete_skipped(target.folder_id, target.generation, uid)?;
+                crate::event_log::log_event(
+                    "MESSAGE_RECOVERED",
+                    &format!("Account '{}': skipped message UID {} in '{}' is now backed up", target.account.id, uid, target.folder_name),
+                );
+                continue;
+            }
+            self.guard.set_budget(SMALL_RESPONSE_BUDGET);
+            match within("UID SEARCH", self.limits.command, session.uid_search(format!("UID {}", uid))).await {
+                Ok(found) if !found.contains(&uid) => {
+                    self.db.delete_skipped(target.folder_id, target.generation, uid)?;
+                    crate::event_log::log_event(
+                        "MESSAGE_SKIPPED",
+                        &format!(
+                            "Account '{}': skipped message UID {} in '{}' was deleted on the server before it could be backed up",
+                            target.account.id, uid, target.folder_name
+                        ),
+                    );
+                }
+                Err(e) if ends_session(&e) => return Err(e),
+                _ => self.db.touch_skipped(target.folder_id, target.generation, uid)?,
+            }
+        }
+        Ok(())
     }
 
     /// A response to a command that asked for server ids couldn't be parsed:
@@ -1305,7 +1404,25 @@ impl SyncProgress {
             total_messages: 0,
             processed_messages: 0,
             downloaded_bytes: 0,
+            skipped_messages: 0,
             error: None,
+        }
+    }
+
+    /// Why this sync didn't back up everything, if it didn't: it stopped
+    /// part-way, or messages were left out for their size. A sync with a
+    /// reason is never reported as a success.
+    pub fn incomplete_reason(&self) -> Option<String> {
+        let skipped = (self.skipped_messages > 0).then(|| {
+            format!(
+                "{} message(s) are larger than the size limit and are not backed up (settings.imap_max_message_mb; retry with `mailbackup account retry-skipped`)",
+                self.skipped_messages
+            )
+        });
+        match (&self.error, skipped) {
+            (Some(e), Some(s)) => Some(format!("{}; {}", e, s)),
+            (Some(e), None) => Some(e.clone()),
+            (None, s) => s,
         }
     }
 }

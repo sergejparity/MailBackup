@@ -271,13 +271,14 @@ impl BackupScheduler {
                     };
 
                     match sync_engine.sync_account(&acc, &password, Some(progress_cb)).await {
-                        // Stopped part-way (a folder failed or timed out): an error, not a success
-                        Ok(progress) if progress.error.is_some() => {
+                        // Stopped part-way, or messages left out for their size:
+                        // incomplete, never a success
+                        Ok(progress) if progress.incomplete_reason().is_some() => {
                             let err_msg = format!(
-                                "Scheduled background sync of account '{}' stopped after {} message(s): {}",
+                                "Scheduled background sync of account '{}' is incomplete after {} message(s): {}",
                                 acc.name,
                                 progress.processed_messages,
-                                progress.error.as_deref().unwrap_or_default()
+                                progress.incomplete_reason().unwrap_or_default()
                             );
                             error!("{}", err_msg);
                             crate::event_log::log_event("SYNC_ERROR", &err_msg);

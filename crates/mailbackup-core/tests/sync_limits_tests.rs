@@ -182,3 +182,133 @@ fn limit_settings_are_validated_and_mapped() {
         assert!(err.contains(field), "{} = {}: {}", field, value, err);
     }
 }
+
+// ---- Messages over the size limit ----------------------------------------
+
+fn with_max(max_bytes: u64) -> Limits {
+    Limits { max_message_bytes: max_bytes, ..DEFAULT_LIMITS }
+}
+
+fn big_mail(subject: &str, len: usize) -> Vec<u8> {
+    let mut m = mail(subject);
+    m.extend(std::iter::repeat_n(b'x', len));
+    m.extend(b"\r\n");
+    m
+}
+
+/// UID 1 and 3 small, UID 2 about 200 KB
+fn one_big(server: &FakeImap) -> Vec<u8> {
+    let big = big_mail("big", 200 * 1024);
+    let (m1, m3) = (mail("one"), mail("three"));
+    server.set(Some(1), &[(1, &m1), (2, &big), (3, &m3)]);
+    big
+}
+
+fn body_fetches(server: &FakeImap) -> Vec<String> {
+    server.with(|m| {
+        m.raw_commands
+            .iter()
+            .map(|(_, c)| c.to_ascii_uppercase())
+            .filter(|c| c.starts_with("UID FETCH") && c.contains("BODY.PEEK[]"))
+            .collect()
+    })
+}
+
+#[tokio::test]
+async fn a_message_over_the_limit_is_recorded_not_fetched_and_never_counts_as_backed_up() {
+    let (a, server) = (archive(), FakeImap::start().await);
+    one_big(&server);
+    let acc = account(&server, "user");
+
+    let progress = sync_with_engine(engine(&a, with_max(100 * 1024)), &server, &acc).await.unwrap();
+    assert!(progress.error.is_none(), "{:?}", progress.error);
+    assert_eq!(progress.skipped_messages, 1);
+    let reason = progress.incomplete_reason().expect("an incomplete sync, not a success");
+    assert!(reason.contains("1 message(s)"), "{}", reason);
+
+    assert_eq!(subjects(&a), ["one", "three"]);
+    assert!(!server.take_fetched().contains(&2), "the big body was never requested");
+    assert_eq!(inbox(&a).last_synced_uid, 3, "the record lets the checkpoint pass it");
+    let skipped = a.db.skipped_messages(Some("acc")).unwrap();
+    assert_eq!(skipped.len(), 1);
+    assert_eq!((skipped[0].uid, skipped[0].reason.as_str()), (2, "over_size_limit"));
+    assert!(skipped[0].size_bytes > 200 * 1024 && skipped[0].limit_bytes == 100 * 1024);
+
+    // The next sync neither fetches it nor forgets it
+    let progress = sync_with_engine(engine(&a, with_max(100 * 1024)), &server, &acc).await.unwrap();
+    assert!(server.take_fetched().is_empty());
+    assert_eq!(progress.skipped_messages, 1);
+    assert!(progress.incomplete_reason().is_some());
+}
+
+#[tokio::test]
+async fn raising_the_limit_after_a_restart_recovers_the_message_with_one_fetch() {
+    let (a, server) = (archive(), FakeImap::start().await);
+    let big = one_big(&server);
+    let acc = account(&server, "user");
+    sync_with_engine(engine(&a, with_max(100 * 1024)), &server, &acc).await.unwrap();
+    server.take_fetched();
+
+    // A restart: the catalog is opened again from disk
+    let reopened = Archive {
+        db: mailbackup_core::db::Database::open(a._dir.path().join("catalog.db")).unwrap(),
+        storage: a.storage.clone(),
+        _dir: tempfile::tempdir().unwrap(),
+    };
+    server.with(|m| m.raw_commands.clear());
+    let progress = sync_with_engine(engine(&reopened, with_max(1024 * 1024)), &server, &acc).await.unwrap();
+
+    assert!(progress.incomplete_reason().is_none(), "{:?}", progress.incomplete_reason());
+    assert_eq!(progress.skipped_messages, 0);
+    assert_eq!(server.take_fetched(), [2], "only the skipped message is fetched");
+    assert_eq!(body_fetches(&server), ["UID FETCH 2 (UID BODY.PEEK[] INTERNALDATE)"], "with a fetch of its own UID");
+    let (_, body) = archived(&reopened).into_iter().find(|(m, _)| m.uid == 2).expect("archived");
+    assert_eq!(body, big);
+    assert!(reopened.db.skipped_messages(None).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_requested_retry_fetches_the_message_whatever_the_limit() {
+    let (a, server) = (archive(), FakeImap::start().await);
+    one_big(&server);
+    let acc = account(&server, "user");
+    sync_with_engine(engine(&a, with_max(100 * 1024)), &server, &acc).await.unwrap();
+    server.take_fetched();
+
+    assert_eq!(a.db.request_skipped_retry("acc").unwrap(), 1);
+    let progress = sync_with_engine(engine(&a, with_max(100 * 1024)), &server, &acc).await.unwrap();
+    assert_eq!(server.take_fetched(), [2]);
+    assert_eq!(progress.skipped_messages, 0);
+    assert_eq!(subjects(&a).len(), 3);
+}
+
+#[tokio::test]
+async fn a_skipped_message_deleted_on_the_server_loses_its_record() {
+    let (a, server) = (archive(), FakeImap::start().await);
+    one_big(&server);
+    let acc = account(&server, "user");
+    sync_with_engine(engine(&a, with_max(100 * 1024)), &server, &acc).await.unwrap();
+
+    server.with(|m| m.messages.retain(|(u, _)| *u != 2));
+    let progress = sync_with_engine(engine(&a, with_max(1024 * 1024)), &server, &acc).await.unwrap();
+    assert_eq!(progress.skipped_messages, 0);
+    assert!(a.db.skipped_messages(None).unwrap().is_empty());
+    assert_eq!(subjects(&a), ["one", "three"], "nothing is archived for it");
+}
+
+#[tokio::test]
+async fn a_skip_is_not_applied_to_new_content_after_a_uidvalidity_change() {
+    let (a, server) = (archive(), FakeImap::start().await);
+    one_big(&server);
+    let acc = account(&server, "user");
+    sync_with_engine(engine(&a, with_max(100 * 1024)), &server, &acc).await.unwrap();
+    assert_eq!(a.db.skipped_messages(None).unwrap().len(), 1);
+
+    // New UIDVALIDITY: UID 2 is now a different, small message
+    let (m1, m2) = (mail("new one"), mail("new two"));
+    server.set(Some(2), &[(1, &m1), (2, &m2)]);
+    let progress = sync_with_engine(engine(&a, with_max(100 * 1024)), &server, &acc).await.unwrap();
+    assert!(progress.incomplete_reason().is_none(), "{:?}", progress.incomplete_reason());
+    assert!(subjects(&a).contains(&"new two".to_string()), "UID 2 of the new generation is archived");
+    assert!(a.db.skipped_messages(None).unwrap().is_empty(), "the old record doesn't carry over");
+}

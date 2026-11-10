@@ -394,8 +394,21 @@ fn catalog_opens_with_every_row_as_written() {
     let conn = rusqlite::Connection::open(dir.path().join("mailbackup.db")).unwrap();
     let now = compat::catalog::snapshot(&conn);
     let written = read_json(&fixtures_root().join("catalog").join("snapshot.json"));
-    assert_eq!(now["user_version"], written["user_version"]);
-    assert_eq!(now["schema"], written["schema"]);
+    // Written at schema 3; opening upgrades it. Every object it had is kept
+    // exactly, and the only new ones are those of later schema versions
+    assert_eq!(written["user_version"], 3);
+    assert_eq!(now["user_version"], mailbackup_core::db::SCHEMA_VERSION);
+    let (written_schema, now_schema) = (written["schema"].as_array().unwrap(), now["schema"].as_array().unwrap());
+    for object in written_schema {
+        assert!(now_schema.contains(object), "kept as written: {}", object);
+    }
+    let added: Vec<&str> = now_schema
+        .iter()
+        .filter(|o| !written_schema.contains(o))
+        .map(|o| o["name"].as_str().unwrap())
+        .collect();
+    // Schema 4 (issue #72)
+    assert_eq!(added, ["idx_skipped_messages_account", "sqlite_autoindex_skipped_messages_1", "skipped_messages"]);
     for (table, rows) in written["tables"].as_object().unwrap() {
         assert_eq!(&now["tables"][table], rows, "table {}", table);
     }

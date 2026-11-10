@@ -958,6 +958,33 @@ function showSavedOrWarning(responseText, savedMessage) {
   else showToast(savedMessage);
 }
 
+// Messages not backed up because of their size (issue #72), counted by account
+async function loadSkippedMessages() {
+  try {
+    const res = await fetch('/api/skipped');
+    if (!res.ok) return;
+    const counts = {};
+    (await res.json()).forEach((s) => { counts[s.account_id] = (counts[s.account_id] || 0) + 1; });
+    state.skippedByAccount = counts;
+  } catch (err) {
+    console.error('Failed to load skipped messages:', err);
+  }
+}
+
+async function retrySkipped(accountId) {
+  try {
+    const res = await fetch(`/api/accounts/${encodeURIComponent(accountId)}/skipped/retry`, { method: 'POST' });
+    if (!res.ok) {
+      showToast(`Retry failed: ${await res.text()}`);
+      return;
+    }
+    const { marked } = await res.json();
+    showToast(`${marked} message(s) will be fetched on the next sync, whatever their size.`, 6000);
+  } catch (err) {
+    showToast(`Network error: ${err}`);
+  }
+}
+
 // Accounts the scheduler left out because their schedule is invalid, by id
 // (see /api/scheduler/status)
 async function loadSchedulerStatus() {
@@ -1057,6 +1084,7 @@ async function loadAccounts() {
     if (!res.ok) return;
     state.accounts = await res.json();
     await loadSchedulerStatus();
+    await loadSkippedMessages();
     renderAccounts();
     renderModalAccounts();
 
@@ -1171,6 +1199,10 @@ function renderModalAccounts() {
     const scheduleWarning = skipped
       ? `<div style="font-size: 0.75rem; color: var(--accent-rose); margin-top: 2px;">⚠ No scheduled backup: ${escapeHtml(skipped.error)}</div>`
       : '';
+    const skippedCount = (state.skippedByAccount || {})[acc.id] || 0;
+    const skippedWarning = skippedCount
+      ? `<div style="font-size: 0.75rem; color: var(--accent-rose); margin-top: 2px;">⚠ Backup incomplete: ${skippedCount} message(s) are larger than the size limit and not backed up. <button class="btn btn-sm btn-ghost" data-action="retry-skipped">Retry</button></div>`
+      : '';
 
     row.innerHTML = `
       <div>
@@ -1179,6 +1211,7 @@ function renderModalAccounts() {
           Server: ${escapeHtml(acc.imap_server)}:${acc.imap_port} • Schedule: <code>${escapeHtml(scheduleText)}</code> • Retention: ${retentionText}
         </div>
         ${scheduleWarning}
+        ${skippedWarning}
       </div>
       <div style="display: flex; gap: 8px;">
         <button class="btn btn-sm btn-secondary" data-action="edit">Edit</button>
@@ -1188,6 +1221,7 @@ function renderModalAccounts() {
     // Bound here rather than via inline onclick attributes, which the Content-Security-Policy blocks.
     row.querySelector('[data-action="edit"]').addEventListener('click', () => openEditAccount(acc.id));
     row.querySelector('[data-action="remove"]').addEventListener('click', () => deleteAccount(acc.id));
+    row.querySelector('[data-action="retry-skipped"]')?.addEventListener('click', () => retrySkipped(acc.id));
     el.modalAccountsList.appendChild(row);
   });
 }
