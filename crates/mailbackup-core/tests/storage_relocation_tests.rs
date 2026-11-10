@@ -1,0 +1,76 @@
+//! Moving the data folder while archivers and pruning hold the storage
+//! lifetime lock (issue #79, review of #91): a guarded operation never sees
+//! two folders, and nothing stored under a guard is left behind.
+
+use mailbackup_core::storage::{StorageEngine, STORAGE_LOCK_FILE};
+use std::sync::mpsc;
+use std::time::Duration;
+
+const WAIT: Duration = Duration::from_millis(300);
+
+#[test]
+fn a_relocation_waits_for_an_archiver_and_takes_what_it_stored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (old, new) = (tmp.path().join("old"), tmp.path().join("new"));
+    let storage = StorageEngine::new(&old);
+
+    // An archiver holds the guard and has not stored its file yet
+    let guard = storage.lock_shared().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let mover = {
+        let (storage, new) = (storage.clone(), new.clone());
+        std::thread::spawn(move || done_tx.send(storage.relocate(&new, true).unwrap()).unwrap())
+    };
+    assert!(done_rx.recv_timeout(WAIT).is_err(), "the relocation waits for the archiver");
+    assert_eq!(storage.base_dir(), old, "the archiver's folder doesn't change under it");
+    let stored = storage.store_eml("acc", "INBOX", 1, None, b"Subject: x\r\n\r\nbody").unwrap();
+    assert!(stored.absolute_path.starts_with(&old));
+    drop(guard);
+
+    assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1, "its file is copied");
+    mover.join().unwrap();
+    assert_eq!(storage.base_dir(), new);
+    assert_eq!(storage.read_eml(&stored.relative_path).unwrap(), b"Subject: x\r\n\r\nbody");
+    assert!(!new.join(STORAGE_LOCK_FILE).exists(), "the old folder's lock file isn't copied");
+}
+
+#[test]
+fn a_guard_asked_for_during_a_relocation_gets_the_new_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (old, new) = (tmp.path().join("old"), tmp.path().join("new"));
+    let storage = StorageEngine::new(&old);
+    let first = storage.lock_shared().unwrap();
+
+    let mover = {
+        let (storage, new) = (storage.clone(), new.clone());
+        std::thread::spawn(move || storage.relocate(&new, true).unwrap())
+    };
+    std::thread::sleep(WAIT); // the relocation is now waiting for `first`
+
+    // Pruning (another handle on the same engine) asks for the lock now: it
+    // must not start in the old folder while the move is pending
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let pruner = {
+        let storage = storage.clone();
+        std::thread::spawn(move || {
+            let _lock = storage.lock_exclusive().unwrap();
+            seen_tx.send(storage.base_dir()).unwrap();
+        })
+    };
+    assert!(seen_rx.recv_timeout(WAIT).is_err(), "it waits for the relocation");
+    drop(first);
+    assert_eq!(seen_rx.recv_timeout(Duration::from_secs(5)).unwrap(), new);
+    mover.join().unwrap();
+    pruner.join().unwrap();
+}
+
+#[test]
+fn relocating_without_moving_switches_to_an_empty_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (old, new) = (tmp.path().join("old"), tmp.path().join("new"));
+    let storage = StorageEngine::new(&old);
+    storage.store_eml("acc", "INBOX", 1, None, b"Subject: x\r\n\r\n").unwrap();
+    assert_eq!(storage.relocate(&new, false).unwrap(), 0);
+    assert_eq!(storage.base_dir(), new);
+    assert!(new.is_dir());
+}
