@@ -3,7 +3,8 @@
 //! [`ChannelWriter`] is the `std::io::Write` end of a bounded channel: a
 //! blocking producer (the mbox exporter) writes into it and blocks while the
 //! client is slower; [`channel_body`] is the response body reading the other
-//! end. Memory stays at a few chunks. When the client goes away, the body is
+//! end. Memory stays at a few chunks of at most [`CHUNK_BYTES`], however
+//! large a single write is. When the client goes away, the body is
 //! dropped, the next write fails, and the producer stops.
 //!
 //! [`save_body`] writes a response body to a new file chunk by chunk, for the
@@ -69,11 +70,15 @@ impl io::Write for ChannelWriter {
         if self.tx.is_closed() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "the client stopped reading"));
         }
-        self.buf.extend_from_slice(data);
-        if self.buf.len() >= CHUNK_BYTES {
+        // Never more than one chunk buffered: a large write (a long line
+        // without breaks) is taken a chunk at a time, each sent, and waited
+        // for, before the rest (`write_all` comes back for it)
+        let taken = data.len().min(CHUNK_BYTES - self.buf.len());
+        self.buf.extend_from_slice(&data[..taken]);
+        if self.buf.len() == CHUNK_BYTES {
             self.send_buffer()?;
         }
-        Ok(data.len())
+        Ok(taken)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -124,6 +129,66 @@ mod tests {
         producer.await.unwrap();
         let expected: Vec<u8> = (0..1000u32).flat_map(|i| i.to_le_bytes().repeat(256)).collect();
         assert_eq!(collected.as_ref(), expected.as_slice());
+    }
+
+    /// The chunks of a body, as the client receives them.
+    async fn chunks(body: Body) -> Vec<Bytes> {
+        body.into_data_stream().map(|c| c.unwrap()).collect().await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_large_write_is_sent_in_chunks_of_at_most_chunk_bytes() {
+        let (writer, body) = channel();
+        let data: Vec<u8> = (0..CHUNK_BYTES * 10 + 123).map(|i| (i % 251) as u8).collect();
+        let expected = data.clone();
+        let producer = tokio::task::spawn_blocking(move || {
+            let mut writer = writer;
+            writer.write_all(&data).unwrap();
+            writer.flush().unwrap();
+        });
+        let received = chunks(body).await;
+        producer.await.unwrap();
+        assert!(received.iter().all(|c| c.len() <= CHUNK_BYTES), "sizes: {:?}", received.iter().map(Bytes::len).collect::<Vec<_>>());
+        assert_eq!(received.concat(), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_mbox_with_long_unbroken_lines_streams_in_bounded_chunks() {
+        // A message whose body is one 3 MB line
+        let mut eml = b"From: a@example.com\r\nSubject: long\r\n\r\n".to_vec();
+        eml.extend(std::iter::repeat_n(b'x', 3 * 1024 * 1024));
+        eml.extend(b"\r\n");
+        let (writer, body) = channel();
+        let producer = tokio::task::spawn_blocking(move || {
+            let mut writer = writer;
+            mailbackup_core::mbox::write_message(&mut writer, &eml).unwrap();
+            writer.flush().unwrap();
+        });
+        let received = chunks(body).await;
+        producer.await.unwrap();
+        assert!(received.iter().all(|c| c.len() <= CHUNK_BYTES));
+        assert!(received.iter().map(Bytes::len).sum::<usize>() > 3 * 1024 * 1024);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_body_stops_one_large_write_within_the_bound() {
+        let (writer, body) = channel();
+        drop(body);
+        let accepted = tokio::task::spawn_blocking(move || {
+            let mut writer = writer;
+            let data = vec![0u8; 64 * 1024 * 1024];
+            let mut accepted = 0usize;
+            while accepted < data.len() {
+                match writer.write(&data[accepted..]) {
+                    Ok(n) => accepted += n,
+                    Err(_) => break,
+                }
+            }
+            accepted
+        })
+        .await
+        .unwrap();
+        assert!(accepted <= CHUNK_BYTES * (CHANNEL_CHUNKS + 1), "took {} bytes after the client left", accepted);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
