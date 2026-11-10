@@ -3550,6 +3550,8 @@ mod tests {
         for _ in 0..20 {
             let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = socket.local_addr().unwrap().port();
+            #[cfg(target_os = "linux")]
+            let inode = socket_inode(&socket);
             let identity = runtime::ServerIdentity::new(port);
             let published = runtime::PublishedRuntime::publish(dir.path(), &identity).unwrap();
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3558,8 +3560,48 @@ mod tests {
             let dropper = std::thread::spawn(move || drop(listener));
             rx.await.unwrap();
             assert!(!runtime::runtime_path(dir.path(), port).exists(), "runtime file gone before the signal");
-            assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(), "port free before the signal");
+            #[cfg(target_os = "linux")]
+            assert!(!process_holds_socket(&inode), "socket closed before the signal");
+            assert_port_free(port);
             dropper.join().unwrap();
+        }
+    }
+
+    /// The kernel name of `socket` (`socket:[<inode>]`), shared by every
+    /// descriptor that refers to it.
+    #[cfg(target_os = "linux")]
+    fn socket_inode(socket: &tokio::net::TcpListener) -> std::path::PathBuf {
+        use std::os::fd::AsRawFd;
+        std::fs::read_link(format!("/proc/self/fd/{}", socket.as_raw_fd())).unwrap()
+    }
+
+    /// True if any descriptor of this process still refers to the socket.
+    #[cfg(target_os = "linux")]
+    fn process_holds_socket(inode: &std::path::Path) -> bool {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == inode))
+    }
+
+    /// Asserts nothing listens on `port` any more.
+    ///
+    /// On Linux the caller has already checked that this process closed the
+    /// socket, so a remaining `AddrInUse` can only be a copy inherited by a
+    /// child another test is spawning (`fork` copies every descriptor, and the
+    /// copy lives until that child's `exec`). Wait that out, briefly. On other
+    /// systems the port must be free at once.
+    fn assert_port_free(port: u16) {
+        let wait = if cfg!(target_os = "linux") { std::time::Duration::from_secs(2) } else { std::time::Duration::ZERO };
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Ok(_) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("port {} free before the signal: {}", port, e),
+            }
         }
     }
 
