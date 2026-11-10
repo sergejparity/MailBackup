@@ -13,58 +13,101 @@ on:
       - master
   workflow_dispatch:
 
+# Read-only token: building needs nothing more. Publishing a release (with
+# write access) belongs in a separate job that only runs for tags (issue #81).
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Exact versions of tools the release build installs. Dependabot doesn't
+  # update these (only `uses:` lines): bump them here deliberately.
+  TAURI_CLI_VERSION: 2.12.4
+
+# Actions are pinned to commit SHAs (the comment names the release); Dependabot
+# keeps them current.
+
 jobs:
   build-windows:
     runs-on: windows-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (master)
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-msvc
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2" --locked
+        run: cargo install tauri-cli --version "=${{ env.TAURI_CLI_VERSION }}" --locked
 
+      # --locked: the release is built from exactly the committed Cargo.lock
       - name: Build CLI & Server binaries
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --locked
 
       - name: Build Tauri Desktop GUI & Windows Installers
         working-directory: ./crates/mailbackup-gui
-        run: cargo tauri build
+        run: cargo tauri build -- --locked
+
+      # upload-artifact's if-no-files-found only fails when nothing at all
+      # matches, so a single missing binary would go unnoticed: check each
+      # required output by name first
+      - name: Check that every release output exists
+        shell: pwsh
+        run: |
+          $missing = @()
+          foreach ($exe in 'mailbackup.exe', 'mailbackup-server.exe', 'mailbackup-gui.exe') {
+            if (-not (Test-Path "target/release/$exe")) { $missing += "target/release/$exe" }
+          }
+          $nsis = @(Get-ChildItem -Path target/release/bundle/nsis -Filter *.exe -ErrorAction SilentlyContinue)
+          $msi = @(Get-ChildItem -Path target/release/bundle/msi -Filter *.msi -ErrorAction SilentlyContinue)
+          if ($nsis.Count -ne 1) { $missing += "exactly one NSIS installer (found $($nsis.Count))" }
+          if ($msi.Count -ne 1) { $missing += "exactly one MSI installer (found $($msi.Count))" }
+          if ($missing.Count -gt 0) {
+            $missing | ForEach-Object { Write-Error "Missing: $_" -ErrorAction Continue }
+            exit 1
+          }
 
       - name: Upload Windows Artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mailbackup-windows-x64
           path: |
-            target/release/mailbackup-cli.exe
+            target/release/mailbackup.exe
             target/release/mailbackup-server.exe
             target/release/mailbackup-gui.exe
-            **/target/release/bundle/nsis/*.exe
-            **/target/release/bundle/msi/*.msi
-          if-no-files-found: warn
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
+          if-no-files-found: error
 
   # The minimum supported Rust version on Windows (issue #47): the whole
   # workspace, including the GUI's Windows-only dependencies, checked on
   # exactly the `rust-version` toolchain with the committed lockfile
   msrv-windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (master)
+        with:
+          toolchain: 1.98.0
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Check on the minimum supported Rust version
         run: cargo check --workspace --all-targets --locked
