@@ -204,6 +204,15 @@ fn one_big(server: &FakeImap) -> Vec<u8> {
     big
 }
 
+/// The account's recorded syncs, oldest first: (status, reason).
+fn history(a: &Archive) -> Vec<(String, Option<String>)> {
+    let conn = rusqlite::Connection::open(a._dir.path().join("catalog.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT status, error_message FROM sync_history WHERE account_id = 'acc' ORDER BY start_time, rowid")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+}
+
 fn body_fetches(server: &FakeImap) -> Vec<String> {
     server.with(|m| {
         m.raw_commands
@@ -239,6 +248,26 @@ async fn a_message_over_the_limit_is_recorded_not_fetched_and_never_counts_as_ba
     assert!(server.take_fetched().is_empty());
     assert_eq!(progress.skipped_messages, 1);
     assert!(progress.incomplete_reason().is_some());
+}
+
+#[tokio::test]
+async fn the_sync_history_records_a_skip_as_incomplete_until_it_is_recovered() {
+    let (a, server) = (archive(), FakeImap::start().await);
+    one_big(&server);
+    let acc = account(&server, "user");
+    // The skip, a sync with nothing new that still misses it, and the
+    // recovery after the limit is raised
+    sync_with_engine(engine(&a, with_max(100 * 1024)), &server, &acc).await.unwrap();
+    sync_with_engine(engine(&a, with_max(100 * 1024)), &server, &acc).await.unwrap();
+    sync_with_engine(engine(&a, with_max(1024 * 1024)), &server, &acc).await.unwrap();
+
+    let rows = history(&a);
+    assert_eq!(rows.len(), 3, "{:?}", rows);
+    for (status, reason) in &rows[..2] {
+        assert_eq!(status, "incomplete");
+        assert!(reason.as_deref().is_some_and(|r| r.contains("1 message(s)")), "{:?}", reason);
+    }
+    assert_eq!(rows[2], ("success".to_string(), None));
 }
 
 #[tokio::test]
