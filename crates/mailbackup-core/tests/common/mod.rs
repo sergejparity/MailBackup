@@ -518,3 +518,13 @@ pub fn eml_files(a: &Archive) -> usize {
 pub fn stale_result<T>(r: mailbackup_core::error::Result<T>) -> bool {
     matches!(r, Err(mailbackup_core::error::Error::StaleSync(_)))
 }
+
+/// Sets when a message was archived (`created_at`), which retention counts
+/// from (issue #73), through a second connection to the catalog file.
+pub fn set_archived_at(a: &Archive, message_id: &str, when: &str) {
+    let conn = rusqlite::Connection::open(a._dir.path().join("catalog.db")).unwrap();
+    let changed = conn
+        .execute("UPDATE messages SET created_at = ?1 WHERE id = ?2", rusqlite::params![when, message_id])
+        .unwrap();
+    assert_eq!(changed, 1, "message {} exists", message_id);
+}

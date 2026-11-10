@@ -385,9 +385,13 @@ fn test_retention_policy_pruning() {
 
     assert!(stored.absolute_path.exists());
 
-    // Enforce 90-day retention
+    // Retention counts from when the message was backed up (issue #73): today
+    // a 90-day policy keeps it, whatever its old Date says...
     let retention = RetentionManager::new(&db, &storage);
-    let report = retention.enforce_retention("acc1", Some(90)).unwrap();
+    assert_eq!(retention.enforce_retention("acc1", Some(90)).unwrap().pruned_count, 0);
+    assert!(stored.absolute_path.exists());
+    // ...and 91 days after it was backed up, it goes
+    let report = retention.enforce_retention_as_of("acc1", Some(90), Utc::now() + Duration::days(91)).unwrap();
 
     assert_eq!(report.pruned_count, 1);
     assert!(!stored.absolute_path.exists()); // Physical file deleted
