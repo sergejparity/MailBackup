@@ -3544,22 +3544,115 @@ mod tests {
         web.stop().await;
     }
 
+    /// Identifies a listening socket by its OS handle, to tell later whether
+    /// that very socket is still open. Re-binding its port can't tell: other
+    /// tests bind ephemeral ports concurrently and may take the freed one.
+    struct SocketHandle {
+        #[cfg(unix)]
+        raw: std::os::fd::RawFd,
+        #[cfg(windows)]
+        raw: std::os::windows::io::RawSocket,
+        /// (device, inode): unique per open socket, so a handle number reused
+        /// by another socket doesn't read as this one
+        #[cfg(unix)]
+        inode: (u64, u64),
+        addr: SocketAddr,
+    }
+
+    impl SocketHandle {
+        fn of(socket: &tokio::net::TcpListener) -> Self {
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                let raw = socket.as_raw_fd();
+                let inode = Self::inode_of(raw).expect("open socket");
+                SocketHandle { raw, inode, addr: socket.local_addr().unwrap() }
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawSocket;
+                SocketHandle { raw: socket.as_raw_socket(), addr: socket.local_addr().unwrap() }
+            }
+        }
+
+        #[cfg(unix)]
+        fn inode_of(raw: std::os::fd::RawFd) -> Option<(u64, u64)> {
+            use std::os::fd::FromRawFd;
+            use std::os::unix::fs::MetadataExt;
+            // Borrowed, never closed here: only queried (fstat)
+            let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(raw) });
+            file.metadata().ok().map(|m| (m.dev(), m.ino()))
+        }
+
+        /// Whether the handle still refers to the socket it was taken from.
+        /// Only queries the handle (which may since be closed, or reused by
+        /// something else), never closes it.
+        fn is_open(&self) -> bool {
+            #[cfg(unix)]
+            let borrowed = {
+                use std::os::fd::FromRawFd;
+                if Self::inode_of(self.raw) != Some(self.inode) {
+                    return false;
+                }
+                std::mem::ManuallyDrop::new(unsafe { std::net::TcpListener::from_raw_fd(self.raw) })
+            };
+            #[cfg(windows)]
+            let borrowed = {
+                use std::os::windows::io::FromRawSocket;
+                std::mem::ManuallyDrop::new(unsafe { std::net::TcpListener::from_raw_socket(self.raw) })
+            };
+            borrowed.local_addr().ok() == Some(self.addr)
+        }
+    }
+
+    /// Records, at the moment the receiver is woken, whether the socket is
+    /// still open and the runtime file still exists. The sender wakes the
+    /// receiver from inside `send`, so this sees the state exactly when the
+    /// signal is sent, before the sending thread can do anything more.
+    struct CheckOnWake {
+        handle: SocketHandle,
+        runtime_file: std::path::PathBuf,
+        /// `(socket open, runtime file exists)` when woken
+        seen: std::sync::Mutex<Option<(bool, bool)>>,
+    }
+
+    impl std::task::Wake for CheckOnWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let state = (self.handle.is_open(), self.runtime_file.exists());
+            self.seen.lock().unwrap().get_or_insert(state);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_closed_signal_comes_after_the_socket_and_runtime_file_are_gone() {
+        use std::future::Future;
         let dir = tempfile::tempdir().unwrap();
         for _ in 0..20 {
             let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = socket.local_addr().unwrap().port();
+            let check = Arc::new(CheckOnWake {
+                handle: SocketHandle::of(&socket),
+                runtime_file: runtime::runtime_path(dir.path(), port),
+                seen: std::sync::Mutex::new(None),
+            });
             let identity = runtime::ServerIdentity::new(port);
             let published = runtime::PublishedRuntime::publish(dir.path(), &identity).unwrap();
-            let (tx, rx) = tokio::sync::oneshot::channel();
+            assert!(check.runtime_file.exists() && check.handle.is_open(), "both there to begin with");
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            // Register the checking waker before anything is dropped
+            let waker = std::task::Waker::from(check.clone());
+            assert!(std::pin::Pin::new(&mut rx).poll(&mut std::task::Context::from_waker(&waker)).is_pending());
             let listener = ClosingListener { inner: Some(socket), published: Some(published), closed: Some(tx) };
-            // Dropped on another thread while this one waits for the signal
-            let dropper = std::thread::spawn(move || drop(listener));
-            rx.await.unwrap();
-            assert!(!runtime::runtime_path(dir.path(), port).exists(), "runtime file gone before the signal");
-            assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(), "port free before the signal");
-            dropper.join().unwrap();
+            // Dropped on another thread, as axum's would be
+            std::thread::spawn(move || drop(listener)).join().unwrap();
+            assert_eq!(rx.await, Ok(()), "the signal was sent");
+            let (socket_open, runtime_file_exists) = check.seen.lock().unwrap().expect("woken by the signal");
+            assert!(!runtime_file_exists, "runtime file gone before the signal");
+            assert!(!socket_open, "socket closed before the signal");
         }
     }
 
