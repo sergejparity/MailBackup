@@ -110,7 +110,9 @@ fn handle_download<R: tauri::Runtime>(
             }
         }
         DownloadEvent::Finished { url, path, success } => {
-            if let Some(message) = finish_message(reservations.finish(url.as_str(), path, success)) {
+            let finish = reservations.finish(url.as_str(), path, success);
+            let mark = mark_saved(url.path(), &finish);
+            if let Some(message) = finish_message(finish, mark) {
                 let _ = webview.eval(toast_script(&message));
             }
             true
@@ -147,13 +149,33 @@ fn choose_destination(
     Some(reservations.reserve(&dir, name, key))
 }
 
+/// Marks a saved attachment or message as downloaded from the internet
+/// (issue #75), on the final file (after a `.part` was renamed over the
+/// one it replaces). Returns a warning for the toast if marking failed; an
+/// unsupported file system only gets a log line.
+fn mark_saved(url_path: &str, finish: &Finish) -> Option<String> {
+    let Finish::Saved(Some(path)) = finish else { return None };
+    if !mailbackup_core::download_mark::is_mail_content(url_path) {
+        return None;
+    }
+    match mailbackup_core::download_mark::mark_from_internet(path) {
+        Ok(mailbackup_core::download_mark::Mark::Unsupported(why)) => {
+            eprintln!("{} can't be marked as downloaded from the internet: {}", path.display(), why);
+            None
+        }
+        Ok(_) => None,
+        Err(e) => Some(format!("it couldn't be marked as downloaded from the internet ({}); open it with care", e)),
+    }
+}
+
 /// The toast for a download's end; none for a refused or cancelled one,
-/// which said so already.
-fn finish_message(finish: Finish) -> Option<String> {
+/// which said so already. `warning` is added to a successful save.
+fn finish_message(finish: Finish, warning: Option<String>) -> Option<String> {
+    let warning = warning.map(|w| format!("; {}", w)).unwrap_or_default();
     match finish {
         Finish::Refused => None,
-        Finish::Saved(Some(path)) => Some(format!("Saved {}", path.display())),
-        Finish::Saved(None) => Some("Download saved".to_string()),
+        Finish::Saved(Some(path)) => Some(format!("Saved {}{}", path.display(), warning)),
+        Finish::Saved(None) => Some(format!("Download saved{}", warning)),
         Finish::Failed => Some("The download failed".to_string()),
     }
 }
@@ -206,7 +228,9 @@ fn download_in_process<R: tauri::Runtime>(app: tauri::AppHandle<R>, url: tauri::
         };
         match write_new_file(&path, response.body()) {
             Ok(()) => {
-                if let Some(message) = finish_message(reservations.finish(&key, Some(path), true)) {
+                let finish = reservations.finish(&key, Some(path), true);
+                let mark = mark_saved(url.path(), &finish);
+                if let Some(message) = finish_message(finish, mark) {
                     notify(&message);
                 }
             }
@@ -317,7 +341,10 @@ fn save_dialog(dir: &std::path::Path, name: &str) -> SaveChoice {
             $d.FileName = $env:MAILBACKUP_SAVE_NAME; $d.OverwritePrompt = $true; \
             $owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true }; \
             if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName; exit 0 } else { exit 1 }";
-        match std::process::Command::new("powershell")
+        let Ok(powershell) = mailbackup_core::service::trusted_program("powershell") else {
+            return SaveChoice::Unavailable;
+        };
+        match std::process::Command::new(powershell)
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .env("MAILBACKUP_SAVE_DIR", dir)
             .env("MAILBACKUP_SAVE_NAME", name)
@@ -333,7 +360,10 @@ fn save_dialog(dir: &std::path::Path, name: &str) -> SaveChoice {
         let script = "on run argv\n\
             POSIX path of (choose file name with prompt \"Save download\" default name (item 2 of argv) default location (POSIX file (item 1 of argv)))\n\
             end run";
-        match std::process::Command::new("osascript").arg("-e").arg(script).arg(dir).arg(name).output() {
+        let Ok(osascript) = mailbackup_core::service::trusted_program("osascript") else {
+            return SaveChoice::Unavailable;
+        };
+        match std::process::Command::new(osascript).arg("-e").arg(script).arg(dir).arg(name).output() {
             // Cancel is AppleScript error -128
             Ok(out) if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("-128") => SaveChoice::Cancelled,
             Ok(out) if out.status.success() => chosen(out),
@@ -355,6 +385,8 @@ fn save_dialog(dir: &std::path::Path, name: &str) -> SaveChoice {
             ("kdialog", vec!["--title".into(), "Save download".into(), "--getsavefilename".into(), start.clone().into()]),
         ];
         for (program, args) in attempts {
+            // From fixed system folders only, never from PATH (issue #75)
+            let Ok(program) = mailbackup_core::service::trusted_program(program) else { continue };
             if let Ok(out) = std::process::Command::new(program).args(&args).output() {
                 return chosen(out);
             }
