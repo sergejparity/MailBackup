@@ -1005,7 +1005,32 @@ async fn serve_index(State(state): State<AppState>) -> impl IntoResponse {
     serve_file("index.html", &state.api_token)
 }
 
-async fn serve_static(State(state): State<AppState>, Path(path): Path<String>) -> impl IntoResponse {
+async fn serve_static(State(state): State<AppState>, Path(path): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    // The embedded files change only with a new build: answer a matching
+    // If-None-Match with 304 (issue #79). Pages that carry the token are
+    // never cached.
+    let clean = path.trim_start_matches('/');
+    if !matches!(clean, "index.html" | "login.html")
+        && let Some(file) = Assets::get(clean) {
+        let etag = format!("\"{}\"", hex::encode(file.metadata.sha256_hash()));
+        let matches = headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
+        if matches {
+            let mut res = StatusCode::NOT_MODIFIED.into_response();
+            if let Ok(value) = HeaderValue::from_str(&etag) {
+                res.headers_mut().insert(header::ETAG, value);
+            }
+            return res;
+        }
+        let mut res = serve_file(clean, &state.api_token);
+        if let Ok(value) = HeaderValue::from_str(&etag) {
+            res.headers_mut().insert(header::ETAG, value);
+        }
+        res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        return res;
+    }
     serve_file(&path, &state.api_token)
 }
 
@@ -4944,5 +4969,32 @@ mod tests {
         let saved = dir.path().join("events.log");
         streaming::save_body(first.into_body(), &saved).await.unwrap();
         assert!(saved.exists());
+    }
+
+    #[tokio::test]
+    async fn embedded_assets_answer_if_none_match_and_token_pages_are_never_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = create_router(test_state(dir.path(), Vec::new()).await);
+        let get = |uri: &str, etag: Option<&str>| {
+            let mut req = HttpRequest::builder().uri(uri).header(header::HOST, "127.0.0.1:8765");
+            if let Some(tag) = etag {
+                req = req.header(header::IF_NONE_MATCH, tag);
+            }
+            req.body(Body::empty()).unwrap()
+        };
+        let res = router.clone().oneshot(get("/app.js", None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let etag = res.headers().get(header::ETAG).expect("an ETag").to_str().unwrap().to_string();
+        let res = router.clone().oneshot(get("/app.js", Some(&etag))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        let res = router.clone().oneshot(get("/app.js", Some("\"other\""))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        for page in ["/", "/index.html"] {
+            let res = router.clone().oneshot(get(page, Some("*"))).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{}", page);
+            assert!(res.headers().get(header::ETAG).is_none(), "{}", page);
+            assert_eq!(res.headers().get(header::CACHE_CONTROL).unwrap(), "no-store", "{}", page);
+        }
     }
 }
