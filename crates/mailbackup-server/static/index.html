@@ -794,6 +794,17 @@
                     <div id="web-server-note" style="font-size: 0.78rem; color: var(--text-secondary); margin-top: 6px; line-height: 1.45;"></div>
                   </div>
                 </div>
+                <!-- Browser access key (issue #70) -->
+                <div id="web-key-row" style="font-size: 0.8rem; line-height: 1.45;">
+                  <div style="font-weight: 500;">Access key</div>
+                  <div style="color: var(--text-secondary); margin: 2px 0 6px;">A browser asks for this key once, then stays logged in for 12 hours of use. Regenerating it logs every browser out.</div>
+                  <code id="web-key-value" style="display: block; word-break: break-all; margin-bottom: 6px;">••••••••••••••••</code>
+                  <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                    <button type="button" class="btn btn-sm btn-secondary" id="btn-web-key-show">Show</button>
+                    <button type="button" class="btn btn-sm btn-secondary" id="btn-web-key-regenerate">Regenerate</button>
+                    <button type="button" class="btn btn-sm btn-ghost" id="btn-web-logout">Log out of this browser</button>
+                  </div>
+                </div>
               </div>
             </div>
 

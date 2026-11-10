@@ -51,6 +51,12 @@ enum Commands {
     #[command(about = "Run the unattended background scheduler daemon")]
     Daemon,
 
+    #[command(about = "Print the access key a browser needs to log in to the web UI")]
+    WebKey {
+        #[arg(long, help = "Replace it with a new key; every browser has to log in again")]
+        regenerate: bool,
+    },
+
     #[command(about = "Start the embedded Web UI and REST API server")]
     Serve(ServeArgs),
 }
@@ -260,6 +266,22 @@ async fn main() -> Result<()> {
         }
         Commands::Daemon => {
             handle_daemon(config, &config_path, db, storage, credentials).await?;
+        }
+        Commands::WebKey { regenerate } => {
+            let config_dir = config_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+            let key = if regenerate {
+                mailbackup_core::web_access::regenerate_key(&config_dir)?
+            } else {
+                mailbackup_core::web_access::load_or_create_key(&config_dir)?
+            };
+            // The key alone on stdout, so it can be piped; the rest on stderr
+            println!("{}", key);
+            if regenerate {
+                eprintln!("New access key saved; browsers that were logged in must log in again.");
+            }
+            if !config.settings.require_login {
+                eprintln!("Note: settings.require_login is off, so the web UI doesn't ask for it.");
+            }
         }
         Commands::Serve(args) => {
             println!("{} Starting MailBackup Studio on http://127.0.0.1:{}", MAIL_EMOJI, args.port);

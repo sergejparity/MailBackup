@@ -53,6 +53,28 @@ fn get(port: u16, path: &str, host: &str) -> String {
     http(port, &format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host))
 }
 
+/// Logs in with the access key of `dir` (issue #70); the session cookie.
+fn login(dir: &Path, port: u16) -> String {
+    let key = mailbackup_core::web_access::read_key(dir).unwrap().expect("the server created the key");
+    let body = format!(r#"{{"key":"{}"}}"#, key);
+    let res = http(
+        port,
+        &format!(
+            "POST /api/login HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            port,
+            body.len(),
+            body
+        ),
+    );
+    assert!(res.starts_with("HTTP/1.1 204"), "{}", res);
+    let line = res.lines().find(|l| l.to_ascii_lowercase().starts_with("set-cookie:")).expect("a session cookie");
+    line.split_once(':').unwrap().1.trim().split(';').next().unwrap().to_string()
+}
+
+fn get_with_cookie(port: u16, path: &str, cookie: &str) -> String {
+    http(port, &format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nCookie: {}\r\nConnection: close\r\n\r\n", path, port, cookie))
+}
+
 fn json_response(body: &str) -> String {
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -105,7 +127,7 @@ fn the_handshake_needs_no_token_but_is_host_checked() {
     assert!(rebinding.starts_with("HTTP/1.1 403"), "{}", rebinding);
     let bad_nonce = get(port, "/api/handshake?nonce=xyz", &host);
     assert!(bad_nonce.starts_with("HTTP/1.1 400"), "{}", bad_nonce);
-    // Every other API route still needs the token
+    // Every other API route still needs a session and the token
     let other = get(port, "/api/version", &host);
     assert!(other.starts_with("HTTP/1.1 401"), "{}", other);
 }
@@ -116,8 +138,10 @@ fn a_squatter_using_the_public_page_token_is_rejected() {
     let genuine = start_server(dir.path(), 0).unwrap();
     let info = runtime_of(dir.path(), genuine);
 
-    // The API token anyone can read from the served page
-    let page = get(genuine, "/", &format!("127.0.0.1:{}", genuine));
+    // The API token of the served page (since #70 only after logging in)
+    let anonymous = get(genuine, "/", &format!("127.0.0.1:{}", genuine));
+    assert!(!anonymous.contains("mailbackup-api-token\" content=\""), "no token without a session");
+    let page = get_with_cookie(genuine, "/", &login(dir.path(), genuine));
     let token = page
         .split("name=\"mailbackup-api-token\" content=\"")
         .nth(1)
@@ -279,4 +303,52 @@ fn a_complete_answer_is_accepted_without_waiting_for_the_connection_to_close() {
     let started = std::time::Instant::now();
     assert!(runtime::verify_genuine(dir.path(), lingering).is_some());
     assert!(started.elapsed() < std::time::Duration::from_secs(1), "took {:?}", started.elapsed());
+}
+
+// ---- The desktop app logs in for the user (issue #70) ----
+
+#[test]
+fn the_desktop_login_needs_a_verified_server_and_opens_one_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = start_server(dir.path(), 0).unwrap();
+    let path = runtime::desktop_login_path(dir.path(), port).expect("verified, so logged in");
+    assert!(path.starts_with("/login?ticket="), "{}", path);
+    let key = mailbackup_core::web_access::read_key(dir.path()).unwrap().unwrap();
+    assert!(!path.contains(&key), "the key is never in the URL");
+
+    let redeemed = get(port, &path, &format!("127.0.0.1:{}", port));
+    assert!(redeemed.starts_with("HTTP/1.1 303"), "{}", redeemed);
+    let cookie = redeemed
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().split(';').next().unwrap().to_string())
+        .expect("a session");
+    let page = get_with_cookie(port, "/", &cookie);
+    assert!(page.contains("mailbackup-api-token\" content=\""), "the app, with its token");
+    let again = get(port, &path, &format!("127.0.0.1:{}", port));
+    assert!(again.starts_with("HTTP/1.1 200") && again.contains("login-form"), "a ticket works once");
+}
+
+#[test]
+fn the_key_is_never_sent_to_a_server_that_fails_the_handshake() {
+    let dir = tempfile::tempdir().unwrap();
+    // A genuine server creates the runtime and key files...
+    let genuine = start_server(dir.path(), 0).unwrap();
+    let info = runtime_of(dir.path(), genuine);
+    let key = mailbackup_core::web_access::read_key(dir.path()).unwrap().unwrap();
+    // ...and a squatter on another port, with a leftover runtime file for it,
+    // can't answer the challenge
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    let fake = fake_server(move |request, _| {
+        log.lock().unwrap().push(request.to_string());
+        json_response(r#"{"proof":"00","port":1}"#)
+    });
+    stale_file_for(dir.path(), &info, fake);
+
+    assert!(runtime::desktop_login_path(dir.path(), fake).is_none());
+    let requests = seen.lock().unwrap();
+    assert!(!requests.is_empty(), "the handshake was attempted");
+    assert!(requests.iter().all(|r| !r.contains(&key) && !r.contains("/api/login")), "{:?}", requests);
 }

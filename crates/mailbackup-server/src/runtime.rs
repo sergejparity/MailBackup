@@ -167,14 +167,46 @@ fn handshake_request(port: u16, nonce: &str) -> Option<Vec<u8>> {
 }
 
 fn handshake_request_by(port: u16, nonce: &str, deadline: Instant) -> Option<Vec<u8>> {
-    let remaining = || deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero());
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let mut stream = TcpStream::connect_timeout(&addr, remaining()?).ok()?;
-    stream.set_write_timeout(Some(remaining()?)).ok()?;
     let request = format!(
         "GET /api/handshake?nonce={} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
         nonce, port
     );
+    exchange(port, &request, deadline)
+}
+
+/// Logs the desktop window in to the server on `port` (issue #70): only if
+/// that server first proves it is genuine (see [`verify_genuine`]), the
+/// access key from the config folder is exchanged, over loopback, for a
+/// single-use login ticket. Returns the path the window opens
+/// (`/login?ticket=…`), which turns the ticket into a session; `None` if
+/// the server isn't verified, the key can't be read, or the login fails (the
+/// window then shows the login page). The key itself never goes into a URL.
+pub fn desktop_login_path(config_dir: &Path, port: u16) -> Option<String> {
+    verify_genuine(config_dir, port)?;
+    let key = mailbackup_core::web_access::read_key(config_dir).ok()??;
+    let body = serde_json::json!({ "key": key, "ticket": true }).to_string();
+    let request = format!(
+        "POST /api/login HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://127.0.0.1:{}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        port,
+        port,
+        body.len(),
+        body
+    );
+    let answer: serde_json::Value = serde_json::from_slice(&exchange(port, &request, Instant::now() + DEADLINE)?).ok()?;
+    let ticket = answer.get("ticket")?.as_str()?;
+    // Only a plain hex token goes into the URL
+    (ticket.len() == 64 && ticket.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("/login?ticket={}", ticket))
+}
+
+/// Sends `request` to `127.0.0.1:port` and returns the body of a `200`
+/// response with a `Content-Length`, else `None`. Gives up at `deadline`,
+/// however the other end paces its bytes, and stops reading once the
+/// declared body has arrived.
+fn exchange(port: u16, request: &str, deadline: Instant) -> Option<Vec<u8>> {
+    let remaining = || deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero());
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&addr, remaining()?).ok()?;
+    stream.set_write_timeout(Some(remaining()?)).ok()?;
     stream.write_all(request.as_bytes()).ok()?;
 
     let mut response = Vec::new();
