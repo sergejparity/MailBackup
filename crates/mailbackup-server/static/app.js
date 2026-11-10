@@ -949,6 +949,35 @@ function initEventListeners() {
   });
 }
 
+// A change that was saved may still carry a warning from the server (the
+// scheduler couldn't take it over, issue #71): show that instead of the
+// plain confirmation, and for longer.
+function showSavedOrWarning(responseText, savedMessage) {
+  const at = (responseText || '').indexOf('Warning:');
+  if (at >= 0) showToast(`Saved. ${responseText.slice(at)}`, 9000);
+  else showToast(savedMessage);
+}
+
+// Accounts the scheduler left out because their schedule is invalid, by id
+// (see /api/scheduler/status)
+async function loadSchedulerStatus() {
+  try {
+    const res = await fetch('/api/scheduler/status');
+    if (!res.ok) return;
+    const status = await res.json();
+    state.schedulerSkipped = Object.fromEntries((status.skipped || []).map((s) => [s.account_id, s]));
+    state.schedulerProblem = !status.running
+      ? 'The backup scheduler is not running; no scheduled backups are made.'
+      : status.last_reload_error
+        ? `Scheduled backups still follow earlier settings: ${status.last_reload_error}`
+        : status.default_schedule_error
+          ? `The default schedule in config.yaml is invalid; accounts without their own schedule run daily at midnight. ${status.default_schedule_error}`
+          : '';
+  } catch (err) {
+    console.error('Failed to load the scheduler status:', err);
+  }
+}
+
 function showToast(msg, duration = 3000) {
   el.toastMessage.textContent = msg;
   el.toast.style.display = 'flex';
@@ -1018,6 +1047,7 @@ async function loadAccounts() {
     const res = await fetch('/api/accounts');
     if (!res.ok) return;
     state.accounts = await res.json();
+    await loadSchedulerStatus();
     renderAccounts();
     renderModalAccounts();
 
@@ -1115,6 +1145,12 @@ function renderModalAccounts() {
     el.modalAccountsList.innerHTML = `<p style="color: var(--text-dim);">No accounts configured yet.</p>`;
     return;
   }
+  if (state.schedulerProblem) {
+    const problem = document.createElement('div');
+    problem.style.cssText = 'color: var(--accent-rose); font-size: 0.8rem; margin-bottom: 8px;';
+    problem.textContent = `⚠ ${state.schedulerProblem}`;
+    el.modalAccountsList.appendChild(problem);
+  }
 
   state.accounts.forEach(acc => {
     const row = document.createElement('div');
@@ -1122,6 +1158,10 @@ function renderModalAccounts() {
     const retentionText = acc.retention_days ? `${acc.retention_days} days` : 'Forever';
     const scheduleText = acc.schedule || 'Default (Daily)';
     const statusText = acc.enabled ? '<span style="color: var(--accent-emerald); font-weight: 600;">Enabled</span>' : '<span style="color: var(--text-dim);">Disabled</span>';
+    const skipped = (state.schedulerSkipped || {})[acc.id];
+    const scheduleWarning = skipped
+      ? `<div style="font-size: 0.75rem; color: var(--accent-rose); margin-top: 2px;">⚠ No scheduled backup: ${escapeHtml(skipped.error)}</div>`
+      : '';
 
     row.innerHTML = `
       <div>
@@ -1129,6 +1169,7 @@ function renderModalAccounts() {
         <div style="font-size: 0.75rem; color: var(--text-dim); margin-top: 2px;">
           Server: ${escapeHtml(acc.imap_server)}:${acc.imap_port} • Schedule: <code>${escapeHtml(scheduleText)}</code> • Retention: ${retentionText}
         </div>
+        ${scheduleWarning}
       </div>
       <div style="display: flex; gap: 8px;">
         <button class="btn btn-sm btn-secondary" data-action="edit">Edit</button>
@@ -1278,7 +1319,7 @@ async function saveAccountEdit(accountId, payload) {
     });
 
     if (res.ok) {
-      showToast('Account settings updated successfully! ✅');
+      showSavedOrWarning(await res.text(), 'Account settings updated successfully! ✅');
       closeModal(el.editAccountModal);
       await loadAccounts();
     } else {
@@ -1840,7 +1881,7 @@ async function handleAddAccount(e) {
     });
 
     if (res.ok) {
-      showToast('Account added successfully! ✅');
+      showSavedOrWarning(await res.text(), 'Account added successfully! ✅');
       closeModal(el.settingsModal);
       el.addAccountForm.reset();
       await loadAccounts();
@@ -3154,7 +3195,7 @@ function renderCsvPreview(report) {
           <td><span class="badge" style="background: rgba(99, 102, 241, 0.15); color: #818cf8; text-transform: uppercase; font-size: 10px;">${escapeHtml(acc.provider)}</span></td>
           <td style="font-family: monospace; font-size: 12px; color: var(--text-secondary);">${escapeHtml(acc.server)}:${acc.port}</td>
           <td style="font-family: monospace; font-size: 12px; color: var(--text-secondary);">${escapeHtml(acc.username)}</td>
-          <td style="font-family: monospace; font-size: 12px; color: var(--text-secondary);">${acc.schedule || '0 0 * * *'}</td>
+          <td style="font-family: monospace; font-size: 12px; color: var(--text-secondary);">${escapeHtml(acc.schedule || '0 0 * * *')}</td>
         </tr>
       `).join('');
       if (el.btnConfirmCsvImport) el.btnConfirmCsvImport.disabled = false;

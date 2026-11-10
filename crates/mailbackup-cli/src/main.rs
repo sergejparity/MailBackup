@@ -422,6 +422,9 @@ fn handle_account_add(
     };
 
     let schedule = args.schedule.or_else(|| Some("0 0 * * *".to_string()));
+    if let Some(schedule) = &schedule {
+        mailbackup_core::scheduler::validate_schedule(schedule)?;
+    }
 
     let account = AccountConfig {
         id: id.clone(),

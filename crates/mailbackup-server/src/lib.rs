@@ -166,6 +166,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/messages/{id}/attachments/{index}", get(api_download_attachment))
         .route("/api/search", get(api_search))
         .route("/api/sync/status", get(api_get_sync_status))
+        .route("/api/scheduler/status", get(api_scheduler_status))
         .route("/api/sync/{account_id}", post(api_sync_account))
         .route("/api/export/mbox", post(api_export_mbox))
         .route("/api/export/mbox/download", get(api_download_mbox))
@@ -780,6 +781,31 @@ fn serve_file(path: &str, api_token: &str) -> Response {
     }
 }
 
+/// Reloads the scheduler with `cfg`. A failed reload leaves the previous
+/// jobs running (see `BackupScheduler::reload`); the returned text tells
+/// the user so, to be appended to the response of the change that caused it.
+async fn reload_scheduler(state: &AppState, cfg: &AppConfig) -> Option<String> {
+    match state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await {
+        Ok(()) => None,
+        Err(e) => {
+            error!("Scheduler reload failed: {}", e);
+            Some(format!(" Warning: scheduled backups still follow the previous settings ({}).", e))
+        }
+    }
+}
+
+/// `schedule` as it may be stored for an account; an error (reported as
+/// 400) if the scheduler couldn't run it (issue #71).
+fn checked_schedule(schedule: &str) -> mailbackup_core::Result<String> {
+    mailbackup_core::scheduler::validate_schedule(schedule).map(|_| schedule.trim().to_string())
+}
+
+/// Which accounts have a scheduled backup, as of the scheduler's last
+/// (re)start. Read-only: asking logs nothing.
+async fn api_scheduler_status(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.scheduler.lock().await.status().clone()).into_response()
+}
+
 // REST Handlers
 async fn api_stats(State(state): State<AppState>) -> impl IntoResponse {
     match state.db.get_storage_stats() {
@@ -829,6 +855,12 @@ async fn api_add_account(
         _ => ProviderType::GenericImap,
     };
 
+    let schedule = match payload.schedule.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(checked_schedule) {
+        Some(Ok(s)) => Some(s),
+        Some(Err(e)) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        None => None,
+    };
+
     let id = StorageEngine::sanitize_slug(&payload.email);
     let account = AccountConfig {
         id: id.clone(),
@@ -840,7 +872,7 @@ async fn api_add_account(
         use_tls: true,
         auth_type: AuthType::Password,
         username: payload.username.trim().to_string(),
-        schedule: payload.schedule,
+        schedule,
         retention_days: payload.retention_days,
         folder_filter: FolderFilter::default(),
         gmail_smart_labels: true,
@@ -868,14 +900,14 @@ async fn api_add_account(
     }
 
     // Reload scheduler with new account
-    let _ = state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await;
+    let warning = reload_scheduler(&state, &cfg).await;
 
     mailbackup_core::event_log::log_event(
         "ACCOUNT_ADDED",
         &format!("Account '{}' ({}) added [Provider: {}]", acc_name_log, acc_email_log, acc_provider_log),
     );
 
-    (StatusCode::OK, "Account created").into_response()
+    (StatusCode::OK, format!("Account created.{}", warning.unwrap_or_default())).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1014,7 +1046,7 @@ async fn api_import_accounts_csv(
     }
 
     // Reload scheduler with updated accounts
-    let _ = state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await;
+    let _ = reload_scheduler(&state, &cfg).await;
 
     mailbackup_core::event_log::log_event(
         "ACCOUNTS_BULK_IMPORTED",
@@ -1065,6 +1097,15 @@ async fn api_update_account(
     Path(account_id): Path<String>,
     Json(payload): Json<UpdateAccountPayload>,
 ) -> impl IntoResponse {
+    // Nothing is changed for a schedule that can't run (issue #71)
+    let mut payload = payload;
+    if let Some(schedule) = payload.schedule.take() {
+        payload.schedule = match checked_schedule(&schedule) {
+            Ok(s) => Some(s),
+            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        };
+    }
+
     let mut cfg = state.config.write().await;
     let acc = match cfg.get_account_mut(&account_id) {
         Some(a) => a,
@@ -1202,7 +1243,7 @@ async fn api_update_account(
     }
 
     // Reload scheduler (still holding the gate after a switch)
-    let _ = state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await;
+    let warning = reload_scheduler(&state, &cfg).await;
 
     let message = match &archived {
         Some(switched) => format!(
@@ -1221,7 +1262,7 @@ async fn api_update_account(
     );
     drop(archived);
 
-    (StatusCode::OK, "Account updated").into_response()
+    (StatusCode::OK, format!("Account updated.{}", warning.unwrap_or_default())).into_response()
 }
 
 async fn api_delete_account(
@@ -1239,7 +1280,7 @@ async fn api_delete_account(
     let _ = cfg.save(&state.config_path);
 
     // Reload scheduler
-    let _ = state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await;
+    let _ = reload_scheduler(&state, &cfg).await;
 
     mailbackup_core::event_log::log_event(
         "ACCOUNT_DELETED",
@@ -4078,5 +4119,107 @@ mod tests {
         assert_eq!(status(&router, authed("DELETE", "/api/accounts/acc", None)).await, StatusCode::NO_CONTENT);
         assert!(state.config.read().await.accounts.iter().any(|a| a.id == archive_id));
         assert_eq!(state.db.get_folders(&archive_id).unwrap().len(), 1);
+    }
+
+    // ---- Schedules that can't run (issue #71) ----
+
+    async fn send(router: &Router, method: &str, uri: &str, body: serde_json::Value) -> (StatusCode, String) {
+        let req = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:8765")
+            .header(API_TOKEN_HEADER, TOKEN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn new_account(email: &str, schedule: &str) -> serde_json::Value {
+        serde_json::json!({
+            "provider": "generic", "name": "N", "email": email, "server": "imap.example.com",
+            "port": 993, "username": email, "password": "pw", "schedule": schedule,
+        })
+    }
+
+    #[tokio::test]
+    async fn an_account_with_an_invalid_schedule_is_refused_and_nothing_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+
+        let (status, body) = send(&router, "POST", "/api/accounts", new_account("a@example.com", "every 6h")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body);
+        assert!(body.contains("every 6h"), "{}", body);
+        assert!(state.config.read().await.accounts.is_empty());
+        assert!(!state.config_path.exists(), "the config wasn't written");
+        assert!(state.credentials.get_password("a_example_com").is_err(), "no password was stored");
+
+        let (status, body) = send(&router, "POST", "/api/accounts", new_account("a@example.com", "0 */6 * * *")).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        assert!(!body.contains("Warning"), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_schedule_in_an_update_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+        let (status, _) = send(&router, "POST", "/api/accounts", new_account("a@example.com", "0 1 * * *")).await;
+        assert_eq!(status, StatusCode::OK);
+        let id = state.config.read().await.accounts[0].id.clone();
+        let saved = std::fs::read_to_string(&state.config_path).unwrap();
+
+        for bad in ["daily at noon", ""] {
+            let update = serde_json::json!({ "name": "Renamed", "schedule": bad });
+            let (status, body) = send(&router, "PUT", &format!("/api/accounts/{}", id), update).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body);
+        }
+        let cfg = state.config.read().await;
+        assert_eq!(cfg.accounts[0].name, "N", "no part of the refused update was applied");
+        assert_eq!(cfg.accounts[0].schedule.as_deref(), Some("0 1 * * *"));
+        assert_eq!(std::fs::read_to_string(&state.config_path).unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn the_scheduler_status_names_accounts_without_a_scheduled_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+        let (status, _) = send(&router, "POST", "/api/accounts", new_account("good@example.com", "0 1 * * *")).await;
+        assert_eq!(status, StatusCode::OK);
+        // A schedule that got into the config another way (edited by hand)
+        {
+            let mut cfg = state.config.write().await;
+            let mut broken = cfg.accounts[0].clone();
+            broken.id = "broken".to_string();
+            broken.email = "broken@example.com".to_string();
+            broken.schedule = Some("whenever".to_string());
+            cfg.accounts.push(broken);
+        }
+        // Any later change reloads the scheduler: it must keep the good account
+        let (status, body) = send(&router, "POST", "/api/accounts", new_account("third@example.com", "@daily")).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+
+        let (status, body) = send(&router, "GET", "/api/scheduler/status", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(report["running"], true, "{}", body);
+        assert_eq!(report["scheduled_accounts"], 2, "{}", body);
+        assert_eq!(report["skipped"].as_array().unwrap().len(), 1, "{}", body);
+        assert_eq!(report["skipped"][0]["account_id"], "broken");
+    }
+
+    #[tokio::test]
+    async fn a_csv_row_with_an_invalid_schedule_is_a_row_error() {
+        let csv = "email,password,schedule\nok@example.com,pw,0 2 * * *\nbad@example.com,pw,every 6h\n";
+        let report = mailbackup_core::csv_import::parse_accounts_csv(csv);
+        assert_eq!(report.valid_accounts.len(), 1);
+        assert_eq!(report.valid_accounts[0].email, "ok@example.com");
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].error.contains("every 6h") && report.errors[0].error.contains("bad@example.com"));
     }
 }
