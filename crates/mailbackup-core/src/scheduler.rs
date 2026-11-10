@@ -204,6 +204,7 @@ impl BackupScheduler {
             let creds_clone = self.credentials.clone();
             let status_listener_clone = self.status_listener.clone();
             let config_path_clone = self.config_path.clone();
+            let limits = crate::imap::Limits::from_settings(&config.settings);
 
             info!(
                 "Registering scheduled backup for account '{}' ({}) with cron: '{}' (normalized: '{}')",
@@ -258,7 +259,7 @@ impl BackupScheduler {
                         }
                     };
 
-                    let sync_engine = ImapSyncEngine::new(db.clone(), storage.clone());
+                    let sync_engine = ImapSyncEngine::new(db.clone(), storage.clone()).with_limits(limits);
                     let listener_cb = status_listener.clone();
                     let acc_id_cb = acc.id.clone();
                     let acc_name_cb = acc.name.clone();
@@ -270,6 +271,20 @@ impl BackupScheduler {
                     };
 
                     match sync_engine.sync_account(&acc, &password, Some(progress_cb)).await {
+                        // Stopped part-way (a folder failed or timed out): an error, not a success
+                        Ok(progress) if progress.error.is_some() => {
+                            let err_msg = format!(
+                                "Scheduled background sync of account '{}' stopped after {} message(s): {}",
+                                acc.name,
+                                progress.processed_messages,
+                                progress.error.as_deref().unwrap_or_default()
+                            );
+                            error!("{}", err_msg);
+                            crate::event_log::log_event("SYNC_ERROR", &err_msg);
+                            if let Some(ref l) = status_listener {
+                                l(&acc.id, &acc.name, "error", Some(&progress), Some(&err_msg));
+                            }
+                        }
                         Ok(progress) => {
                             let mb = (progress.downloaded_bytes as f64) / (1024.0 * 1024.0);
                             let msg = format!(

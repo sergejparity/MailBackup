@@ -1613,6 +1613,7 @@ async fn api_sync_account(
         Some(a) => a.clone(),
         None => return (StatusCode::NOT_FOUND, "Account not found").into_response(),
     };
+    let limits = mailbackup_core::imap::Limits::from_settings(&cfg.settings);
     drop(cfg);
     if acc.is_archive() {
         return (StatusCode::CONFLICT, "This account is a read-only archive and isn't synced").into_response();
@@ -1688,7 +1689,7 @@ async fn api_sync_account(
                 return;
             }
         };
-        let sync_engine = ImapSyncEngine::new(db.clone(), storage.clone());
+        let sync_engine = ImapSyncEngine::new(db.clone(), storage.clone()).with_limits(limits);
         let active_syncs_cb = active_syncs.clone();
         let acc_id_cb = acc.id.clone();
         let acc_name_cb = acc.name.clone();
@@ -1712,7 +1713,16 @@ async fn api_sync_account(
             }
         };
 
-        match sync_engine.sync_account(&acc, &password, Some(progress_cb)).await {
+        // A sync that stopped part-way (a folder failed or timed out) is an error
+        let result = match sync_engine.sync_account(&acc, &password, Some(progress_cb)).await {
+            Ok(p) if p.error.is_some() => Err(mailbackup_core::Error::Other(format!(
+                "stopped after {} message(s): {}",
+                p.processed_messages,
+                p.error.as_deref().unwrap_or_default()
+            ))),
+            other => other,
+        };
+        match result {
             Ok(p) => {
                 let mb = (p.downloaded_bytes as f64) / (1024.0 * 1024.0);
                 mailbackup_core::event_log::log_event(

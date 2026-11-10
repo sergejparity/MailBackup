@@ -733,7 +733,8 @@ async fn handle_sync(
                 .unwrap(),
         );
 
-        let sync_engine = ImapSyncEngine::new(db.clone(), storage.clone());
+        let sync_engine =
+            ImapSyncEngine::new(db.clone(), storage.clone()).with_limits(mailbackup_core::imap::Limits::from_settings(&config.settings));
         let pb_clone = pb.clone();
         let progress_cb = move |p: &mailbackup_core::imap::SyncProgress| {
             pb_clone.set_message(format!(
@@ -745,7 +746,16 @@ async fn handle_sync(
             ));
         };
 
-        match sync_engine.sync_account(acc, &password, Some(progress_cb)).await {
+        // A sync that stopped part-way (a folder failed or timed out) is an error
+        let result = match sync_engine.sync_account(acc, &password, Some(progress_cb)).await {
+            Ok(p) if p.error.is_some() => Err(mailbackup_core::Error::Other(format!(
+                "stopped after {} message(s): {}",
+                p.processed_messages,
+                p.error.as_deref().unwrap_or_default()
+            ))),
+            other => other,
+        };
+        match result {
             Ok(progress) => {
                 let mb = (progress.downloaded_bytes as f64) / (1024.0 * 1024.0);
                 mailbackup_core::event_log::log_event(
