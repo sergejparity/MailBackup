@@ -136,6 +136,13 @@ Open your browser at `http://127.0.0.1:8765` to access the full offline email br
 
 **Web access on/off (desktop app):** Settings → General Settings → *Web Access*. When off, MailBackup Studio opens no network port at all: its window gets the interface in-process through a private protocol, scheduled backups keep running, and no browser or other program can reach the UI or API. When on (the default), the same interface is also available in a browser at the address above. The headless server and the OS background service always listen, since that is the only way to reach them; while the background service runs, the desktop window shows it.
 
+**Logging in from a browser:** a browser must log in once with the access key before MailBackup shows it anything. Other programs and other users on the same computer can reach `127.0.0.1` too, so the port alone is not a protection.
+- **The key:** a random key in `.web_access_key` next to `config.yaml`, owner-only, created on first start. The desktop app shows it under Settings, Browser access; `mailbackup web-key` prints it.
+- **The session:** after logging in, the browser keeps a session cookie (`HttpOnly`, `SameSite=Strict`). It ends after 12 hours without use, when you log out, when the server restarts, or when the key is regenerated (Settings, or `mailbackup web-key --regenerate`), which logs every browser out.
+- **Wrong keys:** after 5 failed attempts from one address, that address waits a minute.
+- **The desktop app** logs in for you: only after the server proved it is genuine (see below) does it exchange the key, over `127.0.0.1`, for a one-time login link. The key itself is never put in a URL.
+- **Turning it off:** `require_login: false` under `settings` restores the old behaviour, where anyone who can reach the port can use the API. Only do this on a computer nobody else uses.
+
 **API access:** the server listens on `127.0.0.1` only. Every `/api/*` request must carry a random per-process token, which the server embeds in the page it serves, so other websites and DNS-rebinding attacks can't call the API. The token changes whenever the server restarts, so reload open browser tabs after a restart. The token is only ever sent in the `X-MailBackup-Token` header, never in a URL. Download links instead carry a ticket that the page requests right before each download: it works once, for that one file, within a minute.
 
 **Desktop app and the server it shows:** the desktop app only displays a MailBackup server that proves it was started by your account.
@@ -152,14 +159,17 @@ settings:
   web_port: 8765
   # Interface to listen on. Default: 127.0.0.1 (this computer only).
   # Use 0.0.0.0 to reach the Web Studio from other devices or from outside a
-  # container. Anyone who can reach the port still needs the token, which they
-  # can only get by loading the page, so only do this on networks you trust.
+  # container. Browsers must log in with the access key, but the connection is
+  # plain HTTP: the key, the session and your mail travel unencrypted. Put a
+  # TLS reverse proxy in front of it, and only do this on networks you trust.
   bind_address: 127.0.0.1
   # Host names (besides IP addresses and localhost) the UI may be opened by,
   # e.g. the domain of a reverse proxy in front of the server. Only list
   # names you control.
   allowed_hosts: []
 ```
+
+**Upgrading to 0.8.6 or later:** browsers now have to log in (see above). Open bookmarks lead to the login page; enter the key from the desktop app's settings or from `mailbackup web-key`. The desktop app and the background service need nothing.
 
 **Upgrading from 0.2.4 or earlier:** older versions listened on all interfaces (`0.0.0.0`) and accepted API calls from anywhere without a token.
 - The desktop app, the Windows/macOS/Linux background service and local browser access are unaffected, because they all use `127.0.0.1`.

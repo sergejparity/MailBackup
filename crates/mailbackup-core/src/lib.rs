@@ -21,5 +21,6 @@ pub mod safe_paths;
 pub mod private_fs;
 pub mod html_view;
 pub mod attachments;
+pub mod web_access;
 
 pub use error::{Error, Result};

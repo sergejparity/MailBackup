@@ -217,7 +217,11 @@ pub struct GlobalSettings {
     /// Largest message fetched, in MB, default 256. Larger messages are
     /// recorded as not backed up instead of being fetched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub imap_max_message_mb: Option<u64>,
+    pub imap_max_message_mb: Option<u64>,    /// Browsers must log in with the access key before they get the web UI
+    /// or API (issue #70). Turning it off restores the old behaviour, where
+    /// anyone who can reach the port can use the API. Written only when off.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub require_login: bool,
 }
 
 /// Longest any IMAP timeout may be set to.
@@ -296,6 +300,7 @@ impl Default for GlobalSettings {
             imap_idle_timeout_secs: None,
             imap_command_timeout_secs: None,
             imap_max_message_mb: None,
+            require_login: true,
         }
     }
 }

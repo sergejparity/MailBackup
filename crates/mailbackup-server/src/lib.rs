@@ -64,6 +64,8 @@ pub struct AppState {
     /// server (see `runtime`), with the port it listens on. Never sent to
     /// clients.
     pub identity: Arc<StdRwLock<runtime::ServerIdentity>>,
+    /// Logins and sessions of browsers (see `access`).
+    pub access: Arc<access::Access>,
     /// The HTTP listener, which the desktop app turns on and off with the
     /// `web_server_enabled` setting; `None` when nothing can switch it
     /// (tests).
@@ -79,10 +81,13 @@ pub struct InProcess {
     pub origin: String,
 }
 
+pub mod access;
 pub mod runtime;
 pub mod tickets;
 
 pub const API_TOKEN_HEADER: &str = "x-mailbackup-token";
+/// On a `401` of an API route: the browser has no (more) session.
+pub const LOGIN_REQUIRED_HEADER: &str = "x-mailbackup-login";
 
 /// `Content-Disposition: attachment` for `filename`, valid for any input:
 /// `filename=` carries an ASCII-only copy (quotes, backslashes, control and
@@ -148,6 +153,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/", get(serve_index))
         .route("/api/stats", get(api_stats))
         .route("/api/handshake", get(api_handshake))
+        .route("/login", get(login_page_or_ticket))
+        .route("/api/login", post(api_login))
+        .route("/api/logout", post(api_logout))
+        .route("/api/web-key", get(api_web_key))
+        .route("/api/web-key/regenerate", post(api_web_key_regenerate))
         .route("/api/download-ticket", post(api_download_ticket))
         .route("/api/accounts", get(api_get_accounts).post(api_add_account))
         .route("/api/accounts/import-csv", post(api_import_accounts_csv))
@@ -214,12 +224,13 @@ async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> R
         return guarded(&state, req, next).await;
     }
 
-    let allowed = {
+    let (allowed, require_login) = {
         let cfg = state.config.read().await;
-        match headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
+        let host = match headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
             Some(h) if is_allowed_host(h, &cfg.settings.allowed_hosts) => Some(h.to_string()),
             _ => None,
-        }
+        };
+        (host, cfg.settings.require_login)
     };
     let host = match allowed {
         Some(h) => h,
@@ -240,7 +251,57 @@ async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> R
         }
     }
 
+    // Everything but the login page and what it needs takes a session
+    // (issue #70). Only exact public paths pass: aliases of the app page
+    // (`/index.html`, encoded spellings) are refused like any other path
+    if require_login && !is_public_path(req.uri().path()) {
+        let session = headers
+            .get(header::COOKIE)
+            .and_then(|c| c.to_str().ok())
+            .and_then(access::session_from_cookies)
+            .is_some_and(|token| state.access.session_valid(token));
+        if !session {
+            let res = if req.uri().path().starts_with("/api/") {
+                // The header tells the app's page to go back to the login page
+                (StatusCode::UNAUTHORIZED, [(LOGIN_REQUIRED_HEADER, "1")], "Login required").into_response()
+            } else {
+                login_page()
+            };
+            return with_security_headers(res);
+        }
+    }
+
     guarded(&state, req, next).await
+}
+
+/// Paths a browser without a session may request: the login page, its
+/// script and images, logging in, and the server handshake. Exact matches.
+fn is_public_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/login"
+            | "/login.js"
+            | "/theme-init.js"
+            | "/logo-mark.png"
+            | "/favicon.png"
+            | "/favicon-64.png"
+            | "/favicon.ico"
+            | "/apple-touch-icon.png"
+            | "/api/login"
+            | "/api/handshake"
+    )
+}
+
+fn login_page() -> Response {
+    serve_file("login.html", "")
+}
+
+fn with_security_headers(mut res: Response) -> Response {
+    let headers = res.headers_mut();
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CONTENT_SECURITY_POLICY));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    res
 }
 
 /// The API token (or ticket) check and the security headers, for requests
@@ -249,7 +310,8 @@ async fn guarded(state: &AppState, req: Request, next: Next) -> Response {
     let headers = req.headers();
     // The handshake proves the server's identity to a client that has no
     // credentials yet (see `runtime`); Host/Origin checks above still apply
-    if req.uri().path().starts_with("/api/") && req.uri().path() != "/api/handshake" {
+    // So does logging in, which a browser does before it has the token
+    if req.uri().path().starts_with("/api/") && !matches!(req.uri().path(), "/api/handshake" | "/api/login") {
         let valid = headers
             .get(API_TOKEN_HEADER)
             .and_then(|v| v.to_str().ok())
@@ -259,12 +321,7 @@ async fn guarded(state: &AppState, req: Request, next: Next) -> Response {
         }
     }
 
-    let mut res = next.run(req).await;
-    let headers = res.headers_mut();
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CONTENT_SECURITY_POLICY));
-    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
-    res
+    with_security_headers(next.run(req).await)
 }
 
 /// Whether `req` is a `GET` of a download route carrying a live ticket issued
@@ -523,7 +580,18 @@ impl Server {
             identity: identity.clone(),
             running: Mutex::new(None),
         });
+        // The browser access key exists from the start, so the desktop app
+        // and `mailbackup web-key` find it (issue #70)
+        if let Err(e) = mailbackup_core::web_access::load_or_create_key(&web.config_dir) {
+            error!("Couldn't create the browser access key in {}: {}", web.config_dir.display(), e);
+        }
+        if !config_arc.read().await.settings.require_login {
+            tracing::warn!(
+                "settings.require_login is off: anyone who can reach the web port can use the whole API without logging in"
+            );
+        }
         let state = AppState {
+            access: Arc::new(access::Access::new(web.config_dir.clone())),
             config: config_arc,
             config_path,
             db,
@@ -618,6 +686,17 @@ impl Drop for ClosingListener {
     }
 }
 
+/// The peer address of a connection to the [`ClosingListener`], available
+/// to handlers as `ConnectInfo<PeerAddr>` (failed logins are limited per peer).
+#[derive(Clone, Copy, Debug)]
+pub struct PeerAddr(pub SocketAddr);
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, ClosingListener>> for PeerAddr {
+    fn connect_info(stream: axum::serve::IncomingStream<'_, ClosingListener>) -> Self {
+        PeerAddr(*stream.remote_addr())
+    }
+}
+
 impl axum::serve::Listener for ClosingListener {
     type Io = tokio::net::TcpStream;
     type Addr = SocketAddr;
@@ -652,7 +731,7 @@ impl WebListener {
         let addr = SocketAddr::new(self.bind_ip, port);
         if !self.bind_ip.is_loopback() {
             tracing::warn!(
-                "Web UI / REST API is exposed on {} (bind_address). It is reachable from other machines on the network.",
+                "Web UI / REST API is exposed on {} (bind_address). It is reachable from other machines on the network over plain HTTP: the access key, the session and your mail travel unencrypted. Put a TLS reverse proxy in front of it.",
                 addr
             );
         }
@@ -673,7 +752,9 @@ impl WebListener {
             let shutdown = async move {
                 let _ = stopped.await;
             };
-            if let Err(e) = axum::serve(listener, router).with_graceful_shutdown(shutdown).await {
+            // Peer addresses, for limiting failed logins per peer
+            let service = router.into_make_service_with_connect_info::<PeerAddr>();
+            if let Err(e) = axum::serve(listener, service).with_graceful_shutdown(shutdown).await {
                 error!("The web server stopped: {}", e);
             }
         });
@@ -748,6 +829,144 @@ async fn api_handshake(State(state): State<AppState>, Query(query): Query<Handsh
     }
 }
 
+// ---- Logging in (issue #70; see `access`) ----
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    key: String,
+    /// Answer with a single-use login ticket instead of a session cookie
+    /// (the desktop app, which hands the ticket to its window)
+    #[serde(default)]
+    ticket: bool,
+}
+
+const MAX_LOGIN_BODY: usize = 4 * 1024;
+
+/// `POST /api/login` with `{"key": …}`: a session cookie for the access key.
+/// JSON only, so a cross-origin form can't send it (and the guard already
+/// refused other origins); failures are limited per peer address.
+async fn api_login(State(state): State<AppState>, req: Request) -> Response {
+    let json = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json")));
+    if !json {
+        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "Expected application/json").into_response();
+    }
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<PeerAddr>>()
+        .map(|info| info.0.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let secure = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|o| o.to_str().ok())
+        .is_some_and(|o| o.to_ascii_lowercase().starts_with("https://"));
+    let Ok(body) = axum::body::to_bytes(req.into_body(), MAX_LOGIN_BODY).await else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "Request too large").into_response();
+    };
+    let Ok(login) = serde_json::from_slice::<LoginRequest>(&body) else {
+        return (StatusCode::BAD_REQUEST, "Expected {\"key\": \"…\"}").into_response();
+    };
+    let access = state.access.clone();
+    let result = if login.ticket { access.login_ticket(&peer, &login.key) } else { access.login(&peer, &login.key) };
+    match result {
+        Ok(ticket) if login.ticket => {
+            Json(serde_json::json!({ "ticket": ticket, "expires_in": access::TICKET_TTL.as_secs() })).into_response()
+        }
+        Ok(session) => {
+            info!("Browser logged in from {}", peer);
+            let mut res = StatusCode::NO_CONTENT.into_response();
+            if let Ok(cookie) = HeaderValue::from_str(&access::session_cookie(&session, secure)) {
+                res.headers_mut().insert(header::SET_COOKIE, cookie);
+            }
+            res
+        }
+        Err(access::LoginError::WrongKey) => {
+            tracing::warn!("Failed login from {}", peer);
+            (StatusCode::UNAUTHORIZED, "Wrong access key").into_response()
+        }
+        Err(access::LoginError::TooMany(wait)) => {
+            tracing::warn!("Too many failed logins from {}", peer);
+            let mut res = (StatusCode::TOO_MANY_REQUESTS, "Too many failed logins; try again later").into_response();
+            if let Ok(secs) = HeaderValue::from_str(&wait.as_secs().max(1).to_string()) {
+                res.headers_mut().insert(header::RETRY_AFTER, secs);
+            }
+            res
+        }
+        Err(access::LoginError::Unavailable(e)) => {
+            error!("The access key can't be read: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "The access key can't be read").into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LoginTicketQuery {
+    ticket: Option<String>,
+}
+
+/// `GET /login`: the login page, or with `?ticket=` (the desktop app) a
+/// session for a single-use login ticket and a redirect to the app.
+async fn login_page_or_ticket(State(state): State<AppState>, Query(query): Query<LoginTicketQuery>) -> Response {
+    let Some(ticket) = query.ticket.filter(|t| !t.is_empty()) else {
+        return login_page();
+    };
+    match state.access.redeem_ticket(&ticket) {
+        Some(session) => {
+            let mut res = (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
+            if let Ok(cookie) = HeaderValue::from_str(&access::session_cookie(&session, false)) {
+                res.headers_mut().insert(header::SET_COOKIE, cookie);
+            }
+            res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            res
+        }
+        None => login_page(),
+    }
+}
+
+async fn api_logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    if let Some(token) = headers.get(header::COOKIE).and_then(|c| c.to_str().ok()).and_then(access::session_from_cookies) {
+        state.access.logout(token);
+    }
+    let mut res = StatusCode::NO_CONTENT.into_response();
+    if let Ok(cookie) = HeaderValue::from_str(&access::expired_cookie()) {
+        res.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
+    res
+}
+
+/// The access key, for a user who is already in (a session or the desktop
+/// window), so they can open the UI in a browser.
+async fn api_web_key(State(state): State<AppState>) -> Response {
+    match state.access.key() {
+        Ok(key) => Json(serde_json::json!({
+            "key": key,
+            "path": mailbackup_core::web_access::key_path(&state.config_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default()),
+            "require_login": state.config.read().await.settings.require_login,
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// A new access key: every browser session ends, this one included.
+async fn api_web_key_regenerate(State(state): State<AppState>) -> Response {
+    match state.access.regenerate() {
+        Ok(key) => {
+            mailbackup_core::event_log::log_event("WEB_KEY_REGENERATED", "Browser access key regenerated; all browser sessions ended");
+            let mut res = Json(serde_json::json!({ "key": key })).into_response();
+            if let Ok(cookie) = HeaderValue::from_str(&access::expired_cookie()) {
+                res.headers_mut().insert(header::SET_COOKIE, cookie);
+            }
+            res
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 // Static Assets Handler
 async fn serve_index(State(state): State<AppState>) -> impl IntoResponse {
     serve_file("index.html", &state.api_token)
@@ -775,7 +994,7 @@ fn serve_file(path: &str, api_token: &str) -> Response {
                 header::CONTENT_TYPE,
                 HeaderValue::from_str(mime.as_ref()).unwrap_or(HeaderValue::from_static("application/octet-stream")),
             );
-            if clean_path == "index.html" {
+            if clean_path == "index.html" || clean_path == "login.html" {
                 res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             }
             res
@@ -2812,7 +3031,11 @@ mod tests {
         )
         .await
         .unwrap();
+        // These tests are about other things; the login is tested on its own
+        // with it turned on (see `login_state`)
+        config.settings.require_login = false;
         AppState {
+            access: Arc::new(access::Access::new(dir.to_path_buf())),
             config: Arc::new(RwLock::new(config)),
             config_path: dir.join("config.yaml"),
             db,
@@ -4361,5 +4584,236 @@ mod tests {
 
         let (status, _) = send(&router, "POST", "/api/accounts/nobody/skipped/retry", serde_json::json!(null)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ---- Logging in (issue #70) ----
+
+    async fn login_state(dir: &std::path::Path) -> AppState {
+        let state = test_state(dir, Vec::new()).await;
+        state.config.write().await.settings.require_login = true;
+        state
+    }
+
+    /// A request as a browser on this machine sends it.
+    fn browser(method: &str, uri: &str) -> axum::http::request::Builder {
+        HttpRequest::builder().method(method).uri(uri).header(header::HOST, "127.0.0.1:8765")
+    }
+
+    async fn call(router: &Router, req: HttpRequest<Body>) -> (StatusCode, axum::http::HeaderMap, String) {
+        let res = router.clone().oneshot(req).await.unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, headers, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn login_request(key: &str, peer: &str) -> HttpRequest<Body> {
+        let mut req = browser("POST", "/api/login")
+            .header(header::ORIGIN, "http://127.0.0.1:8765")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "key": key }).to_string()))
+            .unwrap();
+        let addr: SocketAddr = format!("{}:50000", peer).parse().unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(PeerAddr(addr)));
+        req
+    }
+
+    /// Logs in and returns the `Cookie` header value of the session.
+    async fn logged_in(router: &Router, state: &AppState) -> String {
+        let key = state.access.key().unwrap();
+        let (status, headers, body) = call(router, login_request(&key, "127.0.0.1")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{}", body);
+        let cookie = headers.get(header::SET_COOKIE).unwrap().to_str().unwrap();
+        cookie.split(';').next().unwrap().to_string()
+    }
+
+    /// Every route registered in `create_router` (read from this file, so a
+    /// route added later is covered too), with path parameters filled in.
+    fn registered_routes() -> Vec<String> {
+        let source = include_str!("lib.rs");
+        let body = &source[source.find("pub fn create_router").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let mut routes = Vec::new();
+        for part in body.split(".route(").skip(1) {
+            let path = part.split('"').nth(1).unwrap();
+            let filled: String = path
+                .split('/')
+                .map(|seg| match seg {
+                    "{*file}" => "index.html",
+                    s if s.starts_with('{') => "1",
+                    s => s,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            routes.push(filled);
+        }
+        assert!(routes.len() > 30, "found the routes: {:?}", routes);
+        routes
+    }
+
+    #[tokio::test]
+    async fn without_a_session_no_route_but_the_public_ones_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = login_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let mut paths = registered_routes();
+        // Aliases of the app page and assets
+        paths.extend(["/index.html", "/%69ndex.html", "/./index.html", "/app.js", "/styles.css", "/fonts/fonts.css"].map(String::from));
+        for path in paths {
+            if is_public_path(&path) {
+                continue;
+            }
+            for method in ["GET", "POST", "PUT", "DELETE"] {
+                let req = browser(method, &path).header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap();
+                let (status, headers, body) = call(&router, req).await;
+                assert!(!body.contains(TOKEN), "{} {} leaked the token", method, path);
+                if path.starts_with("/api/") {
+                    assert_eq!(status, StatusCode::UNAUTHORIZED, "{} {}", method, path);
+                    assert!(headers.contains_key(LOGIN_REQUIRED_HEADER), "{} {}", method, path);
+                } else {
+                    assert!(body.contains("login-form"), "{} {}: the login page", method, path);
+                }
+            }
+        }
+        // The handshake stays open and minimal
+        let handshake = format!("/api/handshake?nonce={}", "ab".repeat(32));
+        let (status, _, _) = call(&router, browser("GET", &handshake).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_session_gets_the_page_with_the_token_but_api_calls_still_need_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = login_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let cookie = logged_in(&router, &state).await;
+
+        let (status, headers, page) = call(&router, browser("GET", "/").header(header::COOKIE, &cookie).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains(TOKEN), "the app page, with its token");
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+
+        // The cookie alone doesn't make a request the app's own (CSRF)
+        let req = browser("POST", "/api/logs/clear").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
+        assert_eq!(call(&router, req).await.0, StatusCode::UNAUTHORIZED);
+        let req = browser("GET", "/api/stats").header(header::COOKIE, &cookie).header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap();
+        assert_eq!(call(&router, req).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn logins_are_checked_and_limited_per_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = login_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let key = state.access.key().unwrap();
+
+        // Another origin, or not JSON: refused before the key is looked at
+        let req = browser("POST", "/api/login")
+            .header(header::ORIGIN, "http://evil.example")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "key": key }).to_string()))
+            .unwrap();
+        assert_eq!(call(&router, req).await.0, StatusCode::FORBIDDEN);
+        let req = browser("POST", "/api/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("key={}", key)))
+            .unwrap();
+        assert_eq!(call(&router, req).await.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        for _ in 0..access::MAX_FAILURES {
+            let (status, headers, _) = call(&router, login_request(&"0".repeat(64), "10.0.0.9")).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert!(headers.get(header::SET_COOKIE).is_none());
+        }
+        let (status, headers, _) = call(&router, login_request(&key, "10.0.0.9")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "even the right key waits");
+        assert!(headers.contains_key(header::RETRY_AFTER));
+        let (status, _, _) = call(&router, login_request(&key, "10.0.0.10")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "another peer is not affected");
+    }
+
+    #[tokio::test]
+    async fn a_new_key_and_a_logout_end_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = login_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let get_stats = |cookie: &str| {
+            browser("GET", "/api/stats").header(header::COOKIE, cookie).header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap()
+        };
+
+        let first = logged_in(&router, &state).await;
+        let second = logged_in(&router, &state).await;
+        let regenerate = browser("POST", "/api/web-key/regenerate")
+            .header(header::COOKIE, &first)
+            .header(API_TOKEN_HEADER, TOKEN)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = call(&router, regenerate).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        assert_eq!(call(&router, get_stats(&first)).await.0, StatusCode::UNAUTHORIZED, "the session that asked too");
+        assert_eq!(call(&router, get_stats(&second)).await.0, StatusCode::UNAUTHORIZED);
+
+        let third = logged_in(&router, &state).await;
+        assert_eq!(call(&router, get_stats(&third)).await.0, StatusCode::OK);
+        let logout = browser("POST", "/api/logout").header(header::COOKIE, &third).header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap();
+        let (_, headers, _) = call(&router, logout).await;
+        assert!(headers.get(header::SET_COOKIE).unwrap().to_str().unwrap().contains("Max-Age=0"));
+        assert_eq!(call(&router, get_stats(&third)).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_login_ticket_opens_one_session_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = login_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let key = state.access.key().unwrap();
+        let req = browser("POST", "/api/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "key": key, "ticket": true }).to_string()))
+            .unwrap();
+        let (status, headers, body) = call(&router, req).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        assert!(headers.get(header::SET_COOKIE).is_none(), "a ticket, not a session");
+        let ticket = serde_json::from_str::<serde_json::Value>(&body).unwrap()["ticket"].as_str().unwrap().to_string();
+
+        let redeem = || browser("GET", &format!("/login?ticket={}", ticket)).body(Body::empty()).unwrap();
+        let (status, headers, _) = call(&router, redeem()).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers.get(header::LOCATION).unwrap(), "/");
+        let cookie = headers.get(header::SET_COOKIE).unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+        let (status, _, page) = call(&router, browser("GET", "/").header(header::COOKIE, &cookie).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains(TOKEN));
+
+        let (status, headers, page) = call(&router, redeem()).await;
+        assert_eq!(status, StatusCode::OK, "used up: the login page");
+        assert!(headers.get(header::SET_COOKIE).is_none());
+        assert!(page.contains("login-form"));
+    }
+
+    #[tokio::test]
+    async fn the_desktop_window_needs_no_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = login_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let req = in_process(HttpRequest::builder().uri("/api/stats").header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap());
+        assert_eq!(call(&router, req).await.0, StatusCode::OK);
+        let req = in_process(HttpRequest::builder().uri("/").body(Body::empty()).unwrap());
+        assert!(call(&router, req).await.2.contains(TOKEN));
+        // ...and it can show the key, so the user can log in elsewhere
+        let req = in_process(HttpRequest::builder().uri("/api/web-key").header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap());
+        let (status, _, body) = call(&router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(&state.access.key().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn with_login_turned_off_the_page_is_served_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        assert!(!state.config.read().await.settings.require_login);
+        let router = create_router(state);
+        let (status, _, page) = call(&router, browser("GET", "/").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains(TOKEN));
     }
 }

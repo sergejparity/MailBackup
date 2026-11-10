@@ -22,7 +22,11 @@ window.fetch = (input, init = {}) => {
   if (!isApiUrl(url)) return nativeFetch(input, init);
   const headers = new Headers(init.headers || (typeof input === 'string' ? undefined : input.headers));
   headers.set('X-MailBackup-Token', API_TOKEN);
-  return nativeFetch(input, { ...init, headers });
+  return nativeFetch(input, { ...init, headers }).then((res) => {
+    // The session ended (idle, logout elsewhere, new access key): log in again
+    if (res.status === 401 && res.headers.get('X-MailBackup-Login')) window.location.replace('/');
+    return res;
+  });
 };
 
 // Downloads `url` (a same-origin /api/ download route) with a ticket that
@@ -957,6 +961,49 @@ function showSavedOrWarning(responseText, savedMessage) {
   if (at >= 0) showToast(`Saved. ${responseText.slice(at)}`, 9000);
   else showToast(savedMessage);
 }
+
+// Browser access key (issue #70): shown only on request
+async function showWebKey() {
+  try {
+    const res = await fetch('/api/web-key');
+    if (!res.ok) {
+      showToast(`Couldn't read the access key: ${await res.text()}`);
+      return;
+    }
+    const data = await res.json();
+    document.getElementById('web-key-value').textContent = data.key;
+  } catch (err) {
+    showToast(`Network error: ${err}`);
+  }
+}
+
+async function regenerateWebKey() {
+  if (!confirm('Create a new access key? Every browser that is logged in, this one included, has to log in again with the new key.')) return;
+  try {
+    const res = await fetch('/api/web-key/regenerate', { method: 'POST' });
+    if (!res.ok) {
+      showToast(`Couldn't regenerate the key: ${await res.text()}`);
+      return;
+    }
+    const data = await res.json();
+    document.getElementById('web-key-value').textContent = data.key;
+    showToast('New access key created. Browsers must log in with it again.', 6000);
+  } catch (err) {
+    showToast(`Network error: ${err}`);
+  }
+}
+
+async function logOutOfBrowser() {
+  try {
+    await fetch('/api/logout', { method: 'POST' });
+  } finally {
+    window.location.replace('/');
+  }
+}
+
+document.getElementById('btn-web-key-show')?.addEventListener('click', showWebKey);
+document.getElementById('btn-web-key-regenerate')?.addEventListener('click', regenerateWebKey);
+document.getElementById('btn-web-logout')?.addEventListener('click', logOutOfBrowser);
 
 // Messages not backed up because of their size (issue #72), counted by account
 async function loadSkippedMessages() {

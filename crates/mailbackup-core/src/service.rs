@@ -449,7 +449,7 @@ impl ServiceEnv {
 pub fn ownership_candidates(config_path: &Path) -> Vec<PathBuf> {
     let mut paths = vec![config_path.to_path_buf()];
     if let Some(dir) = config_path.parent() {
-        for name in [".credentials_store.json", "credentials_store.json", ".credentials_key"] {
+        for name in [".credentials_store.json", "credentials_store.json", ".credentials_key", crate::web_access::KEY_FILE] {
             paths.push(dir.join(name));
         }
     }

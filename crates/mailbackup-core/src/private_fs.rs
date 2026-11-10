@@ -397,7 +397,8 @@ pub fn sensitive_targets(config_path: &Path) -> Vec<Target> {
 
 /// [`sensitive_targets`] with the app folder given explicitly.
 pub fn sensitive_targets_in(config_path: &Path, base: &Path) -> Vec<Target> {
-    const STORE_FILES: [&str; 3] = [".credentials_store.json", "credentials_store.json", ".credentials_key"];
+    // With the browser access key (issue #70)
+    const STORE_FILES: [&str; 4] = [".credentials_store.json", "credentials_store.json", ".credentials_key", crate::web_access::KEY_FILE];
     let mut targets = Vec::new();
     if let (Some(dir), Some(name)) = (config_path.parent(), config_path.file_name()) {
         let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };

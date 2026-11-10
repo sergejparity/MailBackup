@@ -29,7 +29,11 @@ fn ui_url(port: u16) -> Result<tauri::Url, String> {
     let config_dir = config_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
     if mailbackup_server::runtime::verify_genuine(&config_dir, port).is_some() {
         println!("Using the MailBackup server already running on port {}", port);
-        return format!("http://127.0.0.1:{}/", port).parse().map_err(|e| format!("{}", e));
+        // Logged in for the user with a single-use ticket, only after the
+        // server proved itself (issue #70); without one the window shows the
+        // login page
+        let path = mailbackup_server::runtime::desktop_login_path(&config_dir, port).unwrap_or_else(|| "/".to_string());
+        return format!("http://127.0.0.1:{}{}", port, path).parse().map_err(|e| format!("{}", e));
     }
     let server = tauri::async_runtime::block_on(mailbackup_server::Server::build(None, Some(port), false))
         .map_err(|e| e.to_string())?;
