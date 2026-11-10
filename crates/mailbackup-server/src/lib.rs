@@ -1082,11 +1082,14 @@ fn checked_schedule(schedule: &str) -> mailbackup_core::Result<String> {
 
 /// Messages that are not backed up because of their size (issue #72), of
 /// every account.
-async fn api_skipped_messages(State(state): State<AppState>) -> impl IntoResponse {
-    match state.db.skipped_messages(None) {
-        Ok(list) => Json(list).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+async fn api_skipped_messages(State(state): State<AppState>) -> Response {
+    blocking(move || -> Response {
+        match state.db.skipped_messages(None) {
+            Ok(list) => Json(list).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    })
+    .await
 }
 
 /// The account's skipped messages are fetched on its next sync, whatever
@@ -1107,12 +1110,38 @@ async fn api_scheduler_status(State(state): State<AppState>) -> impl IntoRespons
     Json(state.scheduler.lock().await.status().clone()).into_response()
 }
 
-// REST Handlers
-async fn api_stats(State(state): State<AppState>) -> impl IntoResponse {
-    match state.db.get_storage_stats() {
-        Ok(stats) => Json(stats).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+/// How many requests do blocking work at once (reading and parsing archived
+/// messages, searches, listings; issue #76). Others wait for a permit, so a burst of
+/// requests can't fill the blocking pool or memory.
+const HEAVY_WORK_PERMITS: usize = 4;
+static HEAVY_WORK: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(HEAVY_WORK_PERMITS)));
+
+/// Runs a handler's blocking work (SQLite, file reads, parsing) on the
+/// blocking pool instead of an async worker, bounded by [`HEAVY_WORK`]
+/// (issue #76). The permit goes with the task: a client that disconnects
+/// doesn't end work already running, so the permit is held until it ends.
+async fn blocking<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+    let permit = HEAVY_WORK.clone().acquire_owned().await.expect("the heavy work semaphore is never closed");
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    });
+    match task.await {
+        Ok(r) => r,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
     }
+}
+
+// REST Handlers
+async fn api_stats(State(state): State<AppState>) -> Response {
+    blocking(move || -> Response {
+        match state.db.get_storage_stats() {
+            Ok(stats) => Json(stats).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    })
+    .await
 }
 
 async fn api_get_accounts(State(state): State<AppState>) -> impl IntoResponse {
@@ -1673,11 +1702,14 @@ fn test_connection_message(err: Option<&mailbackup_core::Error>, acc: &AccountCo
 async fn api_get_folders(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
-) -> impl IntoResponse {
-    match state.db.get_folders(&account_id) {
-        Ok(folders) => Json(folders).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+) -> Response {
+    blocking(move || -> Response {
+        match state.db.get_folders(&account_id) {
+            Ok(folders) => Json(folders).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    })
+    .await
 }
 
 /// The account's server id sources that are distrusted (inconsistent ids)
@@ -1685,11 +1717,14 @@ async fn api_get_folders(
 async fn api_get_server_id_states(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
-) -> impl IntoResponse {
-    match state.db.server_id_states(&account_id) {
-        Ok(states) => Json(states).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+) -> Response {
+    blocking(move || -> Response {
+        match state.db.server_id_states(&account_id) {
+            Ok(states) => Json(states).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    })
+    .await
 }
 
 #[derive(Deserialize, Default)]
@@ -1723,11 +1758,7 @@ async fn api_get_messages(
     };
     let limit = query.limit.unwrap_or(200);
     let db = state.db.clone();
-    let page = tokio::task::spawn_blocking(move || {
-        db.list_folder_messages(&folder_id, sort, descending, limit, query.cursor.as_deref())
-    })
-    .await
-    .unwrap_or_else(|e| Err(mailbackup_core::Error::Other(format!("listing task failed: {}", e))));
+    let page = blocking(move || db.list_folder_messages(&folder_id, sort, descending, limit, query.cursor.as_deref())).await;
     match page {
         Ok(page) => Json(page).into_response(),
         Err(e) => (error_status(&e), e.to_string()).into_response(),
@@ -1758,73 +1789,79 @@ struct AttachmentDetail {
 async fn api_get_message_detail(
     State(state): State<AppState>,
     Path(message_id): Path<String>,
-) -> impl IntoResponse {
-    let msg_rec = match state.db.get_message_by_id(&message_id) {
-        Ok(Some(m)) => m,
-        _ => return (StatusCode::NOT_FOUND, "Message not found").into_response(),
-    };
+) -> Response {
+    blocking(move || -> Response {
+        let msg_rec = match state.db.get_message_by_id(&message_id) {
+            Ok(Some(m)) => m,
+            _ => return (StatusCode::NOT_FOUND, "Message not found").into_response(),
+        };
 
-    let eml_bytes = match state.storage.read_eml(&msg_rec.relative_path) {
-        Ok(b) => b,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read .eml file: {}", e)).into_response(),
-    };
+        let eml_bytes = match state.storage.read_eml(&msg_rec.relative_path) {
+            Ok(b) => b,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read .eml file: {}", e)).into_response(),
+        };
 
-    let parsed = MessageParser::default().parse(&eml_bytes);
-    let (html, text, attachments) = if let Some(p) = parsed {
-        // Inline images (`cid:`) as data: URIs; the viewer blocks remote content
-        let html_content = p.body_html(0).map(|s| mailbackup_core::html_view::inline_cid_images(&s, &p));
-        let text_content = p.body_text(0).map(|s| s.to_string());
+        let parsed = MessageParser::default().parse(&eml_bytes);
+        let (html, text, attachments) = if let Some(p) = parsed {
+            // Inline images (`cid:`) as data: URIs; the viewer blocks remote content
+            let html_content = p.body_html(0).map(|s| mailbackup_core::html_view::inline_cid_images(&s, &p));
+            let text_content = p.body_text(0).map(|s| s.to_string());
 
-        let atts = mailbackup_core::attachments::summaries(&p)
-            .into_iter()
-            .map(|(filename, mime_type, size_bytes)| AttachmentDetail { filename, mime_type, size_bytes })
-            .collect();
-        (html_content, text_content, atts)
-    } else {
-        (None, None, Vec::new())
-    };
+            let atts = mailbackup_core::attachments::summaries(&p)
+                .into_iter()
+                .map(|(filename, mime_type, size_bytes)| AttachmentDetail { filename, mime_type, size_bytes })
+                .collect();
+            (html_content, text_content, atts)
+        } else {
+            (None, None, Vec::new())
+        };
 
-    let resp = MessageDetailResponse {
-        id: msg_rec.id,
-        account_id: msg_rec.account_id,
-        folder_id: msg_rec.folder_id,
-        subject: msg_rec.subject,
-        from_addr: msg_rec.from_addr,
-        to_addrs: msg_rec.to_addrs,
-        date: msg_rec.date,
-        body_html: html,
-        body_text: text,
-        attachments,
-    };
+        let resp = MessageDetailResponse {
+            id: msg_rec.id,
+            account_id: msg_rec.account_id,
+            folder_id: msg_rec.folder_id,
+            subject: msg_rec.subject,
+            from_addr: msg_rec.from_addr,
+            to_addrs: msg_rec.to_addrs,
+            date: msg_rec.date,
+            body_html: html,
+            body_text: text,
+            attachments,
+        };
 
-    Json(resp).into_response()
+        Json(resp).into_response()
+    })
+    .await
 }
 
 async fn api_download_eml(
     State(state): State<AppState>,
     Path(message_id): Path<String>,
-) -> impl IntoResponse {
-    let msg = match state.db.get_message_by_id(&message_id) {
-        Ok(Some(m)) => m,
-        _ => return (StatusCode::NOT_FOUND, "Message not found").into_response(),
-    };
+) -> Response {
+    blocking(move || -> Response {
+        let msg = match state.db.get_message_by_id(&message_id) {
+            Ok(Some(m)) => m,
+            _ => return (StatusCode::NOT_FOUND, "Message not found").into_response(),
+        };
 
-    match state.storage.read_eml(&msg.relative_path) {
-        Ok(bytes) => {
-            let filename = format!("{}.eml", msg.uid);
-            let mut res = Response::new(Body::from(bytes));
-            res.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("message/rfc822"),
-            );
-            res.headers_mut().insert(
-                header::CONTENT_DISPOSITION,
-                attachment_disposition(&filename),
-            );
-            res
+        match state.storage.read_eml(&msg.relative_path) {
+            Ok(bytes) => {
+                let filename = format!("{}.eml", msg.uid);
+                let mut res = Response::new(Body::from(bytes));
+                res.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("message/rfc822"),
+                );
+                res.headers_mut().insert(
+                    header::CONTENT_DISPOSITION,
+                    attachment_disposition(&filename),
+                );
+                res
+            }
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    })
+    .await
 }
 
 /// One attachment of an archived message, decoded: the `index`-th entry of
@@ -1835,26 +1872,29 @@ async fn api_download_attachment(
     State(state): State<AppState>,
     Path((message_id, index)): Path<(String, usize)>,
 ) -> Response {
-    let msg = match state.db.get_message_by_id(&message_id) {
-        Ok(Some(m)) => m,
-        _ => return (StatusCode::NOT_FOUND, "Message not found").into_response(),
-    };
-    let eml = match state.storage.read_eml(&msg.relative_path) {
-        Ok(bytes) => bytes,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    let Some(parsed) = MessageParser::default().parse(&eml) else {
-        return (StatusCode::NOT_FOUND, "Attachment not found").into_response();
-    };
-    let Some(part) = mailbackup_core::attachments::parts(&parsed).nth(index) else {
-        return (StatusCode::NOT_FOUND, "Attachment not found").into_response();
-    };
-    let filename = attachment_filename(part.attachment_name(), part.content_type().as_ref(), index);
-    let mut res = Response::new(Body::from(part.decoded().into_owned()));
-    res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
-    res.headers_mut().insert(header::CONTENT_DISPOSITION, attachment_disposition(&filename));
-    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    res
+    blocking(move || -> Response {
+        let msg = match state.db.get_message_by_id(&message_id) {
+            Ok(Some(m)) => m,
+            _ => return (StatusCode::NOT_FOUND, "Message not found").into_response(),
+        };
+        let eml = match state.storage.read_eml(&msg.relative_path) {
+            Ok(bytes) => bytes,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        let Some(parsed) = MessageParser::default().parse(&eml) else {
+            return (StatusCode::NOT_FOUND, "Attachment not found").into_response();
+        };
+        let Some(part) = mailbackup_core::attachments::parts(&parsed).nth(index) else {
+            return (StatusCode::NOT_FOUND, "Attachment not found").into_response();
+        };
+        let filename = attachment_filename(part.attachment_name(), part.content_type().as_ref(), index);
+        let mut res = Response::new(Body::from(part.decoded().into_owned()));
+        res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+        res.headers_mut().insert(header::CONTENT_DISPOSITION, attachment_disposition(&filename));
+        res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        res
+    })
+    .await
 }
 
 /// The name an attachment is saved under: its own name (without any
@@ -1902,32 +1942,35 @@ struct SearchParams {
 async fn api_search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
-) -> impl IntoResponse {
-    let min_size_bytes = params.min_size_mb.map(|mb| (mb * 1024.0 * 1024.0) as u64);
+) -> Response {
+    blocking(move || -> Response {
+        let min_size_bytes = params.min_size_mb.map(|mb| (mb * 1024.0 * 1024.0) as u64);
 
-    let filter = AdvancedSearchFilter {
-        query: params.q,
-        exclude_words: params.exclude,
-        from: params.from,
-        to: params.to,
-        cc: params.cc,
-        subject: params.subject,
-        date_from: params.date_from,
-        date_to: params.date_to,
-        account_id: params.account_id,
-        folder_id: params.folder_id,
-        has_attachments: params.has_attachments,
-        attachment_name: params.att_name,
-        attachment_type: params.att_type,
-        min_size_bytes,
-        include_deleted: params.include_deleted,
-        limit: params.limit.or(Some(50)),
-    };
+        let filter = AdvancedSearchFilter {
+            query: params.q,
+            exclude_words: params.exclude,
+            from: params.from,
+            to: params.to,
+            cc: params.cc,
+            subject: params.subject,
+            date_from: params.date_from,
+            date_to: params.date_to,
+            account_id: params.account_id,
+            folder_id: params.folder_id,
+            has_attachments: params.has_attachments,
+            attachment_name: params.att_name,
+            attachment_type: params.att_type,
+            min_size_bytes,
+            include_deleted: params.include_deleted,
+            limit: params.limit.or(Some(50)),
+        };
 
-    match state.db.search_advanced(&filter) {
-        Ok(results) => Json(results).into_response(),
-        Err(e) => (error_status(&e), e.to_string()).into_response(),
-    }
+        match state.db.search_advanced(&filter) {
+            Ok(results) => Json(results).into_response(),
+            Err(e) => (error_status(&e), e.to_string()).into_response(),
+        }
+    })
+    .await
 }
 
 async fn api_get_sync_status(State(state): State<AppState>) -> impl IntoResponse {
@@ -3093,6 +3136,46 @@ mod tests {
     use mailbackup_core::server_ids::ServerIdKind;
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// Handlers' blocking work runs on the blocking pool, at most
+    /// HEAVY_WORK_PERMITS at a time, and goes on after its caller is gone,
+    /// holding its permit until it ends (issue #76).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_work_is_bounded_and_outlives_its_caller() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (running, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let calls: Vec<_> = (0..HEAVY_WORK_PERMITS * 3)
+            .map(|_| {
+                let (running, peak) = (running.clone(), peak.clone());
+                tokio::spawn(blocking(move || {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                }))
+            })
+            .collect();
+        for call in calls {
+            call.await.unwrap();
+        }
+        let peak = peak.load(Ordering::SeqCst);
+        assert!((1..=HEAVY_WORK_PERMITS).contains(&peak), "{} at once", peak);
+
+        // The caller is dropped while its work runs: the work still finishes
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(blocking(move || {
+            started_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            done_tx.send(()).unwrap();
+        }));
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap()).await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        finish_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), done_rx).await.unwrap().unwrap();
+    }
 
     async fn test_router(dir: &std::path::Path) -> Router {
         test_router_with(dir, Vec::new()).await

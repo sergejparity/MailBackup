@@ -3,6 +3,7 @@ use crate::server_ids::{ServerId, ServerIdKind, SourcedId};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -1622,6 +1623,16 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// The UIDs above `above_uid` that `generation` already archived in the
+    /// folder, in one query (a sync's existence check used to run one query
+    /// per UID; issue #76).
+    pub fn archived_uids_above(&self, folder_id: &str, generation: u32, above_uid: u32) -> Result<HashSet<u32>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT uid FROM messages WHERE folder_id = ?1 AND uid_generation = ?2 AND uid > ?3")?;
+        let rows = stmt.query_map(params![folder_id, generation, above_uid], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Whether `uid` of `generation` is archived in the folder.
     pub fn message_exists_in_generation(&self, folder_id: &str, generation: u32, uid: u32) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
@@ -2619,5 +2630,20 @@ mod tests {
         assert_eq!((report.messages, report.merged), (1, 1));
         let body: String = conn.query_row("SELECT body_text FROM messages_fts WHERE rowid = 1", [], |r| r.get(0)).unwrap();
         assert_eq!(body, "first body of twenty bytes\nsecond body of twenty bytes");
+    }
+
+    /// Writers from the CLI, the service and the app wait for each other
+    /// instead of failing at once with SQLITE_BUSY. rusqlite sets 5 s on every
+    /// connection it opens; this notices if that ever changes (issue #76).
+    #[test]
+    fn the_catalog_waits_for_other_writers_after_open_and_relocate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("a.db")).unwrap();
+        let timeout = |db: &Database| -> i64 {
+            db.conn.lock().unwrap().query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap()
+        };
+        assert!(timeout(&db) >= 1000, "after open: {} ms", timeout(&db));
+        db.relocate(dir.path().join("b.db"), true).unwrap();
+        assert!(timeout(&db) >= 1000, "after relocate: {} ms", timeout(&db));
     }
 }
