@@ -83,6 +83,7 @@ pub struct InProcess {
 
 pub mod access;
 pub mod runtime;
+pub mod streaming;
 pub mod tickets;
 
 pub const API_TOKEN_HEADER: &str = "x-mailbackup-token";
@@ -628,15 +629,47 @@ impl Server {
             Ok(res) => res,
             Err(never) => match never {},
         };
-        let (parts, body) = res.into_parts();
-        match axum::body::to_bytes(body, usize::MAX).await {
-            Ok(bytes) => axum::http::Response::from_parts(parts, bytes.to_vec()),
-            Err(e) => {
-                error!("Couldn't read a response for the window: {}", e);
-                let mut res = axum::http::Response::new(b"Internal error".to_vec());
-                *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                res
-            }
+        collect_limited(res, IN_PROCESS_RESPONSE_LIMIT).await
+    }
+
+    /// Like [`Server::handle_in_process`] for a download: the response with
+    /// its body still streaming (see `streaming::save_body`), so a large
+    /// download never has to fit in memory. The request passes the same
+    /// guard: the download ticket is checked and used up here, before the
+    /// caller asks where to save.
+    pub async fn handle_in_process_streaming(
+        &self,
+        req: axum::http::Request<Vec<u8>>,
+        origin: &str,
+    ) -> axum::http::Response<Body> {
+        let mut req = req.map(Body::from);
+        req.extensions_mut().insert(InProcess { origin: origin.to_string() });
+        match tower::ServiceExt::oneshot(self.router.clone(), req).await {
+            Ok(res) => res,
+            Err(never) => match never {},
+        }
+    }
+}
+
+/// Largest response the desktop window's protocol collects in memory: the
+/// app's pages and API answers. The biggest is a message's detail: its HTML
+/// (at most the size of the message, `imap::DEFAULT_LIMITS.max_message_bytes`)
+/// plus inlined images (at most `html_view::MAX_INLINE_TOTAL_BYTES` before
+/// base64). Downloads are streamed instead (`handle_in_process_streaming`).
+pub const IN_PROCESS_RESPONSE_LIMIT: usize = 512 * 1024 * 1024;
+
+/// The response with its body collected, or a clear error if the body is
+/// larger than `limit` (never a silently truncated one).
+async fn collect_limited(res: axum::http::Response<Body>, limit: usize) -> axum::http::Response<Vec<u8>> {
+    let (parts, body) = res.into_parts();
+    match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => axum::http::Response::from_parts(parts, bytes.to_vec()),
+        Err(e) => {
+            error!("Couldn't read a response for the window: {}", e);
+            let message = format!("The response is too large to show in the window (over {} MB)", limit / (1024 * 1024));
+            let mut res = axum::http::Response::new(message.into_bytes());
+            *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            res
         }
     }
 }
@@ -2040,6 +2073,8 @@ struct ExportMboxPayload {
 #[derive(Serialize)]
 struct ExportResult {
     exported_count: usize,
+    /// Messages whose file couldn't be read, so they are not in the export
+    skipped_count: usize,
     output_path: String,
 }
 
@@ -2065,29 +2100,11 @@ async fn api_export_mbox(
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
 
-    let folders = match state.db.get_folders(&payload.account_id) {
-        Ok(f) => f,
+    let folder = payload.folder_id.as_deref().map(str::trim).filter(|f| !f.is_empty() && *f != "ALL");
+    let paths = match state.db.message_paths(&payload.account_id, folder) {
+        Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-
-    let target_folders: Vec<_> = if let Some(ref fid) = payload.folder_id {
-        if fid == "ALL" || fid.trim().is_empty() {
-            folders
-        } else {
-            folders.into_iter().filter(|f| f.id == *fid).collect()
-        }
-    } else {
-        folders
-    };
-
-    let mut paths = Vec::new();
-    for f in target_folders {
-        if let Ok(msgs) = state.db.get_messages_for_folder(&f.id) {
-            for m in msgs {
-                paths.push(m.relative_path);
-            }
-        }
-    }
 
     let final_output_path = target.path;
 
@@ -2106,16 +2123,28 @@ async fn api_export_mbox(
             .into_response();
     }
 
-    let exporter = MboxExporter::new(&state.storage);
-    match exporter.export_to_mbox_with(&paths, &final_output_path, payload.overwrite) {
+    let storage = state.storage.clone();
+    let output = final_output_path.clone();
+    let exported = tokio::task::spawn_blocking(move || {
+        MboxExporter::new(&storage).export_to_mbox_counted(&paths, &output, payload.overwrite)
+    })
+    .await
+    .unwrap_or_else(|e| Err(mailbackup_core::Error::Other(format!("export task failed: {}", e))));
+    match exported {
         Ok(count) => {
             let path_str = final_output_path.to_string_lossy().to_string();
             mailbackup_core::event_log::log_event(
                 "ARCHIVE_EXPORTED",
-                &format!("Exported {} message(s) to .mbox archive: {}", count, path_str),
+                &format!(
+                    "Exported {} message(s) to .mbox archive: {}{}",
+                    count.written,
+                    path_str,
+                    if count.skipped > 0 { format!(" ({} could not be read and are missing)", count.skipped) } else { String::new() }
+                ),
             );
             Json(ExportResult {
-                exported_count: count,
+                exported_count: count.written,
+                skipped_count: count.skipped,
                 output_path: path_str,
             })
             .into_response()
@@ -2326,48 +2355,44 @@ async fn api_download_mbox(
     State(state): State<AppState>,
     Query(query): Query<DownloadMboxQuery>,
 ) -> impl IntoResponse {
-    let folders = match state.db.get_folders(&query.account_id) {
-        Ok(f) => f,
+    let folder = query.folder_id.as_deref().map(str::trim).filter(|f| !f.is_empty() && *f != "ALL");
+    let paths = match state.db.message_paths(&query.account_id, folder) {
+        Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    let target_folders: Vec<_> = if let Some(ref fid) = query.folder_id {
-        if fid == "ALL" || fid.trim().is_empty() {
-            folders
-        } else {
-            folders.into_iter().filter(|f| f.id == *fid).collect()
-        }
-    } else {
-        folders
-    };
-
-    let mut paths = Vec::new();
-    for f in target_folders {
-        if let Ok(msgs) = state.db.get_messages_for_folder(&f.id) {
-            for m in msgs {
-                paths.push(m.relative_path);
+    // Streamed (issue #78): produced while the client reads, a few chunks at
+    // a time, and stopped when the client goes away
+    let (writer, body) = streaming::channel();
+    let storage = state.storage.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut writer = writer;
+        let exporter = MboxExporter::new(&storage);
+        match exporter.export_counted(&paths, &mut writer) {
+            Ok(count) => mailbackup_core::event_log::log_event(
+                "ARCHIVE_EXPORTED",
+                &format!(
+                    "Downloaded .mbox archive containing {} message(s){}",
+                    count.written,
+                    if count.skipped > 0 { format!("; {} could not be read and are missing", count.skipped) } else { String::new() }
+                ),
+            ),
+            Err(_) if writer.is_closed() => info!(".mbox download stopped: the client went away"),
+            Err(e) => {
+                let why = format!(".mbox download failed after it started: {}", e);
+                mailbackup_core::event_log::log_event("EXPORT_ERROR", &why);
+                // The client sees a failed transfer, not a short file that looks complete
+                writer.fail(why);
             }
         }
-    }
-
-    let mut buffer = Vec::new();
-    let exporter = MboxExporter::new(&state.storage);
-    let count = match exporter.export_to_writer(&paths, &mut buffer) {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    });
 
     let timestamp = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let filename = format!("backup_{}.mbox", timestamp);
-
-    mailbackup_core::event_log::log_event(
-        "ARCHIVE_EXPORTED",
-        &format!("Downloaded .mbox archive containing {} message(s)", count),
-    );
-
-    let mut res = Response::new(Body::from(buffer));
+    let mut res = Response::new(body);
     res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/mbox"));
     res.headers_mut().insert(header::CONTENT_DISPOSITION, attachment_disposition(&filename));
+    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     res.into_response()
 }
 
@@ -4828,5 +4853,96 @@ mod tests {
         let (status, _, page) = call(&router, browser("GET", "/").body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(page.contains(TOKEN));
+    }
+
+    // ---- Large downloads (issue #78) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_streamed_mbox_download_is_byte_for_byte_the_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = archive_state(dir.path()).await;
+        // A few more messages, so the stream has several chunks
+        let folder = state.db.get_folders("acc").unwrap().remove(0);
+        for uid in 2..40u32 {
+            let raw = format!("From: a@example.com\r\nSubject: m{}\r\n\r\n{}\r\nFrom the start\r\n", uid, "x".repeat(20_000)).into_bytes();
+            let stored = state.storage.store_eml("acc", "INBOX", uid, None, &raw).unwrap();
+            state
+                .db
+                .insert_message(
+                    "acc", &folder.id, uid, None, Some("m"), None, None, None, None, raw.len() as u64,
+                    &stored.relative_path.to_string_lossy(), &stored.sha256, None, &[],
+                )
+                .unwrap();
+        }
+        let router = create_router(state.clone());
+        let (status, body) = send(&router, "GET", "/api/export/mbox/download?account_id=acc&folder_id=ALL", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let paths = state.db.message_paths("acc", None).unwrap();
+        assert_eq!(paths.len(), 39);
+        let mut expected = Vec::new();
+        MboxExporter::new(&state.storage).export_to_writer(&paths, &mut expected).unwrap();
+        assert!(expected.len() > 2 * streaming::CHUNK_BYTES, "spans several chunks");
+        assert_eq!(body.as_bytes(), expected.as_slice());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_export_reports_messages_it_couldnt_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = archive_state(dir.path()).await;
+        let path = state.db.message_paths("acc", None).unwrap().remove(0);
+        std::fs::remove_file(state.storage.base_dir().join(&path)).unwrap();
+        let router = create_router(state.clone());
+        let out = dir.path().join("exports").join("out.mbox");
+        let request = serde_json::json!({ "account_id": "acc", "output_path": out.to_string_lossy() });
+        let (status, body) = send(&router, "POST", "/api/export/mbox", request).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(result["exported_count"], 0);
+        assert_eq!(result["skipped_count"], 1, "visible, not silently missing");
+    }
+
+    #[tokio::test]
+    async fn in_process_responses_over_the_limit_are_a_clear_error() {
+        let small = collect_limited(axum::http::Response::new(Body::from(vec![1u8; 100])), 1000).await;
+        assert_eq!(small.status(), StatusCode::OK);
+        assert_eq!(small.body().len(), 100);
+        let big = collect_limited(axum::http::Response::new(Body::from(vec![1u8; 2000])), 1000).await;
+        assert_eq!(big.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(String::from_utf8_lossy(big.body()).contains("too large"), "not a truncated body");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_desktop_download_uses_its_ticket_before_the_body_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        AppConfig { data_dir: dir.path().join("data"), db_path: dir.path().join("c.db"), ..AppConfig::default() }
+            .save(&config_path)
+            .unwrap();
+        let server = Server::build(Some(config_path), Some(0), false).await.unwrap();
+        let token = {
+            let page = server.handle_in_process(HttpRequest::get("/").body(Vec::new()).unwrap(), APP_ORIGIN).await;
+            let page = String::from_utf8_lossy(page.body()).to_string();
+            page.split("mailbackup-api-token\" content=\"").nth(1).unwrap()[..64].to_string()
+        };
+        let url = "/api/logs/download";
+        let mint = HttpRequest::post("/api/download-ticket")
+            .header(API_TOKEN_HEADER, &token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(serde_json::json!({ "url": url }).to_string().into_bytes())
+            .unwrap();
+        let minted = server.handle_in_process(mint, APP_ORIGIN).await;
+        let ticket = serde_json::from_slice::<serde_json::Value>(minted.body()).unwrap()["ticket"].as_str().unwrap().to_string();
+        let download = || HttpRequest::get(format!("{}?ticket={}", url, ticket)).body(Vec::new()).unwrap();
+
+        let first = server.handle_in_process_streaming(download(), APP_ORIGIN).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        // The body isn't read yet (a Save dialog could be open): the ticket is already used
+        let second = server.handle_in_process_streaming(download(), APP_ORIGIN).await;
+        assert_eq!(second.status(), StatusCode::UNAUTHORIZED);
+
+        let saved = dir.path().join("events.log");
+        streaming::save_body(first.into_body(), &saved).await.unwrap();
+        assert!(saved.exists());
     }
 }
