@@ -3,6 +3,7 @@
 pub mod accounts;
 pub mod config;
 pub mod db;
+pub mod download_mark;
 pub mod keyring;
 pub mod storage;
 pub mod imap;

@@ -2259,10 +2259,22 @@ async fn api_pick_directory(State(state): State<AppState>) -> impl IntoResponse 
     }
 }
 
+/// Helper programs (dialogs) come from fixed system folders, never from
+/// `PATH` (issue #75): `None` if there is no trusted copy.
+fn system_helper(name: &str) -> Option<PathBuf> {
+    match mailbackup_core::service::trusted_program(name) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::debug!("{}", e);
+            None
+        }
+    }
+}
+
 fn pick_directory_native() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("osascript")
+        let output = std::process::Command::new(system_helper("osascript")?)
             .arg("-e")
             .arg("POSIX path of (choose folder with prompt \"Select Export Destination Folder:\")")
             .output()
@@ -2277,7 +2289,7 @@ fn pick_directory_native() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let script = "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Select Export Destination Folder'; if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }";
-        let output = std::process::Command::new("powershell")
+        let output = std::process::Command::new(system_helper("powershell")?)
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .output()
             .ok()?;
@@ -2290,7 +2302,8 @@ fn pick_directory_native() -> Option<PathBuf> {
     }
     #[cfg(target_os = "linux")]
     {
-        if let Ok(output) = std::process::Command::new("zenity")
+        if let Some(zenity) = system_helper("zenity")
+            && let Ok(output) = std::process::Command::new(zenity)
             .args(["--file-selection", "--directory", "--title=Select Export Destination Folder"])
             .output()
             && output.status.success() {

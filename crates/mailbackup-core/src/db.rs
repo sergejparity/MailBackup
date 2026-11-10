@@ -1797,6 +1797,16 @@ impl Database {
                     tokens.join(" ")
                 }
             };
+            // Checked on its own first: in the full query SQLite may never
+            // evaluate it (no rows to join), and a malformed one is the
+            // caller's mistake, not a server error (issue #75)
+            if let Err(e) = conn.query_row(
+                "SELECT count(*) FROM (SELECT 1 FROM messages_fts WHERE messages_fts MATCH ?1 LIMIT 1)",
+                [&fts_query],
+                |_| Ok(()),
+            ) {
+                return Err(crate::Error::InvalidInput(format!("The search can't be understood: {}", e)));
+            }
             conditions.push("messages_fts MATCH ?".to_string());
             params.push(rusqlite::types::Value::Text(fts_query));
         }
@@ -1939,7 +1949,17 @@ impl Database {
             )
         };
 
-        let mut stmt = conn.prepare(&sql)?;
+        // A malformed query (e.g. an unbalanced quote) is the caller's mistake
+        let invalid_query = |e: rusqlite::Error| -> crate::Error {
+            let text = e.to_string();
+            let lower = text.to_ascii_lowercase();
+            if has_fts && (lower.contains("fts5") || lower.contains("unterminated string")) {
+                crate::Error::InvalidInput(format!("The search can't be understood: {}", text))
+            } else {
+                e.into()
+            }
+        };
+        let mut stmt = conn.prepare(&sql).map_err(invalid_query)?;
         let rows = stmt.query_map(params_from_iter(params), |row| {
             let date_str: Option<String> = row.get(6)?;
             let date = date_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc)));
@@ -1955,11 +1975,12 @@ impl Database {
                 relative_path: row.get(7)?,
                 snippet: snippet_to_html(&row.get::<_, Option<String>>(8)?.unwrap_or_default()),
             })
-        })?;
+        })
+        .map_err(invalid_query)?;
 
         let mut results = Vec::new();
         for r in rows {
-            results.push(r?);
+            results.push(r.map_err(invalid_query)?);
         }
         Ok(results)
     }

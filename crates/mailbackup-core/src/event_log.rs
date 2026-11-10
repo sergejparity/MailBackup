@@ -225,6 +225,11 @@ pub fn check_and_rotate_daily() {
     }
 }
 
+/// `text` with every control character (line breaks included) replaced by a space.
+pub fn one_line(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
 /// Appends a new event entry to the persistent events.log file
 pub fn log_event(event_type: &str, details: &str) {
     // Automatically rotate previous day's log if date has changed
@@ -236,11 +241,13 @@ pub fn log_event(event_type: &str, details: &str) {
     }
 
     let now = Utc::now();
+    // One event, one line: line breaks and other control characters in the
+    // text (account names, server messages) would forge entries of their own
     let formatted_line = format!(
         "[{}] [{}] {}\n",
         now.to_rfc3339(),
-        event_type.to_uppercase(),
-        details
+        one_line(&event_type.to_uppercase()),
+        one_line(details)
     );
 
     if let Ok(mut file) = crate::private_fs::open_append(&path) {
@@ -421,6 +428,19 @@ pub fn clear_log() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_detail_with_line_breaks_stays_one_entry() {
+        let forged = "Account 'x\n[2026-01-01T00:00:00+00:00] [SYNC_SUCCESS] all fine\r' added\t!";
+        let line = one_line(forged);
+        assert!(!line.contains('\n') && !line.contains('\r') && !line.contains('\t'), "{:?}", line);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("events.log");
+        std::fs::write(&file, format!("[2026-01-01T00:00:00+00:00] [ACCOUNT_ADDED] {}\n", line)).unwrap();
+        let entries = parse_log_entries_from_file(&file);
+        assert_eq!(entries.len(), 1, "no forged second entry");
+        assert_eq!(entries[0].event_type, "ACCOUNT_ADDED");
+    }
 
     /// A read error ends the scan instead of being retried forever: on Unix a
     /// directory opens fine but every read fails.

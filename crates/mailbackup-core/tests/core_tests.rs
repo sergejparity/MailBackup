@@ -1104,3 +1104,16 @@ fn every_listed_log_file_can_be_downloaded() {
         let _ = std::fs::remove_file(path);
     }
 }
+
+
+/// Issue #75: a malformed full-text query is the caller's mistake (400), not
+/// a server error
+#[test]
+fn a_malformed_search_query_is_invalid_input() {
+    let db = mailbackup_core::db::Database::open_in_memory().unwrap();
+    for query in ["\"unbalanced", "\"a\" AND", "\"x\" NEAR("] {
+        let err = db.search_fts(query, 10).unwrap_err();
+        assert!(matches!(err, mailbackup_core::Error::InvalidInput(_)), "{:?}: {:?}", query, err);
+    }
+    assert!(db.search_fts("plain words", 10).unwrap().is_empty());
+}
