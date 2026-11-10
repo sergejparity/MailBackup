@@ -120,7 +120,7 @@ fn a_v0_catalog_is_migrated_with_everything_intact() {
     assert_eq!(user_version(&path), 0);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(user_version(&path), 3);
+    assert_eq!(user_version(&path), mailbackup_core::db::SCHEMA_VERSION);
 
     let folder = &db.get_folders("acc").unwrap()[0];
     assert_eq!((folder.uidvalidity, folder.last_synced_uid, folder.uid_generation), (Some(7), 42, 0));
@@ -195,11 +195,11 @@ fn reopening_is_a_no_op_and_fresh_catalogs_start_at_the_current_version() {
     Database::open(&path).unwrap();
     let db = Database::open(&path).unwrap();
     assert_eq!(db.get_messages_for_folder("f1").unwrap().len(), 1);
-    assert_eq!(user_version(&path), 3);
+    assert_eq!(user_version(&path), mailbackup_core::db::SCHEMA_VERSION);
 
     let fresh = dir.path().join("fresh.db");
     Database::open(&fresh).unwrap();
-    assert_eq!(user_version(&fresh), 3);
+    assert_eq!(user_version(&fresh), mailbackup_core::db::SCHEMA_VERSION);
 }
 
 #[test]
@@ -225,7 +225,7 @@ fn a_v1_catalog_gains_the_account_transitions_table() {
     drop(conn);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(user_version(&path), 3);
+    assert_eq!(user_version(&path), mailbackup_core::db::SCHEMA_VERSION);
     assert_eq!(db.last_transition_seq("acc").unwrap(), 0);
     assert_eq!(db.get_messages_for_folder("f1").unwrap().len(), 1, "data untouched");
 }
@@ -250,7 +250,7 @@ fn a_v2_catalog_gains_server_id_columns_and_tables() {
     drop(conn);
 
     let db = Database::open(&path).unwrap();
-    assert_eq!(user_version(&path), 3);
+    assert_eq!(user_version(&path), mailbackup_core::db::SCHEMA_VERSION);
     let rows = db.get_messages_for_folder("f1").unwrap();
     assert_eq!(rows.len(), 1, "data untouched");
     assert!(db.message_server_id(&rows[0].id).unwrap().is_none(), "old rows have no server id");

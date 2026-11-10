@@ -81,6 +81,11 @@ pub enum Error {
     #[error("IMAP protocol error: {0}")]
     ProtocolBroken(String),
 
+    /// A connection step or command took longer than its limit, or the
+    /// connection went idle; the session can't be used for another command.
+    #[error("IMAP timeout: {0}")]
+    Timeout(String),
+
     #[error("Generic error: {0}")]
     Other(String),
 }

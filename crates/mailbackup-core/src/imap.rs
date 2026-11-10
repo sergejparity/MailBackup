@@ -4,6 +4,8 @@ use crate::error::{Error, Result};
 use crate::server_ids::{ServerId, ServerIdKind, SourcedId};
 
 mod absorbed_id;
+pub mod guard;
+use guard::{GuardState, Guarded};
 use crate::storage::StorageEngine;
 use async_imap::imap_proto::{AttributeValue, Response, Status};
 use chrono::{DateTime, Utc};
@@ -25,6 +27,14 @@ pub struct SyncProgress {
     pub total_messages: u32,
     pub processed_messages: u32,
     pub downloaded_bytes: u64,
+    /// Messages of the account that are not backed up because they are
+    /// larger than the size limit (see `Database::skipped_messages`)
+    #[serde(default)]
+    pub skipped_messages: u32,
+    /// Why the sync stopped before it was done (a folder failed, a timeout);
+    /// `None` when it finished. What was archived before it is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Most messages fetched with one command.
@@ -34,6 +44,128 @@ pub const BATCH_MAX_MESSAGES: usize = 50;
 pub const BATCH_TARGET_BYTES: u64 = 16 * 1024 * 1024;
 /// Most UIDs per size query.
 const SIZE_QUERY_CHUNK: usize = 500;
+
+/// Time and size limits of IMAP connections (issue #72). None of them bounds
+/// a whole account sync: a large archive on a slow link still finishes, as
+/// long as data keeps moving and each command completes in its time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Each of TCP connect, TLS handshake and greeting + login
+    pub connect: std::time::Duration,
+    /// No byte read (or a write blocked) for this long
+    pub idle: std::time::Duration,
+    /// Completion of one command; a body fetch also gets time for its size
+    pub command: std::time::Duration,
+    /// Slowest transfer a body fetch is given time for, in bytes per second
+    pub min_rate: u64,
+    /// Largest message fetched (see `GlobalSettings::imap_max_message_mb`)
+    pub max_message_bytes: u64,
+}
+
+/// Default limits: 30 s per connection step, 120 s idle, 60 s per command
+/// plus time for 4 KB/s, messages up to 256 MB.
+pub const DEFAULT_LIMITS: Limits = Limits {
+    connect: std::time::Duration::from_secs(30),
+    idle: std::time::Duration::from_secs(120),
+    command: std::time::Duration::from_secs(60),
+    min_rate: 4 * 1024,
+    max_message_bytes: 256 * 1024 * 1024,
+};
+
+/// `skipped_messages.reason` of a message over the size limit.
+pub const SKIPPED_TOO_LARGE: &str = "over_size_limit";
+
+/// Responses of commands that return no message bodies may be this large.
+const SMALL_RESPONSE_BUDGET: u64 = 64 * 1024 * 1024;
+/// Protocol overhead allowed per message of a body fetch, and per command.
+const PER_MESSAGE_OVERHEAD: u64 = 4 * 1024;
+const PER_COMMAND_OVERHEAD: u64 = 64 * 1024;
+
+impl Default for Limits {
+    fn default() -> Self {
+        DEFAULT_LIMITS
+    }
+}
+
+impl Limits {
+    /// The limits the settings ask for; unset ones keep their defaults.
+    pub fn from_settings(settings: &crate::config::GlobalSettings) -> Limits {
+        let secs = std::time::Duration::from_secs;
+        Limits {
+            connect: settings.imap_connect_timeout_secs.map(secs).unwrap_or(DEFAULT_LIMITS.connect),
+            idle: settings.imap_idle_timeout_secs.map(secs).unwrap_or(DEFAULT_LIMITS.idle),
+            command: settings.imap_command_timeout_secs.map(secs).unwrap_or(DEFAULT_LIMITS.command),
+            min_rate: DEFAULT_LIMITS.min_rate,
+            max_message_bytes: settings
+                .imap_max_message_mb
+                .map(|mb| mb * 1024 * 1024)
+                .unwrap_or(DEFAULT_LIMITS.max_message_bytes),
+        }
+    }
+
+    /// Time a command reading about `bytes` may take.
+    fn deadline_for(&self, bytes: u64) -> std::time::Duration {
+        self.command + std::time::Duration::from_secs(bytes / self.min_rate.max(1))
+    }
+
+    /// Bytes a body fetch of messages of these sizes may read.
+    fn body_budget(&self, sizes: impl IntoIterator<Item = Option<u32>>) -> u64 {
+        PER_COMMAND_OVERHEAD
+            + sizes
+                .into_iter()
+                .map(|s| s.map_or(self.max_message_bytes, u64::from) + PER_MESSAGE_OVERHEAD)
+                .sum::<u64>()
+    }
+}
+
+/// An error of an IMAP command as MailBackup reports it: a guard's idle
+/// timeout is `Error::Timeout`, an oversized response `Error::ProtocolBroken`
+/// (both end the session), anything else `Error::Imap` with `context`.
+fn command_error(context: &str, e: impl std::fmt::Display) -> Error {
+    let text = e.to_string();
+    match guard::classify(&text) {
+        Some(guard::Limit::Idle) => Error::Timeout(format!("{}: {}", context, text)),
+        Some(guard::Limit::Budget) => Error::ProtocolBroken(format!("{}: {}", context, text)),
+        None => Error::Imap(format!("{}: {}", context, text)),
+    }
+}
+
+/// Runs `command` within `limit`; a command that doesn't finish in time is
+/// `Error::Timeout`, after which the session must not be used again.
+async fn within<T, E: std::fmt::Display>(
+    what: &str,
+    limit: std::time::Duration,
+    command: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, command).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(command_error(what, e)),
+        Err(_) => Err(Error::Timeout(format!("{} didn't complete within {} s", what, limit.as_secs()))),
+    }
+}
+
+/// A TCP connection to `addr` (`host:port`), trying each address it
+/// resolves to, with TCP keepalive on. Keepalive only adds OS-level
+/// detection of dead peers; the guard's limits are what bound a sync.
+async fn connect_tcp(addr: &str) -> std::io::Result<TcpStream> {
+    let mut last_error = None;
+    for socket_addr in tokio::net::lookup_host(addr).await? {
+        let socket = if socket_addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+        if let Err(e) = socket.set_keepalive(true) {
+            debug!("Couldn't enable TCP keepalive for {}: {}", addr, e);
+        }
+        match socket.connect(socket_addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("{} has no address", addr))))
+}
+
+/// Whether `e` leaves the session unusable: no further command may be sent.
+fn ends_session(e: &Error) -> bool {
+    matches!(e, Error::ProtocolBroken(_) | Error::Timeout(_))
+}
 
 /// The folder a sync session writes to.
 #[derive(Clone, Copy)]
@@ -144,6 +276,9 @@ pub struct ImapSyncEngine {
     storage: StorageEngine,
     batch_max_messages: usize,
     batch_target_bytes: u64,
+    limits: Limits,
+    /// Shared with the streams of this engine's connections
+    guard: std::sync::Arc<GuardState>,
 }
 
 /// `uids` (ascending) as an IMAP sequence set, runs collapsed: `1:3,7,9:10`.
@@ -197,7 +332,32 @@ fn format_address(list: AddressList<'_>) -> String {
 
 impl ImapSyncEngine {
     pub fn new(db: Database, storage: StorageEngine) -> Self {
-        Self { db, storage, batch_max_messages: BATCH_MAX_MESSAGES, batch_target_bytes: BATCH_TARGET_BYTES }
+        Self {
+            db,
+            storage,
+            batch_max_messages: BATCH_MAX_MESSAGES,
+            batch_target_bytes: BATCH_TARGET_BYTES,
+            limits: DEFAULT_LIMITS,
+            guard: GuardState::new(DEFAULT_LIMITS.idle),
+        }
+    }
+
+    /// Uses `limits` instead of [`DEFAULT_LIMITS`].
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self.guard = GuardState::new(limits.idle);
+        self
+    }
+
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// The limits this engine enforces, for a stream of a connection made
+    /// outside it (see [`Self::sync_with`]): wrap the stream before logging
+    /// in so idle connections and oversized responses are caught.
+    pub fn guard_stream<S>(&self, stream: S) -> Guarded<S> {
+        Guarded::new(stream, self.guard.clone())
     }
 
     /// Overrides [`BATCH_MAX_MESSAGES`] and [`BATCH_TARGET_BYTES`].
@@ -218,29 +378,67 @@ impl ImapSyncEngine {
         Ok(TlsConnector::from(Arc::new(config)))
     }
 
-    /// Connects to the IMAP server via TLS
+    /// Connects to the IMAP server via TLS and logs in, within the
+    /// [`DEFAULT_LIMITS`].
     pub async fn connect(
         account: &AccountConfig,
         password: &str,
-    ) -> Result<async_imap::Session<TlsStream<TcpStream>>> {
+    ) -> Result<async_imap::Session<Guarded<TlsStream<TcpStream>>>> {
+        Self::connect_with(account, password, &DEFAULT_LIMITS, GuardState::new(DEFAULT_LIMITS.idle)).await
+    }
+
+    /// Connects and logs in with this engine's limits.
+    pub async fn connect_account(
+        &self,
+        account: &AccountConfig,
+        password: &str,
+    ) -> Result<async_imap::Session<Guarded<TlsStream<TcpStream>>>> {
+        Self::connect_with(account, password, &self.limits, self.guard.clone()).await
+    }
+
+    /// [`Self::connect`] with `limits`: TCP connect, TLS handshake, and
+    /// greeting plus login each within `limits.connect`; the stream is
+    /// guarded by `guard` from the first byte.
+    async fn connect_with(
+        account: &AccountConfig,
+        password: &str,
+        limits: &Limits,
+        guard: std::sync::Arc<GuardState>,
+    ) -> Result<async_imap::Session<Guarded<TlsStream<TcpStream>>>> {
         let addr = format!("{}:{}", account.imap_server, account.imap_port);
-        let tcp_stream = TcpStream::connect(&addr).await.map_err(|e| {
-            Error::Imap(format!("Failed to connect to TCP {}: {}", addr, e))
-        })?;
+        let step = |what: &str| format!("{} with {}", what, addr);
+        let tcp_stream = match tokio::time::timeout(limits.connect, connect_tcp(&addr)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Err(Error::Imap(format!("Failed to connect to TCP {}: {}", addr, e))),
+            Err(_) => return Err(Error::Timeout(format!("{} took longer than {} s", step("Connecting"), limits.connect.as_secs()))),
+        };
 
         let server_name = rustls_pki_types::ServerName::try_from(account.imap_server.clone())
             .map_err(|e| Error::Tls(format!("Invalid TLS server name: {}", e)))?;
 
         let tls_connector = Self::create_tls_connector()?;
-        let tls_stream = tls_connector
-            .connect(server_name, tcp_stream)
-            .await
-            .map_err(|e| Error::Tls(format!("TLS handshake failed with {}: {}", addr, e)))?;
+        let tls_stream = match tokio::time::timeout(limits.connect, tls_connector.connect(server_name, tcp_stream)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Err(Error::Tls(format!("TLS handshake failed with {}: {}", addr, e))),
+            Err(_) => {
+                return Err(Error::Timeout(format!("{} took longer than {} s", step("The TLS handshake"), limits.connect.as_secs())));
+            }
+        };
 
-        let client = async_imap::Client::new(tls_stream);
-        let session = client.login(&account.username, password).await.map_err(|(e, _)| {
-            Error::AuthFailed(account.id.clone(), format!("IMAP login failed: {}", e))
-        })?;
+        guard.set_budget(SMALL_RESPONSE_BUDGET);
+        let client = async_imap::Client::new(Guarded::new(tls_stream, guard));
+        let session = match tokio::time::timeout(limits.connect, client.login(&account.username, password)).await {
+            Ok(Ok(session)) => session,
+            Ok(Err((e, _))) => {
+                return Err(match command_error("IMAP login", &e) {
+                    Error::Imap(_) => Error::AuthFailed(account.id.clone(), format!("IMAP login failed: {}", e)),
+                    other => other,
+                });
+            }
+            Err(_) => {
+                return Err(Error::Timeout(format!("{} took longer than {} s", step("Greeting and login"), limits.connect.as_secs())));
+            }
+        };
 
         info!("Successfully logged in to {} as {}", account.imap_server, account.username);
         Ok(session)
@@ -256,7 +454,12 @@ impl ImapSyncEngine {
     where
         F: Fn(&SyncProgress) + Send + Sync + 'static,
     {
-        self.sync_with(account, || Self::connect(account, password), progress_callback).await
+        self.sync_with(
+            account,
+            || self.connect_account(account, password),
+            progress_callback,
+        )
+        .await
     }
 
     /// Syncs over sessions from `connect`, with COMPRESS=DEFLATE (RFC 4978)
@@ -288,7 +491,9 @@ impl ImapSyncEngine {
         }
         match outcome {
             Ok(outcome) => {
-                self.finish_history(&history_id, &progress, outcome.error.as_deref());
+                progress.error = outcome.error;
+                progress.skipped_messages = self.db.skipped_messages(Some(&account.id))?.len() as u32;
+                self.finish_history(&history_id, &progress);
                 Ok(progress)
             }
             Err(e) => {
@@ -314,15 +519,22 @@ impl ImapSyncEngine {
     {
         let mut session = connect().await?;
 
-        let (offers_compress, offered_ids) = match session.capabilities().await {
+        self.guard.set_budget(SMALL_RESPONSE_BUDGET);
+        let (offers_compress, offered_ids) = match within("CAPABILITY", self.limits.command, session.capabilities()).await {
             Ok(caps) => (caps.has_str("COMPRESS=DEFLATE"), ServerIdKind::offered(|c| caps.has_str(c))),
+            Err(e) if ends_session(&e) => return Err(e),
             Err(e) => {
                 warn!("CAPABILITY failed for {}: {}; not compressing", account.id, e);
                 (false, None)
             }
         };
         if offers_compress {
-            match session.compress(|stream| stream).await {
+            // The guard above the decompressor counts what responses expand to
+            let guard = self.guard.clone();
+            let compress = session.compress(move |stream| Guarded::new(stream, guard));
+            match tokio::time::timeout(self.limits.command, compress).await.unwrap_or_else(|_| {
+                Err(async_imap::error::Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "COMPRESS timed out")))
+            }) {
                 Ok(compressed) => {
                     debug!("Using COMPRESS=DEFLATE for {}", account.id);
                     return self.run_session(compressed, account, offered_ids, progress, progress_callback).await;
@@ -363,13 +575,30 @@ impl ImapSyncEngine {
             None
         };
         let outcome = self.run_session(session, account, offered_ids, &mut progress, progress_callback.as_ref()).await?;
-        self.finish_history(&history_id, &progress, outcome.error.as_deref());
+        progress.error = outcome.error;
+        progress.skipped_messages = self.db.skipped_messages(Some(&account.id))?.len() as u32;
+        self.finish_history(&history_id, &progress);
         Ok(progress)
     }
 
-    fn finish_history(&self, history_id: &str, progress: &SyncProgress, error: Option<&str>) {
-        let status = if error.is_some() { "partial_or_failed" } else { "success" };
-        let _ = self.db.record_sync_finish(history_id, status, progress.processed_messages, progress.downloaded_bytes, error);
+    /// Records how the sync ended, from the finished `progress` (its error and
+    /// skipped messages already filled in): `success` only when nothing is
+    /// missing; messages left out for their size make it `incomplete`, with
+    /// the same reason the caller reports (issue #72).
+    fn finish_history(&self, history_id: &str, progress: &SyncProgress) {
+        let reason = progress.incomplete_reason();
+        let status = match (&progress.error, &reason) {
+            (Some(_), _) => "partial_or_failed",
+            (None, Some(_)) => "incomplete",
+            (None, None) => "success",
+        };
+        let _ = self.db.record_sync_finish(
+            history_id,
+            status,
+            progress.processed_messages,
+            progress.downloaded_bytes,
+            reason.as_deref(),
+        );
     }
 
     async fn run_session<S, F>(
@@ -398,23 +627,26 @@ impl ImapSyncEngine {
         });
 
         let mut folder_names = Vec::new();
-        {
-            let mut mailbox_stream = session.list(None, Some("*")).await.map_err(|e| {
-                Error::Imap(format!("Failed to list mailboxes: {}", e))
-            })?;
-
+        self.guard.set_budget(SMALL_RESPONSE_BUDGET);
+        let listed = within("Listing mailboxes", self.limits.command, async {
+            let mut mailbox_stream = session.list(None, Some("*")).await?;
+            let mut names = Vec::new();
             while let Some(mb_result) = mailbox_stream.next().await {
                 match mb_result {
-                    Ok(mb) => {
-                        let name = mb.name().to_string();
-                        if self.should_sync_folder(account, &name) {
-                            folder_names.push(name);
-                        } else {
-                            debug!("Skipping folder based on filter: {}", name);
-                        }
-                    }
+                    Ok(mb) => names.push(mb.name().to_string()),
+                    // A guard's error ends the listing (and the session)
+                    Err(e) if guard::classify(&e.to_string()).is_some() => return Err(e),
                     Err(e) => warn!("Error reading mailbox: {}", e),
                 }
+            }
+            Ok::<_, async_imap::error::Error>(names)
+        })
+        .await?;
+        for name in listed {
+            if self.should_sync_folder(account, &name) {
+                folder_names.push(name);
+            } else {
+                debug!("Skipping folder based on filter: {}", name);
             }
         }
 
@@ -430,7 +662,7 @@ impl ImapSyncEngine {
 
             if let Err(e) = self.sync_folder(&mut session, account, folder_name, id_kind, &source, progress, progress_callback).await {
                 error!("Error syncing folder '{}': {}", folder_name, e);
-                broken = matches!(e, Error::ProtocolBroken(_));
+                broken = ends_session(&e);
                 outcome.broken_by_ids = broken
                     && id_kind.is_some_and(|kind| self.db.server_id_disabled(&account.id, &source, kind).unwrap_or(false));
                 outcome.error = Some(e.to_string());
@@ -441,7 +673,8 @@ impl ImapSyncEngine {
         // Safe logout; a session whose responses can't be parsed gets no
         // further command
         if !broken {
-            let _ = session.logout().await;
+            self.guard.set_budget(SMALL_RESPONSE_BUDGET);
+            let _ = within("LOGOUT", self.limits.command, session.logout()).await;
         }
 
         Ok(outcome)
@@ -480,9 +713,8 @@ impl ImapSyncEngine {
         F: Fn(&SyncProgress) + Send + Sync + 'static,
     {
         // Use EXAMINE for non-destructive read-only access
-        let mailbox = session.examine(folder_name).await.map_err(|e| {
-            Error::Imap(format!("Failed to examine mailbox '{}': {}", folder_name, e))
-        })?;
+        self.guard.set_budget(SMALL_RESPONSE_BUDGET);
+        let mailbox = within(&format!("Examining mailbox '{}'", folder_name), self.limits.command, session.examine(folder_name)).await?;
 
         let uidvalidity = mailbox.uid_validity;
         let local_slug = StorageEngine::sanitize_slug(folder_name);
@@ -511,6 +743,15 @@ impl ImapSyncEngine {
         // inconsistent (in an earlier sync, or another folder) come first
         self.reconcile_id_rebinds(session, &target, progress, progress_callback).await?;
 
+        // Skipped messages: records of other generations name UIDs that mean
+        // nothing now (this generation's scan evaluates every message again);
+        // this generation's are tried again if they fit now or a retry was asked
+        let dropped = self.db.delete_skipped_of_other_generations(&folder_rec.id, generation)?;
+        if dropped > 0 {
+            info!("Folder '{}': {} skipped-message records of an earlier UID generation dropped", folder_name, dropped);
+        }
+        self.retry_skipped(session, &target, progress, progress_callback).await?;
+
         let last_uid = folder_rec.last_synced_uid;
         debug!(
             "Folder '{}' (ID: {}): generation={}, last_synced_uid={}, uidvalidity={:?}",
@@ -519,9 +760,8 @@ impl ImapSyncEngine {
 
         // Search for new UIDs: (last_uid + 1):*
         let search_query = format!("UID {}:*", last_uid + 1);
-        let uids_set = session.uid_search(&search_query).await.map_err(|e| {
-            Error::Imap(format!("UID search failed in '{}': {}", folder_name, e))
-        })?;
+        self.guard.set_budget(SMALL_RESPONSE_BUDGET);
+        let uids_set = within(&format!("UID search in '{}'", folder_name), self.limits.command, session.uid_search(&search_query)).await?;
 
         let mut uids: Vec<u32> = uids_set.into_iter().filter(|&u| u > last_uid).collect();
         uids.sort_unstable();
@@ -566,15 +806,46 @@ impl ImapSyncEngine {
             pending.retain(|u| !resolved.contains(u));
         }
 
+        // Too large to fetch: recorded as not backed up, never fetched. The
+        // record lets the checkpoint pass the UID; it stays until a retry
+        // archives the message (see `retry_skipped`)
+        let max = self.limits.max_message_bytes;
+        let mut oversized = Vec::new();
+        pending.retain(|uid| match sizes.get(uid) {
+            Some(&size) if u64::from(size) > max => {
+                oversized.push((*uid, size));
+                false
+            }
+            _ => true,
+        });
+        for (uid, size) in oversized {
+            if self.db.record_skipped(&account.id, &folder_rec.id, generation, uid, SKIPPED_TOO_LARGE, size.into(), max)? {
+                warn!("Message UID {} in '{}' ({} bytes) is larger than the {} byte limit; not backed up", uid, folder_name, size, max);
+                crate::event_log::log_event(
+                    "MESSAGE_SKIPPED",
+                    &format!(
+                        "Account '{}': message UID {} in '{}' ({:.1} MB) is larger than the {:.0} MB limit and is not backed up",
+                        account.id,
+                        uid,
+                        folder_name,
+                        size as f64 / 1048576.0,
+                        max as f64 / 1048576.0
+                    ),
+                );
+            }
+            resolved.insert(uid);
+        }
+        self.advance_checkpoint(&target, &uids, &resolved, &mut checkpoint)?;
+
         for batch in plan_batches(&pending, &sizes, self.batch_max_messages, self.batch_target_bytes) {
-            let outcome = self.fetch_batch(session, &target, &batch, &mut resolved, progress, progress_callback).await;
+            let outcome = self.fetch_batch(session, &target, &batch, &sizes, &mut resolved, progress, progress_callback).await;
             if let Err(e) = outcome {
                 // Keep what was archived before the failure
                 self.advance_checkpoint(&target, &uids, &resolved, &mut checkpoint)?;
                 return Err(self.note_broken(&target, target.id_kind.is_some(), e));
             }
             for uid in batch.iter().copied().filter(|u| !resolved.contains(u)).collect::<Vec<_>>() {
-                if let Err(e) = self.resolve_missing(session, &target, uid, &mut resolved, progress, progress_callback).await {
+                if let Err(e) = self.resolve_missing(session, &target, uid, &sizes, &mut resolved, progress, progress_callback).await {
                     self.advance_checkpoint(&target, &uids, &resolved, &mut checkpoint)?;
                     return Err(self.note_broken(&target, target.id_kind.is_some(), e));
                 }
@@ -585,6 +856,56 @@ impl ImapSyncEngine {
         // An inconsistency found during this scan also covers its earlier
         // re-binds by id
         self.reconcile_id_rebinds(session, &target, progress, progress_callback).await
+    }
+
+    /// Tries the folder's skipped messages again (see
+    /// `Database::skipped_to_retry`), each with a fetch of its own UID: an
+    /// archived message, or one the server no longer has, loses its record;
+    /// any other stays recorded (and is not retried again until the limit or
+    /// a new request says so). Never re-scans the folder.
+    async fn retry_skipped<S, F>(
+        &self,
+        session: &mut async_imap::Session<S>,
+        target: &FolderTarget<'_>,
+        progress: &mut SyncProgress,
+        progress_callback: Option<&F>,
+    ) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::fmt::Debug,
+        F: Fn(&SyncProgress) + Send + Sync + 'static,
+    {
+        let candidates = self.db.skipped_to_retry(target.folder_id, target.generation, self.limits.max_message_bytes)?;
+        for skipped in candidates {
+            let uid = skipped.uid;
+            info!("Retrying skipped message UID {} in '{}' ({} bytes)", uid, target.folder_name, skipped.size_bytes);
+            let sizes = HashMap::from([(uid, u32::try_from(skipped.size_bytes).unwrap_or(u32::MAX))]);
+            let mut resolved = HashSet::new();
+            self.fetch_batch(session, target, &[uid], &sizes, &mut resolved, progress, progress_callback).await?;
+            if resolved.contains(&uid) {
+                self.db.delete_skipped(target.folder_id, target.generation, uid)?;
+                crate::event_log::log_event(
+                    "MESSAGE_RECOVERED",
+                    &format!("Account '{}': skipped message UID {} in '{}' is now backed up", target.account.id, uid, target.folder_name),
+                );
+                continue;
+            }
+            self.guard.set_budget(SMALL_RESPONSE_BUDGET);
+            match within("UID SEARCH", self.limits.command, session.uid_search(format!("UID {}", uid))).await {
+                Ok(found) if !found.contains(&uid) => {
+                    self.db.delete_skipped(target.folder_id, target.generation, uid)?;
+                    crate::event_log::log_event(
+                        "MESSAGE_SKIPPED",
+                        &format!(
+                            "Account '{}': skipped message UID {} in '{}' was deleted on the server before it could be backed up",
+                            target.account.id, uid, target.folder_name
+                        ),
+                    );
+                }
+                Err(e) if ends_session(&e) => return Err(e),
+                _ => self.db.touch_skipped(target.folder_id, target.generation, uid)?,
+            }
+        }
+        Ok(())
     }
 
     /// A response to a command that asked for server ids couldn't be parsed:
@@ -717,7 +1038,8 @@ impl ImapSyncEngine {
         uids.sort_unstable();
         let mut checked: HashSet<u32> = HashSet::new();
         for chunk in uids.chunks(self.batch_max_messages) {
-            self.fetch_raw(session, chunk, "(UID BODY.PEEK[] INTERNALDATE)", |item| {
+            let budget = self.limits.body_budget(chunk.iter().map(|_| None));
+            self.fetch_raw(session, chunk, "(UID BODY.PEEK[] INTERNALDATE)", budget, |item| {
                 let Some(uid) = item.uid.or(if chunk.len() == 1 { Some(chunk[0]) } else { None }) else {
                     return Ok(());
                 };
@@ -747,10 +1069,12 @@ impl ImapSyncEngine {
         }
         let mut unchecked = 0;
         for uid in uids.into_iter().filter(|u| !checked.contains(u)) {
-            match session.uid_search(format!("UID {}", uid)).await {
+            self.guard.set_budget(SMALL_RESPONSE_BUDGET);
+            match within("UID SEARCH", self.limits.command, session.uid_search(format!("UID {}", uid))).await {
                 Ok(found) if !found.contains(&uid) => {
                     self.db.undo_id_rebind(target.folder_id, target.generation, &by_uid[&uid].message_id, None)?;
                 }
+                Err(e) if ends_session(&e) => return Err(e),
                 _ => unchecked += 1,
             }
         }
@@ -768,7 +1092,35 @@ impl ImapSyncEngine {
     /// this sees server ids. A response that can't be parsed leaves the
     /// stream unusable: `Error::ProtocolBroken`, and the caller must not send
     /// another command on this session.
+    /// Runs `UID FETCH <uids> <items>`, handing each response to `on_item`.
+    /// The responses may total at most `budget` bytes, and the command has
+    /// the time `Limits::deadline_for(budget)`; exceeding either ends the
+    /// session (`Error::ProtocolBroken` / `Error::Timeout`).
     async fn fetch_raw<S>(
+        &self,
+        session: &mut async_imap::Session<S>,
+        uids: &[u32],
+        items: &str,
+        budget: u64,
+        on_item: impl FnMut(Fetched<'_>) -> Result<()>,
+    ) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
+        let limit = self.limits.deadline_for(budget);
+        self.guard.set_budget(budget);
+        match tokio::time::timeout(limit, self.fetch_raw_unlimited(session, uids, items, on_item)).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Timeout(format!(
+                "UID FETCH {} didn't complete within {} s ({} bytes received)",
+                uid_set(uids),
+                limit.as_secs(),
+                self.guard.used()
+            ))),
+        }
+    }
+
+    async fn fetch_raw_unlimited<S>(
         &self,
         session: &mut async_imap::Session<S>,
         uids: &[u32],
@@ -784,7 +1136,7 @@ impl ImapSyncEngine {
         let tag = session
             .run_command(format!("UID FETCH {} {}", set, items))
             .await
-            .map_err(|e| Error::Imap(format!("Failed to send UID FETCH {}: {}", set, e)))?;
+            .map_err(|e| command_error(&format!("Failed to send UID FETCH {}", set), e))?;
         loop {
             let response = match session.read_response().await {
                 Ok(None) => return Err(Error::Imap(format!("The connection closed during UID FETCH {}", set))),
@@ -793,7 +1145,7 @@ impl ImapSyncEngine {
                 Err(e) if e.kind() == std::io::ErrorKind::Other && e.to_string().contains("during parsing") => {
                     return Err(Error::ProtocolBroken(e.to_string()))
                 }
-                Err(e) => return Err(Error::Imap(format!("Reading UID FETCH {} failed: {}", set, e))),
+                Err(e) => return Err(command_error(&format!("Reading UID FETCH {} failed", set), e)),
                 Ok(Some(response)) => response,
             };
             match response.parsed() {
@@ -855,7 +1207,7 @@ impl ImapSyncEngine {
         };
         let (mut sizes, mut ids) = (HashMap::new(), HashMap::new());
         for chunk in uids.chunks(SIZE_QUERY_CHUNK) {
-            self.fetch_raw(session, chunk, &items, |item| {
+            self.fetch_raw(session, chunk, &items, SMALL_RESPONSE_BUDGET, |item| {
                 // A size query names each UID: one without it is ignored
                 if let Some(uid) = item.uid {
                     if let Some(size) = item.size {
@@ -879,11 +1231,13 @@ impl ImapSyncEngine {
     /// Fetches the bodies of `batch` with one command (with this session's
     /// server ids, if any) and archives each one that arrives, adding it to
     /// `resolved`. UIDs without a body are left for [`Self::resolve_missing`].
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_batch<S, F>(
         &self,
         session: &mut async_imap::Session<S>,
         target: &FolderTarget<'_>,
         batch: &[u32],
+        sizes: &HashMap<u32, u32>,
         resolved: &mut HashSet<u32>,
         progress: &mut SyncProgress,
         progress_callback: Option<&F>,
@@ -892,12 +1246,14 @@ impl ImapSyncEngine {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::fmt::Debug,
         F: Fn(&SyncProgress) + Send + Sync + 'static,
     {
+        // What the server announced, and the maximum for a UID it didn't
+        let budget = self.limits.body_budget(batch.iter().map(|uid| sizes.get(uid).copied()));
         // BODY.PEEK[] ensures read-only semantics (doesn't set \Seen flag on server)
         let items = match target.id_kind {
             Some(kind) => format!("(UID BODY.PEEK[] INTERNALDATE {})", kind.fetch_item()),
             None => "(UID BODY.PEEK[] INTERNALDATE)".to_string(),
         };
-        self.fetch_raw(session, batch, &items, |msg| {
+        self.fetch_raw(session, batch, &items, budget, |msg| {
             // A single-UID fetch can only be that UID; otherwise trust only
             // UIDs that were asked for
             let uid = match (msg.uid, batch) {
@@ -932,11 +1288,13 @@ impl ImapSyncEngine {
     /// server no longer lists was expunged and counts as resolved; one still
     /// listed (or an unanswered search) keeps holding the checkpoint, so the
     /// next sync asks for it again.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_missing<S, F>(
         &self,
         session: &mut async_imap::Session<S>,
         target: &FolderTarget<'_>,
         uid: u32,
+        sizes: &HashMap<u32, u32>,
         resolved: &mut HashSet<u32>,
         progress: &mut SyncProgress,
         progress_callback: Option<&F>,
@@ -945,15 +1303,17 @@ impl ImapSyncEngine {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::fmt::Debug,
         F: Fn(&SyncProgress) + Send + Sync + 'static,
     {
-        self.fetch_batch(session, target, &[uid], resolved, progress, progress_callback).await?;
+        self.fetch_batch(session, target, &[uid], sizes, resolved, progress, progress_callback).await?;
         if resolved.contains(&uid) {
             return Ok(());
         }
-        match session.uid_search(format!("UID {}", uid)).await {
+        self.guard.set_budget(SMALL_RESPONSE_BUDGET);
+        match within("UID SEARCH", self.limits.command, session.uid_search(format!("UID {}", uid))).await {
             Ok(found) if !found.contains(&uid) => {
                 info!("Message UID {} in '{}' was expunged before it could be fetched", uid, target.folder_name);
                 resolved.insert(uid);
             }
+            Err(e) if ends_session(&e) => return Err(e),
             Ok(_) => warn!(
                 "Server lists UID {} in '{}' but didn't return it; it will be fetched on the next sync",
                 uid, target.folder_name
@@ -1059,6 +1419,25 @@ impl SyncProgress {
             total_messages: 0,
             processed_messages: 0,
             downloaded_bytes: 0,
+            skipped_messages: 0,
+            error: None,
+        }
+    }
+
+    /// Why this sync didn't back up everything, if it didn't: it stopped
+    /// part-way, or messages were left out for their size. A sync with a
+    /// reason is never reported as a success.
+    pub fn incomplete_reason(&self) -> Option<String> {
+        let skipped = (self.skipped_messages > 0).then(|| {
+            format!(
+                "{} message(s) are larger than the size limit and are not backed up (settings.imap_max_message_mb; retry with `mailbackup account retry-skipped`)",
+                self.skipped_messages
+            )
+        });
+        match (&self.error, skipped) {
+            (Some(e), Some(s)) => Some(format!("{}; {}", e, s)),
+            (Some(e), None) => Some(e.clone()),
+            (None, s) => s,
         }
     }
 }
