@@ -978,6 +978,15 @@ async function loadSchedulerStatus() {
   }
 }
 
+// Rows whose address already has an account update it instead of being
+// refused (issue #74). A change re-validates a preview that is showing.
+function csvUpdateExisting() {
+  return !!document.getElementById('csv-update-existing')?.checked;
+}
+document.getElementById('csv-update-existing')?.addEventListener('change', () => {
+  if (state.csvImportReport && el.btnPreviewCsv) el.btnPreviewCsv.click();
+});
+
 function showToast(msg, duration = 3000) {
   el.toastMessage.textContent = msg;
   el.toast.style.display = 'flex';
@@ -3138,7 +3147,7 @@ async function handlePreviewCsv() {
     const res = await fetch('/api/accounts/import-csv', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ csv_data: csvData, dry_run: true })
+      body: JSON.stringify({ csv_data: csvData, dry_run: true, update_existing: csvUpdateExisting() })
     });
 
     if (res.ok) {
@@ -3189,7 +3198,7 @@ function renderCsvPreview(report) {
     if (report.valid_accounts && report.valid_accounts.length > 0) {
       el.csvPreviewTbody.innerHTML = report.valid_accounts.map(acc => `
         <tr>
-          <td><span class="badge" style="background: rgba(34, 197, 94, 0.15); color: #4ade80; font-size: 11px;">Valid</span></td>
+          <td><span class="badge" style="background: rgba(34, 197, 94, 0.15); color: #4ade80; font-size: 11px;">${acc.action === 'update' ? 'Update' : 'New'}</span></td>
           <td style="font-weight: 500;">${escapeHtml(acc.name)}</td>
           <td>${escapeHtml(acc.email)}</td>
           <td><span class="badge" style="background: rgba(99, 102, 241, 0.15); color: #818cf8; text-transform: uppercase; font-size: 10px;">${escapeHtml(acc.provider)}</span></td>
@@ -3222,12 +3231,13 @@ async function handleConfirmCsvImport() {
     const res = await fetch('/api/accounts/import-csv', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ csv_data: csvData, dry_run: false })
+      body: JSON.stringify({ csv_data: csvData, dry_run: false, update_existing: csvUpdateExisting() })
     });
 
     if (res.ok) {
       const report = await res.json();
-      showToast(`Successfully imported ${report.imported_count || 0} account(s)! 🎉`);
+      const updated = report.update_count ? ` (${report.update_count} updated)` : '';
+      showToast(`Successfully imported ${report.imported_count || 0} account(s)${updated}! 🎉`);
       clearCsvImport();
       closeModal(el.settingsModal);
       await loadAccounts();

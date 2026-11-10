@@ -26,9 +26,11 @@ fn setup() -> Setup {
 /// Runs `mailbackup account add` for `id` with every setting given as a flag,
 /// plus `extra`, feeding `stdin` and setting `env`.
 fn add(s: &Setup, id: &str, extra: &[&str], stdin: &[u8], env: &[(&str, &OsStr)]) -> Output {
+    // One account per address (issue #74), so each id gets its own
+    let email = format!("{}@example.com", id);
     let mut args: Vec<&str> = vec![
         "--config", s.config.to_str().unwrap(), "account", "add", "--id", id, "--name", id, "--email",
-        "user@example.com", "--provider", "generic", "--server", "imap.example.com", "--port", "993", "--username",
+        &email, "--provider", "generic", "--server", "imap.example.com", "--port", "993", "--username",
         "user", "--retention-days", "30",
     ];
     args.extend_from_slice(extra);

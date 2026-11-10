@@ -111,8 +111,9 @@ fn attachment_disposition(filename: &str) -> HeaderValue {
 /// client's (400), a missing item 404, anything else the server's (500).
 fn error_status(e: &mailbackup_core::Error) -> StatusCode {
     match e {
-        mailbackup_core::Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
-        mailbackup_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+        mailbackup_core::Error::InvalidInput(_) | mailbackup_core::Error::AccountArchived(_) => StatusCode::BAD_REQUEST,
+        mailbackup_core::Error::NotFound(_) | mailbackup_core::Error::AccountNotFound(_) => StatusCode::NOT_FOUND,
+        mailbackup_core::Error::AccountExists(_) => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -824,7 +825,7 @@ async fn api_get_account(
     Path(account_id): Path<String>,
 ) -> impl IntoResponse {
     let cfg = state.config.read().await;
-    match cfg.get_account(&account_id) {
+    match cfg.account_by_id(&account_id) {
         Some(acc) => Json(acc).into_response(),
         None => (StatusCode::NOT_FOUND, "Account not found").into_response(),
     }
@@ -861,43 +862,34 @@ async fn api_add_account(
         None => None,
     };
 
-    let id = StorageEngine::sanitize_slug(&payload.email);
-    let account = AccountConfig {
-        id: id.clone(),
-        name: payload.name,
-        email: payload.email.clone(),
-        provider,
-        imap_server: payload.server.trim().to_string(),
-        imap_port: payload.port,
-        use_tls: true,
-        auth_type: AuthType::Password,
-        username: payload.username.trim().to_string(),
-        schedule,
-        retention_days: payload.retention_days,
-        folder_filter: FolderFilter::default(),
-        gmail_smart_labels: true,
-        enabled: true,
-        storage_namespace: None,
-        credential_ref: None,
-        archive: None,
-        trust_server_ids: false,
+    let mut cfg = state.config.write().await;
+    // Refuses an address that already has an account; never reuses another
+    // account's id, files or password (issue #74)
+    let account = match mailbackup_core::accounts::create(
+        &mut cfg,
+        &state.config_path,
+        &state.db,
+        &state.storage,
+        &state.credentials,
+        mailbackup_core::accounts::NewAccount {
+            name: payload.name,
+            email: payload.email,
+            provider,
+            imap_server: payload.server,
+            imap_port: payload.port,
+            username: payload.username,
+            password: payload.password,
+            schedule,
+            retention_days: payload.retention_days,
+            requested_id: None,
+        },
+    ) {
+        Ok(account) => account,
+        Err(e) => return (error_status(&e), format!("Account not added: {}", e)).into_response(),
     };
-
-    if let Err(e) = state.credentials.set_account_password(&account, &payload.password) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save secret: {}", e)).into_response();
-    }
-
     let acc_name_log = account.name.clone();
     let acc_email_log = account.email.clone();
     let acc_provider_log = format!("{:?}", account.provider);
-
-    let mut cfg = state.config.write().await;
-    cfg.accounts.retain(|a| a.id != id);
-    cfg.accounts.push(account);
-
-    if let Err(e) = cfg.save(&state.config_path) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save config: {}", e)).into_response();
-    }
 
     // Reload scheduler with new account
     let warning = reload_scheduler(&state, &cfg).await;
@@ -916,6 +908,10 @@ struct ImportAccountsCsvPayload {
     csv_content: String,
     #[serde(default)]
     dry_run: bool,
+    /// Rows whose address already has an account update that account
+    /// instead of being refused (issue #74)
+    #[serde(default)]
+    update_existing: bool,
 }
 
 #[derive(Serialize)]
@@ -927,6 +923,9 @@ struct ImportAccountsCsvResponse {
     errors: Vec<mailbackup_core::csv_import::CsvRowError>,
     imported: bool,
     imported_count: usize,
+    /// Of the valid rows, how many update an existing account
+    #[serde(default)]
+    update_count: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -941,6 +940,8 @@ struct ImportedAccountPreview {
     port: u16,
     username: String,
     schedule: Option<String>,
+    /// "create" or "update"
+    action: &'static str,
 }
 
 async fn api_accounts_csv_template() -> impl IntoResponse {
@@ -961,89 +962,98 @@ async fn api_import_accounts_csv(
     State(state): State<AppState>,
     Json(payload): Json<ImportAccountsCsvPayload>,
 ) -> impl IntoResponse {
-    let report = mailbackup_core::csv_import::parse_accounts_csv(&payload.csv_content);
+    let mut report = mailbackup_core::csv_import::parse_accounts_csv(&payload.csv_content);
+    // The whole file is checked against the accounts (and itself) before
+    // anything is written
+    let mut cfg = state.config.write().await;
+    let (plan, conflicts) = mailbackup_core::accounts::plan_import(&cfg, &report.valid_accounts, payload.update_existing);
+    report.errors.extend(conflicts);
+    report.errors.sort_by_key(|e| e.line);
 
-    let previews: Vec<ImportedAccountPreview> = report
-        .valid_accounts
+    let previews: Vec<ImportedAccountPreview> = plan
         .iter()
-        .map(|acc| ImportedAccountPreview {
-            id: acc.id.clone(),
-            email: acc.email.clone(),
-            name: acc.name.clone(),
-            provider: format!("{:?}", acc.provider),
-            imap_server: acc.imap_server.clone(),
-            server: acc.imap_server.clone(),
-            imap_port: acc.imap_port,
-            port: acc.imap_port,
-            username: acc.username.clone(),
-            schedule: acc.schedule.clone(),
+        .map(|(i, action)| {
+            let acc = &report.valid_accounts[*i];
+            ImportedAccountPreview {
+                id: match action {
+                    mailbackup_core::accounts::ImportAction::Update(id) => id.clone(),
+                    mailbackup_core::accounts::ImportAction::Create => acc.id.clone(),
+                },
+                email: acc.email.clone(),
+                name: acc.name.clone(),
+                provider: format!("{:?}", acc.provider),
+                imap_server: acc.imap_server.clone(),
+                server: acc.imap_server.clone(),
+                imap_port: acc.imap_port,
+                port: acc.imap_port,
+                username: acc.username.clone(),
+                schedule: acc.schedule.clone(),
+                action: match action {
+                    mailbackup_core::accounts::ImportAction::Update(_) => "update",
+                    mailbackup_core::accounts::ImportAction::Create => "create",
+                },
+            }
         })
         .collect();
 
-    let valid_count = report.valid_accounts.len();
-    let error_count = report.errors.len();
+    let valid_count = plan.len();
+    let update_count = plan.iter().filter(|(_, a)| matches!(a, mailbackup_core::accounts::ImportAction::Update(_))).count();
 
-    if payload.dry_run {
+    if payload.dry_run || valid_count == 0 {
+        let status = if payload.dry_run { StatusCode::OK } else { StatusCode::BAD_REQUEST };
         return (
-            StatusCode::OK,
+            status,
             Json(ImportAccountsCsvResponse {
                 valid_count,
-                error_count,
+                error_count: report.errors.len(),
                 accounts: previews.clone(),
                 valid_accounts: previews,
                 errors: report.errors,
                 imported: false,
                 imported_count: 0,
+                update_count,
             }),
         )
             .into_response();
     }
 
-    if valid_count == 0 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ImportAccountsCsvResponse {
-                valid_count: 0,
-                error_count,
-                accounts: vec![],
-                valid_accounts: vec![],
-                errors: report.errors,
-                imported: false,
-                imported_count: 0,
-            }),
-        )
-            .into_response();
-    }
-
-    // Save credentials and update config
-    let mut saved_accounts = Vec::new();
-    for acc in &report.valid_accounts {
-        let cfg_acc = acc.to_account_config();
-        if let Err(e) = state.credentials.set_account_password(&cfg_acc, &acc.password) {
-            error!("Failed to save secret for account '{}': {}", acc.email, e);
+    // One account at a time, each saved on its own: a failure stops the
+    // import and reports what was done before it
+    let mut imported_count = 0;
+    for (i, action) in &plan {
+        let row = &report.valid_accounts[*i];
+        let result = match action {
+            mailbackup_core::accounts::ImportAction::Create => mailbackup_core::accounts::create(
+                &mut cfg,
+                &state.config_path,
+                &state.db,
+                &state.storage,
+                &state.credentials,
+                mailbackup_core::accounts::new_account_from_row(row),
+            ),
+            mailbackup_core::accounts::ImportAction::Update(id) => mailbackup_core::accounts::update_from_row(
+                &mut cfg,
+                &state.config_path,
+                &state.credentials,
+                id,
+                row,
+            ),
+        };
+        if let Err(e) = result {
+            error!("CSV import stopped at line {} ({}): {}", row.line, row.email, e);
+            let _ = reload_scheduler(&state, &cfg).await;
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to save secret for account '{}': {}", acc.email, e),
+                error_status(&e),
+                format!(
+                    "Import stopped at line {} ({}): {}. {} account(s) were imported before it.",
+                    row.line, row.email, e, imported_count
+                ),
             )
                 .into_response();
         }
-        saved_accounts.push(cfg_acc);
+        imported_count += 1;
     }
-
-    let mut cfg = state.config.write().await;
-    for acc in saved_accounts {
-        let acc_id = acc.id.clone();
-        cfg.accounts.retain(|a| a.id != acc_id);
-        cfg.accounts.push(acc);
-    }
-
-    if let Err(e) = cfg.save(&state.config_path) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to save config: {}", e),
-        )
-            .into_response();
-    }
+    let error_count = report.errors.len();
 
     // Reload scheduler with updated accounts
     let _ = reload_scheduler(&state, &cfg).await;
@@ -1051,8 +1061,8 @@ async fn api_import_accounts_csv(
     mailbackup_core::event_log::log_event(
         "ACCOUNTS_BULK_IMPORTED",
         &format!(
-            "Bulk imported {} account(s) via CSV ({} invalid rows skipped)",
-            valid_count, error_count
+            "Bulk imported {} account(s) via CSV ({} updated, {} rows skipped)",
+            imported_count, update_count, error_count
         ),
     );
 
@@ -1065,7 +1075,8 @@ async fn api_import_accounts_csv(
             valid_accounts: previews,
             errors: report.errors,
             imported: true,
-            imported_count: valid_count,
+            imported_count,
+            update_count,
         }),
     )
         .into_response()
@@ -1107,7 +1118,7 @@ async fn api_update_account(
     }
 
     let mut cfg = state.config.write().await;
-    let acc = match cfg.get_account_mut(&account_id) {
+    let acc = match cfg.account_by_id_mut(&account_id) {
         Some(a) => a,
         None => return (StatusCode::NOT_FOUND, "Account not found").into_response(),
     };
@@ -1206,7 +1217,7 @@ async fn api_update_account(
         }
     }
 
-    let acc = match cfg.get_account_mut(&account_id) {
+    let acc = match cfg.account_by_id_mut(&account_id) {
         Some(a) => a,
         None => return (StatusCode::NOT_FOUND, "Account not found").into_response(),
     };
@@ -1598,7 +1609,7 @@ async fn api_sync_account(
     Path(account_id): Path<String>,
 ) -> impl IntoResponse {
     let cfg = state.config.read().await;
-    let acc = match cfg.get_account(&account_id) {
+    let acc = match cfg.account_by_id(&account_id) {
         Some(a) => a.clone(),
         None => return (StatusCode::NOT_FOUND, "Account not found").into_response(),
     };
@@ -4221,5 +4232,74 @@ mod tests {
         assert_eq!(report.valid_accounts[0].email, "ok@example.com");
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].error.contains("every 6h") && report.errors[0].error.contains("bad@example.com"));
+    }
+
+    // ---- Adding never replaces an account (issue #74) ----
+
+    #[tokio::test]
+    async fn adding_an_existing_address_is_a_conflict_and_a_colliding_slug_gets_a_new_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+        let (status, body) = send(&router, "POST", "/api/accounts", new_account("a.b@example.com", "0 1 * * *")).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+
+        let (status, body) = send(&router, "POST", "/api/accounts", new_account("A.B@example.com", "0 2 * * *")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{}", body);
+        assert_eq!(state.config.read().await.accounts[0].schedule.as_deref(), Some("0 1 * * *"), "the account is unchanged");
+
+        let (status, body) = send(&router, "POST", "/api/accounts", new_account("a_b@example.com", "0 3 * * *")).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let cfg = state.config.read().await;
+        let ids: Vec<&str> = cfg.accounts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["a_bexample_com", "a_bexample_com-2"]);
+        assert_eq!(cfg.accounts[0].email, "a.b@example.com");
+    }
+
+    #[tokio::test]
+    async fn account_routes_take_ids_not_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+        send(&router, "POST", "/api/accounts", new_account("me@example.com", "0 1 * * *")).await;
+        let (status, _) = send(&router, "GET", "/api/accounts/me@example.com", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(&router, "GET", "/api/accounts/meexample_com", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn csv_import_refuses_existing_addresses_unless_asked_to_update_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+        send(&router, "POST", "/api/accounts", new_account("old@example.com", "0 1 * * *")).await;
+        let csv = "email,password,name\nold@example.com,changed,Renamed\nnew@example.com,pw,New\n";
+
+        let (status, body) = send(&router, "POST", "/api/accounts/import-csv", serde_json::json!({ "csv_data": csv })).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(report["imported_count"], 1, "{}", body);
+        assert_eq!(report["errors"].as_array().unwrap().len(), 1, "{}", body);
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.account_by_id("oldexample_com").unwrap().name, "N", "not replaced");
+            assert_eq!(state.credentials.get_account_password(cfg.account_by_id("oldexample_com").unwrap()).unwrap(), "pw");
+        }
+
+        let csv = "email,password,name\nold@example.com,changed,Renamed\n";
+        let request = serde_json::json!({ "csv_data": csv, "update_existing": true, "dry_run": true });
+        let (_, body) = send(&router, "POST", "/api/accounts/import-csv", request).await;
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(report["valid_accounts"][0]["action"], "update", "{}", body);
+
+        let request = serde_json::json!({ "csv_data": csv, "update_existing": true });
+        let (status, body) = send(&router, "POST", "/api/accounts/import-csv", request).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let cfg = state.config.read().await;
+        assert_eq!(cfg.accounts.len(), 2);
+        let old = cfg.account_by_id("oldexample_com").unwrap();
+        assert_eq!(old.name, "Renamed");
+        assert_eq!(state.credentials.get_account_password(old).unwrap(), "changed");
     }
 }

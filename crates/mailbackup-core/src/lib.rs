@@ -1,5 +1,6 @@
 //! mailbackup-core: Core library for resilient, incremental email backups in Rust.
 
+pub mod accounts;
 pub mod config;
 pub mod db;
 pub mod keyring;
