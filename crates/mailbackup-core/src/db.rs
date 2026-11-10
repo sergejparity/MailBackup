@@ -294,23 +294,21 @@ fn migrate_to_v5_with_limit(conn: &mut Connection, value_limit: usize) -> Result
                FROM messages ORDER BY rowid;"#,
         )?;
 
-        // The old index, row by row, grouped by message (order kept)
-        let mut old: std::collections::HashMap<String, Vec<[String; 5]>> = std::collections::HashMap::new();
-        {
-            let mut stmt = tx.prepare(
-                "SELECT message_id, subject, from_addr, to_addrs, body_text, attachment_names FROM messages_fts ORDER BY rowid",
-            )?;
-            let text = |r: &rusqlite::Row<'_>, i: usize| -> rusqlite::Result<String> {
-                Ok(r.get::<_, Option<String>>(i)?.unwrap_or_default())
-            };
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, [text(r, 1)?, text(r, 2)?, text(r, 3)?, text(r, 4)?, text(r, 5)?]))
-            })?;
-            for row in rows {
-                let (id, values) = row?;
-                old.entry(id).or_default().push(values);
-            }
-        }
+        // Which old index rows belong to which message, on disk: only the
+        // ids are read here, and each message's rows (with their text) are
+        // read when it is indexed, so memory stays at one message whatever
+        // the size of the archive (review of #92)
+        tx.execute_batch(
+            r#"DROP TABLE IF EXISTS temp.fts_v4_rows;
+               CREATE TEMP TABLE fts_v4_rows (message_id TEXT NOT NULL, fts_rowid INTEGER NOT NULL);
+               INSERT INTO temp.fts_v4_rows (message_id, fts_rowid) SELECT message_id, rowid FROM messages_fts;
+               CREATE INDEX temp.fts_v4_rows_by_message ON fts_v4_rows (message_id, fts_rowid);"#,
+        )?;
+        report.orphans = tx.query_row(
+            "SELECT count(DISTINCT message_id) FROM temp.fts_v4_rows WHERE message_id NOT IN (SELECT id FROM messages_v5)",
+            [],
+            |r| r.get(0),
+        )?;
 
         tx.execute_batch(&messages_fts_v5_ddl("messages_fts_v5"))?;
         {
@@ -319,22 +317,33 @@ fn migrate_to_v5_with_limit(conn: &mut Connection, value_limit: usize) -> Result
             let mut insert = tx.prepare(
                 "INSERT INTO messages_fts_v5 (rowid, subject, from_addr, to_addrs, body_text, attachment_names) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
+            // One message's old index rows, in their order
+            let mut old_rows = tx.prepare(
+                r#"SELECT f.subject, f.from_addr, f.to_addrs, f.body_text, f.attachment_names
+                   FROM temp.fts_v4_rows m JOIN messages_fts f ON f.rowid = m.fts_rowid
+                   WHERE m.message_id = ?1 ORDER BY m.fts_rowid"#,
+            )?;
             let mut rows = messages.query([])?;
             while let Some(r) = rows.next()? {
                 report.messages += 1;
                 let (seq, id): (i64, String) = (r.get(0)?, r.get(1)?);
-                let values: [String; 5] = match old.remove(&id) {
-                    None => {
+                let text = |r: &rusqlite::Row<'_>, i: usize| -> rusqlite::Result<String> {
+                    Ok(r.get::<_, Option<String>>(i)?.unwrap_or_default())
+                };
+                let old: Vec<[String; 5]> = old_rows
+                    .query_map(params![id], |o| Ok([text(o, 0)?, text(o, 1)?, text(o, 2)?, text(o, 3)?, text(o, 4)?]))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let values: [String; 5] = match (old.len(), old) {
+                    (0, _) => {
                         // Nothing was indexed: index what the catalog knows
                         report.rebuilt += 1;
                         let names: Vec<String> = attachments
                             .query_map(params![id], |a| a.get::<_, String>(0))?
                             .collect::<rusqlite::Result<_>>()?;
-                        let text = |i: usize| -> rusqlite::Result<String> { Ok(r.get::<_, Option<String>>(i)?.unwrap_or_default()) };
-                        [text(2)?, text(3)?, text(4)?, String::new(), names.join(" ")]
+                        [text(r, 2)?, text(r, 3)?, text(r, 4)?, String::new(), names.join(" ")]
                     }
-                    Some(mut rows) if rows.len() == 1 => rows.remove(0),
-                    Some(rows) => {
+                    (1, mut rows) => rows.remove(0),
+                    (_, rows) => {
                         report.merged += 1;
                         let merged: [String; 5] = std::array::from_fn(|c| merge_index_values(rows.iter().map(|row| row[c].as_str())));
                         // Every distinct old value is in the merged one
@@ -357,7 +366,7 @@ fn migrate_to_v5_with_limit(conn: &mut Connection, value_limit: usize) -> Result
                 insert.execute(params![seq, values[0], values[1], values[2], values[3], values[4]])?;
             }
         }
-        report.orphans = old.len();
+        tx.execute_batch("DROP TABLE temp.fts_v4_rows;")?;
 
         let indexed: i64 = tx.query_row("SELECT count(*) FROM messages_fts_v5", [], |r| r.get(0))?;
         if indexed as usize != report.messages {
