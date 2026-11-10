@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use console::{style, Emoji};
 use dialoguer::{Input, Password, Select};
 use indicatif::{ProgressBar, ProgressStyle};
-use mailbackup_core::config::{AccountConfig, AppConfig, AuthType, FolderFilter, ProviderType};
+use mailbackup_core::config::{AccountConfig, AppConfig, ProviderType};
 use mailbackup_core::db::Database;
 use mailbackup_core::imap::ImapSyncEngine;
 use mailbackup_core::keyring::CredentialStore;
@@ -198,7 +198,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Account(AccountCommands::Add(args)) => {
-            handle_account_add(&mut config, cli.config.as_deref(), &credentials, args)?;
+            handle_account_add(&mut config, &config_path, &db, &storage, &credentials, args)?;
         }
         Commands::Account(AccountCommands::List) => {
             handle_account_list(&config, &db)?;
@@ -329,7 +329,9 @@ fn check_password(password: String, source: &str) -> Result<String> {
 
 fn handle_account_add(
     config: &mut AppConfig,
-    config_path: Option<&std::path::Path>,
+    config_path: &std::path::Path,
+    db: &Database,
+    storage: &StorageEngine,
     credentials: &CredentialStore,
     args: AddAccountArgs,
 ) -> Result<()> {
@@ -372,7 +374,7 @@ fn handle_account_add(
         }
     };
 
-    let (def_server, def_port, def_tls) = provider_choice.default_server();
+    let (def_server, def_port, _) = provider_choice.default_server();
 
     let email = match args.email {
         Some(e) => e,
@@ -384,10 +386,8 @@ fn handle_account_add(
         None => Input::new().with_prompt("Account display name").default(email.clone()).interact_text()?,
     };
 
-    let id = match args.id {
-        Some(i) => i,
-        None => StorageEngine::sanitize_slug(&email),
-    };
+    // Without --id, a free id is derived from the address when saving
+    let id = args.id;
 
     let imap_server = match args.server {
         Some(s) => s,
@@ -426,35 +426,28 @@ fn handle_account_add(
         mailbackup_core::scheduler::validate_schedule(schedule)?;
     }
 
-    let account = AccountConfig {
-        id: id.clone(),
-        name,
-        email,
-        provider: provider_choice,
-        imap_server,
-        imap_port,
-        use_tls: def_tls,
-        auth_type: AuthType::Password,
-        username,
-        schedule,
-        retention_days,
-        folder_filter: FolderFilter::default(),
-        gmail_smart_labels: true,
-        enabled: true,
-        storage_namespace: None,
-        credential_ref: None,
-        archive: None,
-        trust_server_ids: false,
-    };
-
-    // Store password securely, bound to this server/port/username
-    credentials.set_account_password(&account, &password)?;
-
-    config.accounts.retain(|a| a.id != id);
-    config.accounts.push(account);
-
-    let save_path = config_path.unwrap_or_else(|| mailbackup_core::config::default_config_path().leak());
-    config.save(save_path)?;
+    // Refuses an address that already has an account and never reuses
+    // another account's id or password (issue #74)
+    let account = mailbackup_core::accounts::create(
+        config,
+        config_path,
+        db,
+        storage,
+        credentials,
+        mailbackup_core::accounts::NewAccount {
+            name,
+            email,
+            provider: provider_choice,
+            imap_server,
+            imap_port,
+            username,
+            password,
+            schedule,
+            retention_days,
+            requested_id: id,
+        },
+    )?;
+    let id = account.id;
 
     println!("\n{} Account '{}' configured successfully and credentials saved securely!", CHECK_EMOJI, id);
     Ok(())

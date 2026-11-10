@@ -735,6 +735,22 @@ impl Database {
         Ok(())
     }
 
+    /// Whether the catalog knows `name` as an account id or as a name a
+    /// "start a new archive" switch used (finished or not): any folder or
+    /// message of that account, or any side of an account transition.
+    pub fn account_name_in_use(&self, name: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            r#"SELECT EXISTS(SELECT 1 FROM folders WHERE account_id = ?1)
+                   OR EXISTS(SELECT 1 FROM messages WHERE account_id = ?1)
+                   OR EXISTS(SELECT 1 FROM account_transitions
+                             WHERE live_id = ?1 OR archive_id = ?1
+                                OR old_credential_ref = ?1 OR staged_credential_ref = ?1)"#,
+            params![name],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Highest transition number ever recorded for `live_id` (0 if none),
     /// aborted attempts included.
     pub fn last_transition_seq(&self, live_id: &str) -> Result<u32> {

@@ -426,11 +426,45 @@ impl AppConfig {
         Ok(())
     }
 
+    /// The account with exactly this id.
+    pub fn account_by_id(&self, id: &str) -> Option<&AccountConfig> {
+        self.accounts.iter().find(|a| a.id == id)
+    }
+
+    pub fn account_by_id_mut(&mut self, id: &str) -> Option<&mut AccountConfig> {
+        self.accounts.iter_mut().find(|a| a.id == id)
+    }
+
+    /// Index of the account named by an id, or else by an email address:
+    /// the only live account with it, or else the only account with it. An
+    /// id always wins; an address that still names several accounts names
+    /// none of them.
+    fn position(&self, id_or_email: &str) -> Option<usize> {
+        if let Some(i) = self.accounts.iter().position(|a| a.id == id_or_email) {
+            return Some(i);
+        }
+        let only = |live_only: bool| {
+            let mut found = self
+                .accounts
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.email == id_or_email && !(live_only && a.is_archive()));
+            match (found.next(), found.next()) {
+                (Some((i, _)), None) => Some(i),
+                _ => None,
+            }
+        };
+        only(true).or_else(|| only(false))
+    }
+
+    /// The account with this id, or else the only account with this email
+    /// address (a convenience for the command line; the API uses
+    /// [`Self::account_by_id`]).
     pub fn get_account(&self, id_or_email: &str) -> Option<&AccountConfig> {
-        self.accounts.iter().find(|a| a.id == id_or_email || a.email == id_or_email)
+        self.position(id_or_email).map(|i| &self.accounts[i])
     }
 
     pub fn get_account_mut(&mut self, id_or_email: &str) -> Option<&mut AccountConfig> {
-        self.accounts.iter_mut().find(|a| a.id == id_or_email || a.email == id_or_email)
+        self.position(id_or_email).map(|i| &mut self.accounts[i])
     }
 }

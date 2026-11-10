@@ -554,6 +554,10 @@
                 <textarea id="csv-raw-textarea" class="form-input csv-textarea" placeholder="email,password,name,server,port,username&#10;user@example.com,AppPass123,Work Email,mail.example.com,993,user@example.com&#10;john.doe@gmail.com,abcd-efgh-ijkl-mnop,Personal Gmail,,,john.doe@gmail.com&#10;alice@company.com,Secret2026,Alice Smith,outlook.office365.com,993,alice@company.com" spellcheck="false" autocomplete="off"></textarea>
               </div>
 
+              <label style="display: flex; align-items: center; gap: 8px; font-size: 0.85rem; margin-bottom: 8px; cursor: pointer;">
+                <input type="checkbox" id="csv-update-existing">
+                Update existing accounts (otherwise rows for addresses that already have an account are skipped)
+              </label>
               <div class="bulk-import-actions">
                 <button type="button" id="btn-preview-csv" class="btn btn-primary">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

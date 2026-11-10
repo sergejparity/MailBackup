@@ -4,6 +4,9 @@ use crate::storage::StorageEngine;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidImportAccount {
+    /// Line of the row in the file
+    #[serde(default)]
+    pub line: usize,
     pub id: String,
     pub name: String,
     pub email: String,
@@ -321,6 +324,7 @@ pub fn parse_accounts_csv(content: &str) -> CsvImportReport {
         let id = StorageEngine::sanitize_slug(&email);
 
         report.valid_accounts.push(ValidImportAccount {
+            line: row_num,
             id,
             name,
             email,
