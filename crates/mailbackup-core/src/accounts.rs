@@ -13,7 +13,9 @@
 //!   again if the config can't be saved.
 //!
 //! The whole step runs under one cross-process lock, so two creations (in
-//! this process or another) can't choose the same id.
+//! this process or another) can't choose the same id, and it changes the
+//! config file as it is under that lock, so neither drops the other's
+//! account.
 
 use crate::config::{AccountConfig, AppConfig, AuthType, FolderFilter, ProviderType};
 use crate::db::Database;
@@ -111,11 +113,14 @@ fn free_id(
     Err(Error::Other(format!("No free account id for '{}'", email)))
 }
 
-/// Adds a new account to `config` and saves it to `config_path`, with its
-/// password stored. See the module docs for what is guaranteed. `config` is
-/// the caller's (locked) copy; accounts another process added to the file
-/// meanwhile are taken into account for the checks, and the caller's copy is
-/// what is saved, as with every other change it makes.
+/// Adds a new account to the config file at `config_path`, with its
+/// password stored. See the module docs for what is guaranteed.
+///
+/// The file as it is under the creation lock is what gets changed: accounts
+/// and settings another process saved meanwhile are kept, never replaced by
+/// the caller's older copy. `config` (the caller's copy) is then reconciled:
+/// it gets the new account and every account of the file it didn't have;
+/// its own settings are left as they are.
 ///
 /// On any error `config`, the config file and the credential store are as
 /// they were.
@@ -190,11 +195,17 @@ pub fn create(
         undo_password(&e);
         return Err(e);
     }
-    config.accounts.push(account.clone());
-    if let Err(e) = config.save(config_path) {
-        config.accounts.pop();
+    // Change the file as it is now, not the caller's copy, which may be older
+    let mut latest = on_disk.unwrap_or_else(|| config.clone());
+    latest.accounts.push(account.clone());
+    if let Err(e) = latest.save(config_path) {
         undo_password(&e);
         return Err(e);
+    }
+    for saved in latest.accounts {
+        if config.account_by_id(&saved.id).is_none() {
+            config.accounts.push(saved);
+        }
     }
     Ok(account)
 }
