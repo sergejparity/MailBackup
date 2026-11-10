@@ -413,8 +413,11 @@ fn catalog_opens_with_every_row_as_written() {
         .filter(|o| !rebuilt(o) && !written_schema.contains(o))
         .map(|o| o["name"].as_str().unwrap())
         .collect();
-    // Schema 4 (issue #72)
-    assert_eq!(added, ["idx_skipped_messages_account", "sqlite_autoindex_skipped_messages_1", "skipped_messages"]);
+    // Schema 4 (issue #72), and the folder list index on attachments (#77)
+    assert_eq!(
+        added,
+        ["idx_attachments_message", "idx_skipped_messages_account", "sqlite_autoindex_skipped_messages_1", "skipped_messages"]
+    );
     // The indexes on `messages` it had, recreated with the same definitions
     for object in written_schema.iter().filter(|o| o["tbl_name"] == "messages" && o["name"].as_str().unwrap().starts_with("idx_")) {
         assert!(now_schema.contains(object), "recreated as written: {}", object);
