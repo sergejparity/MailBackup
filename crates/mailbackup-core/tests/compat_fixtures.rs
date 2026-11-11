@@ -394,8 +394,21 @@ fn catalog_opens_with_every_row_as_written() {
     let conn = rusqlite::Connection::open(dir.path().join("mailbackup.db")).unwrap();
     let now = compat::catalog::snapshot(&conn);
     let written = read_json(&fixtures_root().join("catalog").join("snapshot.json"));
-    assert_eq!(now["user_version"], written["user_version"]);
-    assert_eq!(now["schema"], written["schema"]);
+    // Written at schema 3; opening upgrades it. Every object it had is kept
+    // exactly, and the only new ones are those of later schema versions
+    assert_eq!(written["user_version"], 3);
+    assert_eq!(now["user_version"], mailbackup_core::db::SCHEMA_VERSION);
+    let (written_schema, now_schema) = (written["schema"].as_array().unwrap(), now["schema"].as_array().unwrap());
+    for object in written_schema {
+        assert!(now_schema.contains(object), "kept as written: {}", object);
+    }
+    let added: Vec<&str> = now_schema
+        .iter()
+        .filter(|o| !written_schema.contains(o))
+        .map(|o| o["name"].as_str().unwrap())
+        .collect();
+    // Schema 4 (issue #72)
+    assert_eq!(added, ["idx_skipped_messages_account", "sqlite_autoindex_skipped_messages_1", "skipped_messages"]);
     for (table, rows) in written["tables"].as_object().unwrap() {
         assert_eq!(&now["tables"][table], rows, "table {}", table);
     }
@@ -568,4 +581,30 @@ fn default_config_location_follows_the_home_folder() {
     let Some(home) = home.filter(|h| !h.as_os_str().is_empty()) else { return };
     assert_eq!(mailbackup_core::config::default_base_dir(), home.join(".mailbackup"));
     assert_eq!(mailbackup_core::config::default_config_path(), home.join(".mailbackup").join("config.yaml"));
+}
+
+
+/// Issue #73: retention right after upgrading a schema-3 catalog counts from
+/// when each row was archived. Every row of the fixture was archived on
+/// 2026-11-04 15:35 UTC, with mail dates from 6 October to 2 November.
+#[test]
+fn retention_after_the_upgrade_counts_from_the_archive_time() {
+    use mailbackup_core::retention::RetentionManager;
+    let (_dir, db, storage) = open_catalog();
+    let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc);
+    let count = |db: &Database| db.get_storage_stats().unwrap().total_messages;
+    assert_eq!(count(&db), 9);
+
+    // A day after archiving, a 30-day policy keeps everything, the mail
+    // dated 6 October (more than 30 days earlier) included
+    let report = RetentionManager::new(&db, &storage).enforce_retention_as_of("acct-live", Some(30), at("2026-11-05T15:35:28Z")).unwrap();
+    assert_eq!(report.pruned_count, 0);
+    assert_eq!(count(&db), 9);
+
+    // 31 days after archiving, every row of the account expires; other
+    // accounts (and the read-only archives) are untouched
+    let report = RetentionManager::new(&db, &storage).enforce_retention_as_of("acct-live", Some(30), at("2026-12-05T15:36:00Z")).unwrap();
+    assert_eq!(report.pruned_count, 6);
+    assert_eq!(count(&db), 3);
+    assert!(db.get_messages_archived_before("acct-moved", at("2027-01-01T00:00:00Z")).unwrap().len() == 1);
 }

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>MailBackup Studio · Log in</title>
+  <script src="/theme-init.js"></script>
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <style>
+    :root { --bg: #f6f7f9; --card: #ffffff; --text: #16181d; --dim: #5b6270; --line: #d9dce3; --accent: #4f46e5; --bad: #c2410c; }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) { --bg: #0f1115; --card: #171a21; --text: #e6e8eb; --dim: #9aa3b2; --line: #2a2f3a; --accent: #818cf8; --bad: #fb923c; }
+    }
+    :root[data-theme="dark"] { --bg: #0f1115; --card: #171a21; --text: #e6e8eb; --dim: #9aa3b2; --line: #2a2f3a; --accent: #818cf8; --bad: #fb923c; }
+    body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px;
+           box-sizing: border-box; background: var(--bg); color: var(--text);
+           font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; line-height: 1.5; }
+    main { width: 100%; max-width: 420px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 28px; }
+    .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+    .brand img { width: 32px; height: 32px; }
+    h1 { font-size: 1.15rem; margin: 0; }
+    p { color: var(--dim); font-size: 0.9rem; margin: 0 0 16px; }
+    label { display: block; font-size: 0.85rem; margin-bottom: 6px; }
+    input { width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+            background: var(--bg); color: var(--text); font-family: ui-monospace, monospace; font-size: 0.85rem; }
+    button { margin-top: 14px; width: 100%; padding: 10px; border: 0; border-radius: 8px; background: var(--accent);
+             color: #fff; font-size: 0.95rem; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: default; }
+    #login-error { color: var(--bad); font-size: 0.85rem; margin-top: 10px; min-height: 1.2em; }
+    code { font-size: 0.8rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand"><img src="/logo-mark.png" alt=""><h1>MailBackup Studio</h1></div>
+    <p>Enter the browser access key to open MailBackup here. The desktop app shows it under Settings, Browser access,
+       and <code>mailbackup web-key</code> prints it.</p>
+    <form id="login-form" autocomplete="off">
+      <label for="login-key">Access key</label>
+      <input id="login-key" name="key" type="password" spellcheck="false" autocapitalize="none" required autofocus>
+      <button type="submit" id="login-submit">Log in</button>
+      <div id="login-error" role="alert"></div>
+    </form>
+  </main>
+  <script src="/login.js"></script>
+</body>
+</html>

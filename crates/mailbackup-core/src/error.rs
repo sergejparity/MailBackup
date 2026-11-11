@@ -63,6 +63,11 @@ pub enum Error {
     #[error("Sync of folder '{0}' was superseded by a newer sync; stopping it")]
     StaleSync(String),
 
+    /// An account for this address, or with this id, already exists
+    /// (reported to API clients as 409).
+    #[error("{0}")]
+    AccountExists(String),
+
     /// The account is a read-only archive (see `config::ArchiveInfo`).
     #[error("Account '{0}' is a read-only archive")]
     AccountArchived(String),
@@ -75,6 +80,11 @@ pub enum Error {
     /// for another command.
     #[error("IMAP protocol error: {0}")]
     ProtocolBroken(String),
+
+    /// A connection step or command took longer than its limit, or the
+    /// connection went idle; the session can't be used for another command.
+    #[error("IMAP timeout: {0}")]
+    Timeout(String),
 
     #[error("Generic error: {0}")]
     Other(String),

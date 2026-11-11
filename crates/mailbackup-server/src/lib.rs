@@ -64,6 +64,8 @@ pub struct AppState {
     /// server (see `runtime`), with the port it listens on. Never sent to
     /// clients.
     pub identity: Arc<StdRwLock<runtime::ServerIdentity>>,
+    /// Logins and sessions of browsers (see `access`).
+    pub access: Arc<access::Access>,
     /// The HTTP listener, which the desktop app turns on and off with the
     /// `web_server_enabled` setting; `None` when nothing can switch it
     /// (tests).
@@ -79,10 +81,14 @@ pub struct InProcess {
     pub origin: String,
 }
 
+pub mod access;
 pub mod runtime;
+pub mod streaming;
 pub mod tickets;
 
 pub const API_TOKEN_HEADER: &str = "x-mailbackup-token";
+/// On a `401` of an API route: the browser has no (more) session.
+pub const LOGIN_REQUIRED_HEADER: &str = "x-mailbackup-login";
 
 /// `Content-Disposition: attachment` for `filename`, valid for any input:
 /// `filename=` carries an ASCII-only copy (quotes, backslashes, control and
@@ -111,8 +117,9 @@ fn attachment_disposition(filename: &str) -> HeaderValue {
 /// client's (400), a missing item 404, anything else the server's (500).
 fn error_status(e: &mailbackup_core::Error) -> StatusCode {
     match e {
-        mailbackup_core::Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
-        mailbackup_core::Error::NotFound(_) => StatusCode::NOT_FOUND,
+        mailbackup_core::Error::InvalidInput(_) | mailbackup_core::Error::AccountArchived(_) => StatusCode::BAD_REQUEST,
+        mailbackup_core::Error::NotFound(_) | mailbackup_core::Error::AccountNotFound(_) => StatusCode::NOT_FOUND,
+        mailbackup_core::Error::AccountExists(_) => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -147,6 +154,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/", get(serve_index))
         .route("/api/stats", get(api_stats))
         .route("/api/handshake", get(api_handshake))
+        .route("/login", get(login_page_or_ticket))
+        .route("/api/login", post(api_login))
+        .route("/api/logout", post(api_logout))
+        .route("/api/web-key", get(api_web_key))
+        .route("/api/web-key/regenerate", post(api_web_key_regenerate))
         .route("/api/download-ticket", post(api_download_ticket))
         .route("/api/accounts", get(api_get_accounts).post(api_add_account))
         .route("/api/accounts/import-csv", post(api_import_accounts_csv))
@@ -166,6 +178,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/messages/{id}/attachments/{index}", get(api_download_attachment))
         .route("/api/search", get(api_search))
         .route("/api/sync/status", get(api_get_sync_status))
+        .route("/api/scheduler/status", get(api_scheduler_status))
+        .route("/api/skipped", get(api_skipped_messages))
+        .route("/api/accounts/{id}/skipped/retry", post(api_retry_skipped))
         .route("/api/sync/{account_id}", post(api_sync_account))
         .route("/api/export/mbox", post(api_export_mbox))
         .route("/api/export/mbox/download", get(api_download_mbox))
@@ -210,12 +225,13 @@ async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> R
         return guarded(&state, req, next).await;
     }
 
-    let allowed = {
+    let (allowed, require_login) = {
         let cfg = state.config.read().await;
-        match headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
+        let host = match headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
             Some(h) if is_allowed_host(h, &cfg.settings.allowed_hosts) => Some(h.to_string()),
             _ => None,
-        }
+        };
+        (host, cfg.settings.require_login)
     };
     let host = match allowed {
         Some(h) => h,
@@ -236,7 +252,57 @@ async fn api_guard(State(state): State<AppState>, req: Request, next: Next) -> R
         }
     }
 
+    // Everything but the login page and what it needs takes a session
+    // (issue #70). Only exact public paths pass: aliases of the app page
+    // (`/index.html`, encoded spellings) are refused like any other path
+    if require_login && !is_public_path(req.uri().path()) {
+        let session = headers
+            .get(header::COOKIE)
+            .and_then(|c| c.to_str().ok())
+            .and_then(access::session_from_cookies)
+            .is_some_and(|token| state.access.session_valid(token));
+        if !session {
+            let res = if req.uri().path().starts_with("/api/") {
+                // The header tells the app's page to go back to the login page
+                (StatusCode::UNAUTHORIZED, [(LOGIN_REQUIRED_HEADER, "1")], "Login required").into_response()
+            } else {
+                login_page()
+            };
+            return with_security_headers(res);
+        }
+    }
+
     guarded(&state, req, next).await
+}
+
+/// Paths a browser without a session may request: the login page, its
+/// script and images, logging in, and the server handshake. Exact matches.
+fn is_public_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/login"
+            | "/login.js"
+            | "/theme-init.js"
+            | "/logo-mark.png"
+            | "/favicon.png"
+            | "/favicon-64.png"
+            | "/favicon.ico"
+            | "/apple-touch-icon.png"
+            | "/api/login"
+            | "/api/handshake"
+    )
+}
+
+fn login_page() -> Response {
+    serve_file("login.html", "")
+}
+
+fn with_security_headers(mut res: Response) -> Response {
+    let headers = res.headers_mut();
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CONTENT_SECURITY_POLICY));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    res
 }
 
 /// The API token (or ticket) check and the security headers, for requests
@@ -245,7 +311,8 @@ async fn guarded(state: &AppState, req: Request, next: Next) -> Response {
     let headers = req.headers();
     // The handshake proves the server's identity to a client that has no
     // credentials yet (see `runtime`); Host/Origin checks above still apply
-    if req.uri().path().starts_with("/api/") && req.uri().path() != "/api/handshake" {
+    // So does logging in, which a browser does before it has the token
+    if req.uri().path().starts_with("/api/") && !matches!(req.uri().path(), "/api/handshake" | "/api/login") {
         let valid = headers
             .get(API_TOKEN_HEADER)
             .and_then(|v| v.to_str().ok())
@@ -255,12 +322,7 @@ async fn guarded(state: &AppState, req: Request, next: Next) -> Response {
         }
     }
 
-    let mut res = next.run(req).await;
-    let headers = res.headers_mut();
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CONTENT_SECURITY_POLICY));
-    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
-    res
+    with_security_headers(next.run(req).await)
 }
 
 /// Whether `req` is a `GET` of a download route carrying a live ticket issued
@@ -519,7 +581,18 @@ impl Server {
             identity: identity.clone(),
             running: Mutex::new(None),
         });
+        // The browser access key exists from the start, so the desktop app
+        // and `mailbackup web-key` find it (issue #70)
+        if let Err(e) = mailbackup_core::web_access::load_or_create_key(&web.config_dir) {
+            error!("Couldn't create the browser access key in {}: {}", web.config_dir.display(), e);
+        }
+        if !config_arc.read().await.settings.require_login {
+            tracing::warn!(
+                "settings.require_login is off: anyone who can reach the web port can use the whole API without logging in"
+            );
+        }
         let state = AppState {
+            access: Arc::new(access::Access::new(web.config_dir.clone())),
             config: config_arc,
             config_path,
             db,
@@ -556,15 +629,47 @@ impl Server {
             Ok(res) => res,
             Err(never) => match never {},
         };
-        let (parts, body) = res.into_parts();
-        match axum::body::to_bytes(body, usize::MAX).await {
-            Ok(bytes) => axum::http::Response::from_parts(parts, bytes.to_vec()),
-            Err(e) => {
-                error!("Couldn't read a response for the window: {}", e);
-                let mut res = axum::http::Response::new(b"Internal error".to_vec());
-                *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                res
-            }
+        collect_limited(res, IN_PROCESS_RESPONSE_LIMIT).await
+    }
+
+    /// Like [`Server::handle_in_process`] for a download: the response with
+    /// its body still streaming (see `streaming::save_body`), so a large
+    /// download never has to fit in memory. The request passes the same
+    /// guard: the download ticket is checked and used up here, before the
+    /// caller asks where to save.
+    pub async fn handle_in_process_streaming(
+        &self,
+        req: axum::http::Request<Vec<u8>>,
+        origin: &str,
+    ) -> axum::http::Response<Body> {
+        let mut req = req.map(Body::from);
+        req.extensions_mut().insert(InProcess { origin: origin.to_string() });
+        match tower::ServiceExt::oneshot(self.router.clone(), req).await {
+            Ok(res) => res,
+            Err(never) => match never {},
+        }
+    }
+}
+
+/// Largest response the desktop window's protocol collects in memory: the
+/// app's pages and API answers. The biggest is a message's detail: its HTML
+/// (at most the size of the message, `imap::DEFAULT_LIMITS.max_message_bytes`)
+/// plus inlined images (at most `html_view::MAX_INLINE_TOTAL_BYTES` before
+/// base64). Downloads are streamed instead (`handle_in_process_streaming`).
+pub const IN_PROCESS_RESPONSE_LIMIT: usize = 512 * 1024 * 1024;
+
+/// The response with its body collected, or a clear error if the body is
+/// larger than `limit` (never a silently truncated one).
+async fn collect_limited(res: axum::http::Response<Body>, limit: usize) -> axum::http::Response<Vec<u8>> {
+    let (parts, body) = res.into_parts();
+    match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => axum::http::Response::from_parts(parts, bytes.to_vec()),
+        Err(e) => {
+            error!("Couldn't read a response for the window: {}", e);
+            let message = format!("The response is too large to show in the window (over {} MB)", limit / (1024 * 1024));
+            let mut res = axum::http::Response::new(message.into_bytes());
+            *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            res
         }
     }
 }
@@ -614,6 +719,17 @@ impl Drop for ClosingListener {
     }
 }
 
+/// The peer address of a connection to the [`ClosingListener`], available
+/// to handlers as `ConnectInfo<PeerAddr>` (failed logins are limited per peer).
+#[derive(Clone, Copy, Debug)]
+pub struct PeerAddr(pub SocketAddr);
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, ClosingListener>> for PeerAddr {
+    fn connect_info(stream: axum::serve::IncomingStream<'_, ClosingListener>) -> Self {
+        PeerAddr(*stream.remote_addr())
+    }
+}
+
 impl axum::serve::Listener for ClosingListener {
     type Io = tokio::net::TcpStream;
     type Addr = SocketAddr;
@@ -648,7 +764,7 @@ impl WebListener {
         let addr = SocketAddr::new(self.bind_ip, port);
         if !self.bind_ip.is_loopback() {
             tracing::warn!(
-                "Web UI / REST API is exposed on {} (bind_address). It is reachable from other machines on the network.",
+                "Web UI / REST API is exposed on {} (bind_address). It is reachable from other machines on the network over plain HTTP: the access key, the session and your mail travel unencrypted. Put a TLS reverse proxy in front of it.",
                 addr
             );
         }
@@ -669,7 +785,9 @@ impl WebListener {
             let shutdown = async move {
                 let _ = stopped.await;
             };
-            if let Err(e) = axum::serve(listener, router).with_graceful_shutdown(shutdown).await {
+            // Peer addresses, for limiting failed logins per peer
+            let service = router.into_make_service_with_connect_info::<PeerAddr>();
+            if let Err(e) = axum::serve(listener, service).with_graceful_shutdown(shutdown).await {
                 error!("The web server stopped: {}", e);
             }
         });
@@ -744,6 +862,144 @@ async fn api_handshake(State(state): State<AppState>, Query(query): Query<Handsh
     }
 }
 
+// ---- Logging in (issue #70; see `access`) ----
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    key: String,
+    /// Answer with a single-use login ticket instead of a session cookie
+    /// (the desktop app, which hands the ticket to its window)
+    #[serde(default)]
+    ticket: bool,
+}
+
+const MAX_LOGIN_BODY: usize = 4 * 1024;
+
+/// `POST /api/login` with `{"key": …}`: a session cookie for the access key.
+/// JSON only, so a cross-origin form can't send it (and the guard already
+/// refused other origins); failures are limited per peer address.
+async fn api_login(State(state): State<AppState>, req: Request) -> Response {
+    let json = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json")));
+    if !json {
+        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "Expected application/json").into_response();
+    }
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<PeerAddr>>()
+        .map(|info| info.0.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let secure = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|o| o.to_str().ok())
+        .is_some_and(|o| o.to_ascii_lowercase().starts_with("https://"));
+    let Ok(body) = axum::body::to_bytes(req.into_body(), MAX_LOGIN_BODY).await else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "Request too large").into_response();
+    };
+    let Ok(login) = serde_json::from_slice::<LoginRequest>(&body) else {
+        return (StatusCode::BAD_REQUEST, "Expected {\"key\": \"…\"}").into_response();
+    };
+    let access = state.access.clone();
+    let result = if login.ticket { access.login_ticket(&peer, &login.key) } else { access.login(&peer, &login.key) };
+    match result {
+        Ok(ticket) if login.ticket => {
+            Json(serde_json::json!({ "ticket": ticket, "expires_in": access::TICKET_TTL.as_secs() })).into_response()
+        }
+        Ok(session) => {
+            info!("Browser logged in from {}", peer);
+            let mut res = StatusCode::NO_CONTENT.into_response();
+            if let Ok(cookie) = HeaderValue::from_str(&access::session_cookie(&session, secure)) {
+                res.headers_mut().insert(header::SET_COOKIE, cookie);
+            }
+            res
+        }
+        Err(access::LoginError::WrongKey) => {
+            tracing::warn!("Failed login from {}", peer);
+            (StatusCode::UNAUTHORIZED, "Wrong access key").into_response()
+        }
+        Err(access::LoginError::TooMany(wait)) => {
+            tracing::warn!("Too many failed logins from {}", peer);
+            let mut res = (StatusCode::TOO_MANY_REQUESTS, "Too many failed logins; try again later").into_response();
+            if let Ok(secs) = HeaderValue::from_str(&wait.as_secs().max(1).to_string()) {
+                res.headers_mut().insert(header::RETRY_AFTER, secs);
+            }
+            res
+        }
+        Err(access::LoginError::Unavailable(e)) => {
+            error!("The access key can't be read: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "The access key can't be read").into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LoginTicketQuery {
+    ticket: Option<String>,
+}
+
+/// `GET /login`: the login page, or with `?ticket=` (the desktop app) a
+/// session for a single-use login ticket and a redirect to the app.
+async fn login_page_or_ticket(State(state): State<AppState>, Query(query): Query<LoginTicketQuery>) -> Response {
+    let Some(ticket) = query.ticket.filter(|t| !t.is_empty()) else {
+        return login_page();
+    };
+    match state.access.redeem_ticket(&ticket) {
+        Some(session) => {
+            let mut res = (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
+            if let Ok(cookie) = HeaderValue::from_str(&access::session_cookie(&session, false)) {
+                res.headers_mut().insert(header::SET_COOKIE, cookie);
+            }
+            res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            res
+        }
+        None => login_page(),
+    }
+}
+
+async fn api_logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    if let Some(token) = headers.get(header::COOKIE).and_then(|c| c.to_str().ok()).and_then(access::session_from_cookies) {
+        state.access.logout(token);
+    }
+    let mut res = StatusCode::NO_CONTENT.into_response();
+    if let Ok(cookie) = HeaderValue::from_str(&access::expired_cookie()) {
+        res.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
+    res
+}
+
+/// The access key, for a user who is already in (a session or the desktop
+/// window), so they can open the UI in a browser.
+async fn api_web_key(State(state): State<AppState>) -> Response {
+    match state.access.key() {
+        Ok(key) => Json(serde_json::json!({
+            "key": key,
+            "path": mailbackup_core::web_access::key_path(&state.config_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default()),
+            "require_login": state.config.read().await.settings.require_login,
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// A new access key: every browser session ends, this one included.
+async fn api_web_key_regenerate(State(state): State<AppState>) -> Response {
+    match state.access.regenerate() {
+        Ok(key) => {
+            mailbackup_core::event_log::log_event("WEB_KEY_REGENERATED", "Browser access key regenerated; all browser sessions ended");
+            let mut res = Json(serde_json::json!({ "key": key })).into_response();
+            if let Ok(cookie) = HeaderValue::from_str(&access::expired_cookie()) {
+                res.headers_mut().insert(header::SET_COOKIE, cookie);
+            }
+            res
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 // Static Assets Handler
 async fn serve_index(State(state): State<AppState>) -> impl IntoResponse {
     serve_file("index.html", &state.api_token)
@@ -771,13 +1027,59 @@ fn serve_file(path: &str, api_token: &str) -> Response {
                 header::CONTENT_TYPE,
                 HeaderValue::from_str(mime.as_ref()).unwrap_or(HeaderValue::from_static("application/octet-stream")),
             );
-            if clean_path == "index.html" {
+            if clean_path == "index.html" || clean_path == "login.html" {
                 res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             }
             res
         }
         None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
     }
+}
+
+/// Reloads the scheduler with `cfg`. A failed reload leaves the previous
+/// jobs running (see `BackupScheduler::reload`); the returned text tells
+/// the user so, to be appended to the response of the change that caused it.
+async fn reload_scheduler(state: &AppState, cfg: &AppConfig) -> Option<String> {
+    match state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await {
+        Ok(()) => None,
+        Err(e) => {
+            error!("Scheduler reload failed: {}", e);
+            Some(format!(" Warning: scheduled backups still follow the previous settings ({}).", e))
+        }
+    }
+}
+
+/// `schedule` as it may be stored for an account; an error (reported as
+/// 400) if the scheduler couldn't run it (issue #71).
+fn checked_schedule(schedule: &str) -> mailbackup_core::Result<String> {
+    mailbackup_core::scheduler::validate_schedule(schedule).map(|_| schedule.trim().to_string())
+}
+
+/// Messages that are not backed up because of their size (issue #72), of
+/// every account.
+async fn api_skipped_messages(State(state): State<AppState>) -> impl IntoResponse {
+    match state.db.skipped_messages(None) {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// The account's skipped messages are fetched on its next sync, whatever
+/// the size limit.
+async fn api_retry_skipped(State(state): State<AppState>, Path(account_id): Path<String>) -> impl IntoResponse {
+    if state.config.read().await.account_by_id(&account_id).is_none() {
+        return (StatusCode::NOT_FOUND, "Account not found").into_response();
+    }
+    match state.db.request_skipped_retry(&account_id) {
+        Ok(marked) => Json(serde_json::json!({ "marked": marked })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Which accounts have a scheduled backup, as of the scheduler's last
+/// (re)start. Read-only: asking logs nothing.
+async fn api_scheduler_status(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.scheduler.lock().await.status().clone()).into_response()
 }
 
 // REST Handlers
@@ -798,7 +1100,7 @@ async fn api_get_account(
     Path(account_id): Path<String>,
 ) -> impl IntoResponse {
     let cfg = state.config.read().await;
-    match cfg.get_account(&account_id) {
+    match cfg.account_by_id(&account_id) {
         Some(acc) => Json(acc).into_response(),
         None => (StatusCode::NOT_FOUND, "Account not found").into_response(),
     }
@@ -829,53 +1131,50 @@ async fn api_add_account(
         _ => ProviderType::GenericImap,
     };
 
-    let id = StorageEngine::sanitize_slug(&payload.email);
-    let account = AccountConfig {
-        id: id.clone(),
-        name: payload.name,
-        email: payload.email.clone(),
-        provider,
-        imap_server: payload.server.trim().to_string(),
-        imap_port: payload.port,
-        use_tls: true,
-        auth_type: AuthType::Password,
-        username: payload.username.trim().to_string(),
-        schedule: payload.schedule,
-        retention_days: payload.retention_days,
-        folder_filter: FolderFilter::default(),
-        gmail_smart_labels: true,
-        enabled: true,
-        storage_namespace: None,
-        credential_ref: None,
-        archive: None,
-        trust_server_ids: false,
+    let schedule = match payload.schedule.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(checked_schedule) {
+        Some(Ok(s)) => Some(s),
+        Some(Err(e)) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        None => None,
     };
 
-    if let Err(e) = state.credentials.set_account_password(&account, &payload.password) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save secret: {}", e)).into_response();
-    }
-
+    let mut cfg = state.config.write().await;
+    // Refuses an address that already has an account; never reuses another
+    // account's id, files or password (issue #74)
+    let account = match mailbackup_core::accounts::create(
+        &mut cfg,
+        &state.config_path,
+        &state.db,
+        &state.storage,
+        &state.credentials,
+        mailbackup_core::accounts::NewAccount {
+            name: payload.name,
+            email: payload.email,
+            provider,
+            imap_server: payload.server,
+            imap_port: payload.port,
+            username: payload.username,
+            password: payload.password,
+            schedule,
+            retention_days: payload.retention_days,
+            requested_id: None,
+        },
+    ) {
+        Ok(account) => account,
+        Err(e) => return (error_status(&e), format!("Account not added: {}", e)).into_response(),
+    };
     let acc_name_log = account.name.clone();
     let acc_email_log = account.email.clone();
     let acc_provider_log = format!("{:?}", account.provider);
 
-    let mut cfg = state.config.write().await;
-    cfg.accounts.retain(|a| a.id != id);
-    cfg.accounts.push(account);
-
-    if let Err(e) = cfg.save(&state.config_path) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save config: {}", e)).into_response();
-    }
-
     // Reload scheduler with new account
-    let _ = state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await;
+    let warning = reload_scheduler(&state, &cfg).await;
 
     mailbackup_core::event_log::log_event(
         "ACCOUNT_ADDED",
         &format!("Account '{}' ({}) added [Provider: {}]", acc_name_log, acc_email_log, acc_provider_log),
     );
 
-    (StatusCode::OK, "Account created").into_response()
+    (StatusCode::OK, format!("Account created.{}", warning.unwrap_or_default())).into_response()
 }
 
 #[derive(Deserialize)]
@@ -884,6 +1183,10 @@ struct ImportAccountsCsvPayload {
     csv_content: String,
     #[serde(default)]
     dry_run: bool,
+    /// Rows whose address already has an account update that account
+    /// instead of being refused (issue #74)
+    #[serde(default)]
+    update_existing: bool,
 }
 
 #[derive(Serialize)]
@@ -895,6 +1198,9 @@ struct ImportAccountsCsvResponse {
     errors: Vec<mailbackup_core::csv_import::CsvRowError>,
     imported: bool,
     imported_count: usize,
+    /// Of the valid rows, how many update an existing account
+    #[serde(default)]
+    update_count: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -909,6 +1215,8 @@ struct ImportedAccountPreview {
     port: u16,
     username: String,
     schedule: Option<String>,
+    /// "create" or "update"
+    action: &'static str,
 }
 
 async fn api_accounts_csv_template() -> impl IntoResponse {
@@ -929,98 +1237,107 @@ async fn api_import_accounts_csv(
     State(state): State<AppState>,
     Json(payload): Json<ImportAccountsCsvPayload>,
 ) -> impl IntoResponse {
-    let report = mailbackup_core::csv_import::parse_accounts_csv(&payload.csv_content);
+    let mut report = mailbackup_core::csv_import::parse_accounts_csv(&payload.csv_content);
+    // The whole file is checked against the accounts (and itself) before
+    // anything is written
+    let mut cfg = state.config.write().await;
+    let (plan, conflicts) = mailbackup_core::accounts::plan_import(&cfg, &report.valid_accounts, payload.update_existing);
+    report.errors.extend(conflicts);
+    report.errors.sort_by_key(|e| e.line);
 
-    let previews: Vec<ImportedAccountPreview> = report
-        .valid_accounts
+    let previews: Vec<ImportedAccountPreview> = plan
         .iter()
-        .map(|acc| ImportedAccountPreview {
-            id: acc.id.clone(),
-            email: acc.email.clone(),
-            name: acc.name.clone(),
-            provider: format!("{:?}", acc.provider),
-            imap_server: acc.imap_server.clone(),
-            server: acc.imap_server.clone(),
-            imap_port: acc.imap_port,
-            port: acc.imap_port,
-            username: acc.username.clone(),
-            schedule: acc.schedule.clone(),
+        .map(|(i, action)| {
+            let acc = &report.valid_accounts[*i];
+            ImportedAccountPreview {
+                id: match action {
+                    mailbackup_core::accounts::ImportAction::Update(id) => id.clone(),
+                    mailbackup_core::accounts::ImportAction::Create => acc.id.clone(),
+                },
+                email: acc.email.clone(),
+                name: acc.name.clone(),
+                provider: format!("{:?}", acc.provider),
+                imap_server: acc.imap_server.clone(),
+                server: acc.imap_server.clone(),
+                imap_port: acc.imap_port,
+                port: acc.imap_port,
+                username: acc.username.clone(),
+                schedule: acc.schedule.clone(),
+                action: match action {
+                    mailbackup_core::accounts::ImportAction::Update(_) => "update",
+                    mailbackup_core::accounts::ImportAction::Create => "create",
+                },
+            }
         })
         .collect();
 
-    let valid_count = report.valid_accounts.len();
-    let error_count = report.errors.len();
+    let valid_count = plan.len();
+    let update_count = plan.iter().filter(|(_, a)| matches!(a, mailbackup_core::accounts::ImportAction::Update(_))).count();
 
-    if payload.dry_run {
+    if payload.dry_run || valid_count == 0 {
+        let status = if payload.dry_run { StatusCode::OK } else { StatusCode::BAD_REQUEST };
         return (
-            StatusCode::OK,
+            status,
             Json(ImportAccountsCsvResponse {
                 valid_count,
-                error_count,
+                error_count: report.errors.len(),
                 accounts: previews.clone(),
                 valid_accounts: previews,
                 errors: report.errors,
                 imported: false,
                 imported_count: 0,
+                update_count,
             }),
         )
             .into_response();
     }
 
-    if valid_count == 0 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ImportAccountsCsvResponse {
-                valid_count: 0,
-                error_count,
-                accounts: vec![],
-                valid_accounts: vec![],
-                errors: report.errors,
-                imported: false,
-                imported_count: 0,
-            }),
-        )
-            .into_response();
-    }
-
-    // Save credentials and update config
-    let mut saved_accounts = Vec::new();
-    for acc in &report.valid_accounts {
-        let cfg_acc = acc.to_account_config();
-        if let Err(e) = state.credentials.set_account_password(&cfg_acc, &acc.password) {
-            error!("Failed to save secret for account '{}': {}", acc.email, e);
+    // One account at a time, each saved on its own: a failure stops the
+    // import and reports what was done before it
+    let mut imported_count = 0;
+    for (i, action) in &plan {
+        let row = &report.valid_accounts[*i];
+        let result = match action {
+            mailbackup_core::accounts::ImportAction::Create => mailbackup_core::accounts::create(
+                &mut cfg,
+                &state.config_path,
+                &state.db,
+                &state.storage,
+                &state.credentials,
+                mailbackup_core::accounts::new_account_from_row(row),
+            ),
+            mailbackup_core::accounts::ImportAction::Update(id) => mailbackup_core::accounts::update_from_row(
+                &mut cfg,
+                &state.config_path,
+                &state.credentials,
+                id,
+                row,
+            ),
+        };
+        if let Err(e) = result {
+            error!("CSV import stopped at line {} ({}): {}", row.line, row.email, e);
+            let _ = reload_scheduler(&state, &cfg).await;
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to save secret for account '{}': {}", acc.email, e),
+                error_status(&e),
+                format!(
+                    "Import stopped at line {} ({}): {}. {} account(s) were imported before it.",
+                    row.line, row.email, e, imported_count
+                ),
             )
                 .into_response();
         }
-        saved_accounts.push(cfg_acc);
+        imported_count += 1;
     }
-
-    let mut cfg = state.config.write().await;
-    for acc in saved_accounts {
-        let acc_id = acc.id.clone();
-        cfg.accounts.retain(|a| a.id != acc_id);
-        cfg.accounts.push(acc);
-    }
-
-    if let Err(e) = cfg.save(&state.config_path) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to save config: {}", e),
-        )
-            .into_response();
-    }
+    let error_count = report.errors.len();
 
     // Reload scheduler with updated accounts
-    let _ = state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await;
+    let _ = reload_scheduler(&state, &cfg).await;
 
     mailbackup_core::event_log::log_event(
         "ACCOUNTS_BULK_IMPORTED",
         &format!(
-            "Bulk imported {} account(s) via CSV ({} invalid rows skipped)",
-            valid_count, error_count
+            "Bulk imported {} account(s) via CSV ({} updated, {} rows skipped)",
+            imported_count, update_count, error_count
         ),
     );
 
@@ -1033,7 +1350,8 @@ async fn api_import_accounts_csv(
             valid_accounts: previews,
             errors: report.errors,
             imported: true,
-            imported_count: valid_count,
+            imported_count,
+            update_count,
         }),
     )
         .into_response()
@@ -1065,8 +1383,17 @@ async fn api_update_account(
     Path(account_id): Path<String>,
     Json(payload): Json<UpdateAccountPayload>,
 ) -> impl IntoResponse {
+    // Nothing is changed for a schedule that can't run (issue #71)
+    let mut payload = payload;
+    if let Some(schedule) = payload.schedule.take() {
+        payload.schedule = match checked_schedule(&schedule) {
+            Ok(s) => Some(s),
+            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        };
+    }
+
     let mut cfg = state.config.write().await;
-    let acc = match cfg.get_account_mut(&account_id) {
+    let acc = match cfg.account_by_id_mut(&account_id) {
         Some(a) => a,
         None => return (StatusCode::NOT_FOUND, "Account not found").into_response(),
     };
@@ -1165,7 +1492,7 @@ async fn api_update_account(
         }
     }
 
-    let acc = match cfg.get_account_mut(&account_id) {
+    let acc = match cfg.account_by_id_mut(&account_id) {
         Some(a) => a,
         None => return (StatusCode::NOT_FOUND, "Account not found").into_response(),
     };
@@ -1202,7 +1529,7 @@ async fn api_update_account(
     }
 
     // Reload scheduler (still holding the gate after a switch)
-    let _ = state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await;
+    let warning = reload_scheduler(&state, &cfg).await;
 
     let message = match &archived {
         Some(switched) => format!(
@@ -1221,7 +1548,7 @@ async fn api_update_account(
     );
     drop(archived);
 
-    (StatusCode::OK, "Account updated").into_response()
+    (StatusCode::OK, format!("Account updated.{}", warning.unwrap_or_default())).into_response()
 }
 
 async fn api_delete_account(
@@ -1239,7 +1566,7 @@ async fn api_delete_account(
     let _ = cfg.save(&state.config_path);
 
     // Reload scheduler
-    let _ = state.scheduler.lock().await.reload(Arc::new(cfg.clone())).await;
+    let _ = reload_scheduler(&state, &cfg).await;
 
     mailbackup_core::event_log::log_event(
         "ACCOUNT_DELETED",
@@ -1557,10 +1884,11 @@ async fn api_sync_account(
     Path(account_id): Path<String>,
 ) -> impl IntoResponse {
     let cfg = state.config.read().await;
-    let acc = match cfg.get_account(&account_id) {
+    let acc = match cfg.account_by_id(&account_id) {
         Some(a) => a.clone(),
         None => return (StatusCode::NOT_FOUND, "Account not found").into_response(),
     };
+    let limits = mailbackup_core::imap::Limits::from_settings(&cfg.settings);
     drop(cfg);
     if acc.is_archive() {
         return (StatusCode::CONFLICT, "This account is a read-only archive and isn't synced").into_response();
@@ -1636,7 +1964,7 @@ async fn api_sync_account(
                 return;
             }
         };
-        let sync_engine = ImapSyncEngine::new(db.clone(), storage.clone());
+        let sync_engine = ImapSyncEngine::new(db.clone(), storage.clone()).with_limits(limits);
         let active_syncs_cb = active_syncs.clone();
         let acc_id_cb = acc.id.clone();
         let acc_name_cb = acc.name.clone();
@@ -1660,7 +1988,17 @@ async fn api_sync_account(
             }
         };
 
-        match sync_engine.sync_account(&acc, &password, Some(progress_cb)).await {
+        // A sync that stopped part-way, or left messages out for their size,
+        // is incomplete: reported as an error
+        let result = match sync_engine.sync_account(&acc, &password, Some(progress_cb)).await {
+            Ok(p) if p.incomplete_reason().is_some() => Err(mailbackup_core::Error::Other(format!(
+                "incomplete after {} message(s): {}",
+                p.processed_messages,
+                p.incomplete_reason().unwrap_or_default()
+            ))),
+            other => other,
+        };
+        match result {
             Ok(p) => {
                 let mb = (p.downloaded_bytes as f64) / (1024.0 * 1024.0);
                 mailbackup_core::event_log::log_event(
@@ -1735,6 +2073,8 @@ struct ExportMboxPayload {
 #[derive(Serialize)]
 struct ExportResult {
     exported_count: usize,
+    /// Messages whose file couldn't be read, so they are not in the export
+    skipped_count: usize,
     output_path: String,
 }
 
@@ -1760,29 +2100,11 @@ async fn api_export_mbox(
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
 
-    let folders = match state.db.get_folders(&payload.account_id) {
-        Ok(f) => f,
+    let folder = payload.folder_id.as_deref().map(str::trim).filter(|f| !f.is_empty() && *f != "ALL");
+    let paths = match state.db.message_paths(&payload.account_id, folder) {
+        Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-
-    let target_folders: Vec<_> = if let Some(ref fid) = payload.folder_id {
-        if fid == "ALL" || fid.trim().is_empty() {
-            folders
-        } else {
-            folders.into_iter().filter(|f| f.id == *fid).collect()
-        }
-    } else {
-        folders
-    };
-
-    let mut paths = Vec::new();
-    for f in target_folders {
-        if let Ok(msgs) = state.db.get_messages_for_folder(&f.id) {
-            for m in msgs {
-                paths.push(m.relative_path);
-            }
-        }
-    }
 
     let final_output_path = target.path;
 
@@ -1801,16 +2123,28 @@ async fn api_export_mbox(
             .into_response();
     }
 
-    let exporter = MboxExporter::new(&state.storage);
-    match exporter.export_to_mbox_with(&paths, &final_output_path, payload.overwrite) {
+    let storage = state.storage.clone();
+    let output = final_output_path.clone();
+    let exported = tokio::task::spawn_blocking(move || {
+        MboxExporter::new(&storage).export_to_mbox_counted(&paths, &output, payload.overwrite)
+    })
+    .await
+    .unwrap_or_else(|e| Err(mailbackup_core::Error::Other(format!("export task failed: {}", e))));
+    match exported {
         Ok(count) => {
             let path_str = final_output_path.to_string_lossy().to_string();
             mailbackup_core::event_log::log_event(
                 "ARCHIVE_EXPORTED",
-                &format!("Exported {} message(s) to .mbox archive: {}", count, path_str),
+                &format!(
+                    "Exported {} message(s) to .mbox archive: {}{}",
+                    count.written,
+                    path_str,
+                    if count.skipped > 0 { format!(" ({} could not be read and are missing)", count.skipped) } else { String::new() }
+                ),
             );
             Json(ExportResult {
-                exported_count: count,
+                exported_count: count.written,
+                skipped_count: count.skipped,
                 output_path: path_str,
             })
             .into_response()
@@ -1954,10 +2288,22 @@ async fn api_pick_directory(State(state): State<AppState>) -> impl IntoResponse 
     }
 }
 
+/// Helper programs (dialogs) come from fixed system folders, never from
+/// `PATH` (issue #75): `None` if there is no trusted copy.
+fn system_helper(name: &str) -> Option<PathBuf> {
+    match mailbackup_core::service::trusted_program(name) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::debug!("{}", e);
+            None
+        }
+    }
+}
+
 fn pick_directory_native() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("osascript")
+        let output = std::process::Command::new(system_helper("osascript")?)
             .arg("-e")
             .arg("POSIX path of (choose folder with prompt \"Select Export Destination Folder:\")")
             .output()
@@ -1972,7 +2318,7 @@ fn pick_directory_native() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let script = "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Select Export Destination Folder'; if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }";
-        let output = std::process::Command::new("powershell")
+        let output = std::process::Command::new(system_helper("powershell")?)
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .output()
             .ok()?;
@@ -1985,7 +2331,8 @@ fn pick_directory_native() -> Option<PathBuf> {
     }
     #[cfg(target_os = "linux")]
     {
-        if let Ok(output) = std::process::Command::new("zenity")
+        if let Some(zenity) = system_helper("zenity")
+            && let Ok(output) = std::process::Command::new(zenity)
             .args(["--file-selection", "--directory", "--title=Select Export Destination Folder"])
             .output()
             && output.status.success() {
@@ -2008,48 +2355,44 @@ async fn api_download_mbox(
     State(state): State<AppState>,
     Query(query): Query<DownloadMboxQuery>,
 ) -> impl IntoResponse {
-    let folders = match state.db.get_folders(&query.account_id) {
-        Ok(f) => f,
+    let folder = query.folder_id.as_deref().map(str::trim).filter(|f| !f.is_empty() && *f != "ALL");
+    let paths = match state.db.message_paths(&query.account_id, folder) {
+        Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    let target_folders: Vec<_> = if let Some(ref fid) = query.folder_id {
-        if fid == "ALL" || fid.trim().is_empty() {
-            folders
-        } else {
-            folders.into_iter().filter(|f| f.id == *fid).collect()
-        }
-    } else {
-        folders
-    };
-
-    let mut paths = Vec::new();
-    for f in target_folders {
-        if let Ok(msgs) = state.db.get_messages_for_folder(&f.id) {
-            for m in msgs {
-                paths.push(m.relative_path);
+    // Streamed (issue #78): produced while the client reads, a few chunks at
+    // a time, and stopped when the client goes away
+    let (writer, body) = streaming::channel();
+    let storage = state.storage.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut writer = writer;
+        let exporter = MboxExporter::new(&storage);
+        match exporter.export_counted(&paths, &mut writer) {
+            Ok(count) => mailbackup_core::event_log::log_event(
+                "ARCHIVE_EXPORTED",
+                &format!(
+                    "Downloaded .mbox archive containing {} message(s){}",
+                    count.written,
+                    if count.skipped > 0 { format!("; {} could not be read and are missing", count.skipped) } else { String::new() }
+                ),
+            ),
+            Err(_) if writer.is_closed() => info!(".mbox download stopped: the client went away"),
+            Err(e) => {
+                let why = format!(".mbox download failed after it started: {}", e);
+                mailbackup_core::event_log::log_event("EXPORT_ERROR", &why);
+                // The client sees a failed transfer, not a short file that looks complete
+                writer.fail(why);
             }
         }
-    }
-
-    let mut buffer = Vec::new();
-    let exporter = MboxExporter::new(&state.storage);
-    let count = match exporter.export_to_writer(&paths, &mut buffer) {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    });
 
     let timestamp = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let filename = format!("backup_{}.mbox", timestamp);
-
-    mailbackup_core::event_log::log_event(
-        "ARCHIVE_EXPORTED",
-        &format!("Downloaded .mbox archive containing {} message(s)", count),
-    );
-
-    let mut res = Response::new(Body::from(buffer));
+    let mut res = Response::new(body);
     res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/mbox"));
     res.headers_mut().insert(header::CONTENT_DISPOSITION, attachment_disposition(&filename));
+    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     res.into_response()
 }
 
@@ -2726,7 +3069,11 @@ mod tests {
         )
         .await
         .unwrap();
+        // These tests are about other things; the login is tested on its own
+        // with it turned on (see `login_state`)
+        config.settings.require_login = false;
         AppState {
+            access: Arc::new(access::Access::new(dir.to_path_buf())),
             config: Arc::new(RwLock::new(config)),
             config_path: dir.join("config.yaml"),
             db,
@@ -4120,5 +4467,524 @@ mod tests {
         assert_eq!(status(&router, authed("DELETE", "/api/accounts/acc", None)).await, StatusCode::NO_CONTENT);
         assert!(state.config.read().await.accounts.iter().any(|a| a.id == archive_id));
         assert_eq!(state.db.get_folders(&archive_id).unwrap().len(), 1);
+    }
+
+    // ---- Schedules that can't run (issue #71) ----
+
+    async fn send(router: &Router, method: &str, uri: &str, body: serde_json::Value) -> (StatusCode, String) {
+        let req = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:8765")
+            .header(API_TOKEN_HEADER, TOKEN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn new_account(email: &str, schedule: &str) -> serde_json::Value {
+        serde_json::json!({
+            "provider": "generic", "name": "N", "email": email, "server": "imap.example.com",
+            "port": 993, "username": email, "password": "pw", "schedule": schedule,
+        })
+    }
+
+    #[tokio::test]
+    async fn an_account_with_an_invalid_schedule_is_refused_and_nothing_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+
+        let (status, body) = send(&router, "POST", "/api/accounts", new_account("a@example.com", "every 6h")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body);
+        assert!(body.contains("every 6h"), "{}", body);
+        assert!(state.config.read().await.accounts.is_empty());
+        assert!(!state.config_path.exists(), "the config wasn't written");
+        assert!(state.credentials.get_password("a_example_com").is_err(), "no password was stored");
+
+        let (status, body) = send(&router, "POST", "/api/accounts", new_account("a@example.com", "0 */6 * * *")).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        assert!(!body.contains("Warning"), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_schedule_in_an_update_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+        let (status, _) = send(&router, "POST", "/api/accounts", new_account("a@example.com", "0 1 * * *")).await;
+        assert_eq!(status, StatusCode::OK);
+        let id = state.config.read().await.accounts[0].id.clone();
+        let saved = std::fs::read_to_string(&state.config_path).unwrap();
+
+        for bad in ["daily at noon", ""] {
+            let update = serde_json::json!({ "name": "Renamed", "schedule": bad });
+            let (status, body) = send(&router, "PUT", &format!("/api/accounts/{}", id), update).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body);
+        }
+        let cfg = state.config.read().await;
+        assert_eq!(cfg.accounts[0].name, "N", "no part of the refused update was applied");
+        assert_eq!(cfg.accounts[0].schedule.as_deref(), Some("0 1 * * *"));
+        assert_eq!(std::fs::read_to_string(&state.config_path).unwrap(), saved);
+    }
+
+    #[tokio::test]
+    async fn the_scheduler_status_names_accounts_without_a_scheduled_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+        let (status, _) = send(&router, "POST", "/api/accounts", new_account("good@example.com", "0 1 * * *")).await;
+        assert_eq!(status, StatusCode::OK);
+        // A schedule that got into the config another way (edited by hand)
+        {
+            let mut cfg = state.config.write().await;
+            let mut broken = cfg.accounts[0].clone();
+            broken.id = "broken".to_string();
+            broken.email = "broken@example.com".to_string();
+            broken.schedule = Some("whenever".to_string());
+            cfg.accounts.push(broken);
+        }
+        // Any later change reloads the scheduler: it must keep the good account
+        let (status, body) = send(&router, "POST", "/api/accounts", new_account("third@example.com", "@daily")).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+
+        let (status, body) = send(&router, "GET", "/api/scheduler/status", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(report["running"], true, "{}", body);
+        assert_eq!(report["scheduled_accounts"], 2, "{}", body);
+        assert_eq!(report["skipped"].as_array().unwrap().len(), 1, "{}", body);
+        assert_eq!(report["skipped"][0]["account_id"], "broken");
+    }
+
+    #[tokio::test]
+    async fn a_csv_row_with_an_invalid_schedule_is_a_row_error() {
+        let csv = "email,password,schedule\nok@example.com,pw,0 2 * * *\nbad@example.com,pw,every 6h\n";
+        let report = mailbackup_core::csv_import::parse_accounts_csv(csv);
+        assert_eq!(report.valid_accounts.len(), 1);
+        assert_eq!(report.valid_accounts[0].email, "ok@example.com");
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].error.contains("every 6h") && report.errors[0].error.contains("bad@example.com"));
+    }
+
+    // ---- Adding never replaces an account (issue #74) ----
+
+    #[tokio::test]
+    async fn adding_an_existing_address_is_a_conflict_and_a_colliding_slug_gets_a_new_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+        let (status, body) = send(&router, "POST", "/api/accounts", new_account("a.b@example.com", "0 1 * * *")).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+
+        let (status, body) = send(&router, "POST", "/api/accounts", new_account("A.B@example.com", "0 2 * * *")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{}", body);
+        assert_eq!(state.config.read().await.accounts[0].schedule.as_deref(), Some("0 1 * * *"), "the account is unchanged");
+
+        let (status, body) = send(&router, "POST", "/api/accounts", new_account("a_b@example.com", "0 3 * * *")).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let cfg = state.config.read().await;
+        let ids: Vec<&str> = cfg.accounts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["a_bexample_com", "a_bexample_com-2"]);
+        assert_eq!(cfg.accounts[0].email, "a.b@example.com");
+    }
+
+    #[tokio::test]
+    async fn account_routes_take_ids_not_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+        send(&router, "POST", "/api/accounts", new_account("me@example.com", "0 1 * * *")).await;
+        let (status, _) = send(&router, "GET", "/api/accounts/me@example.com", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(&router, "GET", "/api/accounts/meexample_com", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn csv_import_refuses_existing_addresses_unless_asked_to_update_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+        send(&router, "POST", "/api/accounts", new_account("old@example.com", "0 1 * * *")).await;
+        let csv = "email,password,name\nold@example.com,changed,Renamed\nnew@example.com,pw,New\n";
+
+        let (status, body) = send(&router, "POST", "/api/accounts/import-csv", serde_json::json!({ "csv_data": csv })).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(report["imported_count"], 1, "{}", body);
+        assert_eq!(report["errors"].as_array().unwrap().len(), 1, "{}", body);
+        {
+            let cfg = state.config.read().await;
+            assert_eq!(cfg.account_by_id("oldexample_com").unwrap().name, "N", "not replaced");
+            assert_eq!(state.credentials.get_account_password(cfg.account_by_id("oldexample_com").unwrap()).unwrap(), "pw");
+        }
+
+        let csv = "email,password,name\nold@example.com,changed,Renamed\n";
+        let request = serde_json::json!({ "csv_data": csv, "update_existing": true, "dry_run": true });
+        let (_, body) = send(&router, "POST", "/api/accounts/import-csv", request).await;
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(report["valid_accounts"][0]["action"], "update", "{}", body);
+
+        let request = serde_json::json!({ "csv_data": csv, "update_existing": true });
+        let (status, body) = send(&router, "POST", "/api/accounts/import-csv", request).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let cfg = state.config.read().await;
+        assert_eq!(cfg.accounts.len(), 2);
+        let old = cfg.account_by_id("oldexample_com").unwrap();
+        assert_eq!(old.name, "Renamed");
+        assert_eq!(state.credentials.get_account_password(old).unwrap(), "changed");
+    }
+
+    // ---- Skipped messages (issue #72) ----
+
+    #[tokio::test]
+    async fn skipped_messages_are_listed_and_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+        send(&router, "POST", "/api/accounts", new_account("me@example.com", "0 1 * * *")).await;
+        let folder = state.db.get_or_create_folder("meexample_com", "INBOX", "INBOX", Some(1)).unwrap();
+        state.db.record_skipped("meexample_com", &folder.id, 0, 7, "over_size_limit", 900, 100).unwrap();
+
+        let (status, body) = send(&router, "GET", "/api/skipped", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(list[0]["uid"], 7, "{}", body);
+        assert_eq!(list[0]["folder_name"], "INBOX");
+
+        let (status, body) = send(&router, "POST", "/api/accounts/meexample_com/skipped/retry", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        assert!(body.contains("\"marked\":1"), "{}", body);
+        assert!(state.db.skipped_messages(None).unwrap()[0].retry_requested);
+
+        let (status, _) = send(&router, "POST", "/api/accounts/nobody/skipped/retry", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ---- Logging in (issue #70) ----
+
+    async fn login_state(dir: &std::path::Path) -> AppState {
+        let state = test_state(dir, Vec::new()).await;
+        state.config.write().await.settings.require_login = true;
+        state
+    }
+
+    /// A request as a browser on this machine sends it.
+    fn browser(method: &str, uri: &str) -> axum::http::request::Builder {
+        HttpRequest::builder().method(method).uri(uri).header(header::HOST, "127.0.0.1:8765")
+    }
+
+    async fn call(router: &Router, req: HttpRequest<Body>) -> (StatusCode, axum::http::HeaderMap, String) {
+        let res = router.clone().oneshot(req).await.unwrap();
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, headers, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn login_request(key: &str, peer: &str) -> HttpRequest<Body> {
+        let mut req = browser("POST", "/api/login")
+            .header(header::ORIGIN, "http://127.0.0.1:8765")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "key": key }).to_string()))
+            .unwrap();
+        let addr: SocketAddr = format!("{}:50000", peer).parse().unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(PeerAddr(addr)));
+        req
+    }
+
+    /// Logs in and returns the `Cookie` header value of the session.
+    async fn logged_in(router: &Router, state: &AppState) -> String {
+        let key = state.access.key().unwrap();
+        let (status, headers, body) = call(router, login_request(&key, "127.0.0.1")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{}", body);
+        let cookie = headers.get(header::SET_COOKIE).unwrap().to_str().unwrap();
+        cookie.split(';').next().unwrap().to_string()
+    }
+
+    /// Every route registered in `create_router` (read from this file, so a
+    /// route added later is covered too), with path parameters filled in.
+    fn registered_routes() -> Vec<String> {
+        let source = include_str!("lib.rs");
+        let body = &source[source.find("pub fn create_router").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let mut routes = Vec::new();
+        for part in body.split(".route(").skip(1) {
+            let path = part.split('"').nth(1).unwrap();
+            let filled: String = path
+                .split('/')
+                .map(|seg| match seg {
+                    "{*file}" => "index.html",
+                    s if s.starts_with('{') => "1",
+                    s => s,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            routes.push(filled);
+        }
+        assert!(routes.len() > 30, "found the routes: {:?}", routes);
+        routes
+    }
+
+    #[tokio::test]
+    async fn without_a_session_no_route_but_the_public_ones_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = login_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let mut paths = registered_routes();
+        // Aliases of the app page and assets
+        paths.extend(["/index.html", "/%69ndex.html", "/./index.html", "/app.js", "/styles.css", "/fonts/fonts.css"].map(String::from));
+        for path in paths {
+            if is_public_path(&path) {
+                continue;
+            }
+            for method in ["GET", "POST", "PUT", "DELETE"] {
+                let req = browser(method, &path).header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap();
+                let (status, headers, body) = call(&router, req).await;
+                assert!(!body.contains(TOKEN), "{} {} leaked the token", method, path);
+                if path.starts_with("/api/") {
+                    assert_eq!(status, StatusCode::UNAUTHORIZED, "{} {}", method, path);
+                    assert!(headers.contains_key(LOGIN_REQUIRED_HEADER), "{} {}", method, path);
+                } else {
+                    assert!(body.contains("login-form"), "{} {}: the login page", method, path);
+                }
+            }
+        }
+        // The handshake stays open and minimal
+        let handshake = format!("/api/handshake?nonce={}", "ab".repeat(32));
+        let (status, _, _) = call(&router, browser("GET", &handshake).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_session_gets_the_page_with_the_token_but_api_calls_still_need_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = login_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let cookie = logged_in(&router, &state).await;
+
+        let (status, headers, page) = call(&router, browser("GET", "/").header(header::COOKIE, &cookie).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains(TOKEN), "the app page, with its token");
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+
+        // The cookie alone doesn't make a request the app's own (CSRF)
+        let req = browser("POST", "/api/logs/clear").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
+        assert_eq!(call(&router, req).await.0, StatusCode::UNAUTHORIZED);
+        let req = browser("GET", "/api/stats").header(header::COOKIE, &cookie).header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap();
+        assert_eq!(call(&router, req).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn logins_are_checked_and_limited_per_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = login_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let key = state.access.key().unwrap();
+
+        // Another origin, or not JSON: refused before the key is looked at
+        let req = browser("POST", "/api/login")
+            .header(header::ORIGIN, "http://evil.example")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "key": key }).to_string()))
+            .unwrap();
+        assert_eq!(call(&router, req).await.0, StatusCode::FORBIDDEN);
+        let req = browser("POST", "/api/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("key={}", key)))
+            .unwrap();
+        assert_eq!(call(&router, req).await.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        for _ in 0..access::MAX_FAILURES {
+            let (status, headers, _) = call(&router, login_request(&"0".repeat(64), "10.0.0.9")).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert!(headers.get(header::SET_COOKIE).is_none());
+        }
+        let (status, headers, _) = call(&router, login_request(&key, "10.0.0.9")).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "even the right key waits");
+        assert!(headers.contains_key(header::RETRY_AFTER));
+        let (status, _, _) = call(&router, login_request(&key, "10.0.0.10")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "another peer is not affected");
+    }
+
+    #[tokio::test]
+    async fn a_new_key_and_a_logout_end_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = login_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let get_stats = |cookie: &str| {
+            browser("GET", "/api/stats").header(header::COOKIE, cookie).header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap()
+        };
+
+        let first = logged_in(&router, &state).await;
+        let second = logged_in(&router, &state).await;
+        let regenerate = browser("POST", "/api/web-key/regenerate")
+            .header(header::COOKIE, &first)
+            .header(API_TOKEN_HEADER, TOKEN)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = call(&router, regenerate).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        assert_eq!(call(&router, get_stats(&first)).await.0, StatusCode::UNAUTHORIZED, "the session that asked too");
+        assert_eq!(call(&router, get_stats(&second)).await.0, StatusCode::UNAUTHORIZED);
+
+        let third = logged_in(&router, &state).await;
+        assert_eq!(call(&router, get_stats(&third)).await.0, StatusCode::OK);
+        let logout = browser("POST", "/api/logout").header(header::COOKIE, &third).header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap();
+        let (_, headers, _) = call(&router, logout).await;
+        assert!(headers.get(header::SET_COOKIE).unwrap().to_str().unwrap().contains("Max-Age=0"));
+        assert_eq!(call(&router, get_stats(&third)).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_login_ticket_opens_one_session_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = login_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let key = state.access.key().unwrap();
+        let req = browser("POST", "/api/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "key": key, "ticket": true }).to_string()))
+            .unwrap();
+        let (status, headers, body) = call(&router, req).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        assert!(headers.get(header::SET_COOKIE).is_none(), "a ticket, not a session");
+        let ticket = serde_json::from_str::<serde_json::Value>(&body).unwrap()["ticket"].as_str().unwrap().to_string();
+
+        let redeem = || browser("GET", &format!("/login?ticket={}", ticket)).body(Body::empty()).unwrap();
+        let (status, headers, _) = call(&router, redeem()).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(headers.get(header::LOCATION).unwrap(), "/");
+        let cookie = headers.get(header::SET_COOKIE).unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+        let (status, _, page) = call(&router, browser("GET", "/").header(header::COOKIE, &cookie).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains(TOKEN));
+
+        let (status, headers, page) = call(&router, redeem()).await;
+        assert_eq!(status, StatusCode::OK, "used up: the login page");
+        assert!(headers.get(header::SET_COOKIE).is_none());
+        assert!(page.contains("login-form"));
+    }
+
+    #[tokio::test]
+    async fn the_desktop_window_needs_no_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = login_state(dir.path()).await;
+        let router = create_router(state.clone());
+        let req = in_process(HttpRequest::builder().uri("/api/stats").header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap());
+        assert_eq!(call(&router, req).await.0, StatusCode::OK);
+        let req = in_process(HttpRequest::builder().uri("/").body(Body::empty()).unwrap());
+        assert!(call(&router, req).await.2.contains(TOKEN));
+        // ...and it can show the key, so the user can log in elsewhere
+        let req = in_process(HttpRequest::builder().uri("/api/web-key").header(API_TOKEN_HEADER, TOKEN).body(Body::empty()).unwrap());
+        let (status, _, body) = call(&router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(&state.access.key().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn with_login_turned_off_the_page_is_served_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        assert!(!state.config.read().await.settings.require_login);
+        let router = create_router(state);
+        let (status, _, page) = call(&router, browser("GET", "/").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(page.contains(TOKEN));
+    }
+
+    // ---- Large downloads (issue #78) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_streamed_mbox_download_is_byte_for_byte_the_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = archive_state(dir.path()).await;
+        // A few more messages, so the stream has several chunks
+        let folder = state.db.get_folders("acc").unwrap().remove(0);
+        for uid in 2..40u32 {
+            let raw = format!("From: a@example.com\r\nSubject: m{}\r\n\r\n{}\r\nFrom the start\r\n", uid, "x".repeat(20_000)).into_bytes();
+            let stored = state.storage.store_eml("acc", "INBOX", uid, None, &raw).unwrap();
+            state
+                .db
+                .insert_message(
+                    "acc", &folder.id, uid, None, Some("m"), None, None, None, None, raw.len() as u64,
+                    &stored.relative_path.to_string_lossy(), &stored.sha256, None, &[],
+                )
+                .unwrap();
+        }
+        let router = create_router(state.clone());
+        let (status, body) = send(&router, "GET", "/api/export/mbox/download?account_id=acc&folder_id=ALL", serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let paths = state.db.message_paths("acc", None).unwrap();
+        assert_eq!(paths.len(), 39);
+        let mut expected = Vec::new();
+        MboxExporter::new(&state.storage).export_to_writer(&paths, &mut expected).unwrap();
+        assert!(expected.len() > 2 * streaming::CHUNK_BYTES, "spans several chunks");
+        assert_eq!(body.as_bytes(), expected.as_slice());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_export_reports_messages_it_couldnt_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = archive_state(dir.path()).await;
+        let path = state.db.message_paths("acc", None).unwrap().remove(0);
+        std::fs::remove_file(state.storage.base_dir().join(&path)).unwrap();
+        let router = create_router(state.clone());
+        let out = dir.path().join("exports").join("out.mbox");
+        let request = serde_json::json!({ "account_id": "acc", "output_path": out.to_string_lossy() });
+        let (status, body) = send(&router, "POST", "/api/export/mbox", request).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(result["exported_count"], 0);
+        assert_eq!(result["skipped_count"], 1, "visible, not silently missing");
+    }
+
+    #[tokio::test]
+    async fn in_process_responses_over_the_limit_are_a_clear_error() {
+        let small = collect_limited(axum::http::Response::new(Body::from(vec![1u8; 100])), 1000).await;
+        assert_eq!(small.status(), StatusCode::OK);
+        assert_eq!(small.body().len(), 100);
+        let big = collect_limited(axum::http::Response::new(Body::from(vec![1u8; 2000])), 1000).await;
+        assert_eq!(big.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(String::from_utf8_lossy(big.body()).contains("too large"), "not a truncated body");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_desktop_download_uses_its_ticket_before_the_body_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        AppConfig { data_dir: dir.path().join("data"), db_path: dir.path().join("c.db"), ..AppConfig::default() }
+            .save(&config_path)
+            .unwrap();
+        let server = Server::build(Some(config_path), Some(0), false).await.unwrap();
+        let token = {
+            let page = server.handle_in_process(HttpRequest::get("/").body(Vec::new()).unwrap(), APP_ORIGIN).await;
+            let page = String::from_utf8_lossy(page.body()).to_string();
+            page.split("mailbackup-api-token\" content=\"").nth(1).unwrap()[..64].to_string()
+        };
+        let url = "/api/logs/download";
+        let mint = HttpRequest::post("/api/download-ticket")
+            .header(API_TOKEN_HEADER, &token)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(serde_json::json!({ "url": url }).to_string().into_bytes())
+            .unwrap();
+        let minted = server.handle_in_process(mint, APP_ORIGIN).await;
+        let ticket = serde_json::from_slice::<serde_json::Value>(minted.body()).unwrap()["ticket"].as_str().unwrap().to_string();
+        let download = || HttpRequest::get(format!("{}?ticket={}", url, ticket)).body(Vec::new()).unwrap();
+
+        let first = server.handle_in_process_streaming(download(), APP_ORIGIN).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        // The body isn't read yet (a Save dialog could be open): the ticket is already used
+        let second = server.handle_in_process_streaming(download(), APP_ORIGIN).await;
+        assert_eq!(second.status(), StatusCode::UNAUTHORIZED);
+
+        let saved = dir.path().join("events.log");
+        streaming::save_body(first.into_body(), &saved).await.unwrap();
+        assert!(saved.exists());
     }
 }

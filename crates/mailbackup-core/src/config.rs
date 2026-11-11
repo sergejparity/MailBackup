@@ -202,6 +202,61 @@ pub struct GlobalSettings {
     /// mode always listens. Written only when off.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub web_server_enabled: bool,
+    /// Limits of IMAP connections (issue #72; see `imap::Limits`). Unset
+    /// keeps the default; each is written only when set. Seconds for each
+    /// connection step (TCP, TLS, greeting + login), default 30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imap_connect_timeout_secs: Option<u64>,
+    /// Seconds without any data before a connection counts as dead, default 120.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imap_idle_timeout_secs: Option<u64>,
+    /// Seconds one command may take, default 60; body fetches also get time
+    /// for their size at 4 KB/s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imap_command_timeout_secs: Option<u64>,
+    /// Largest message fetched, in MB, default 256. Larger messages are
+    /// recorded as not backed up instead of being fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imap_max_message_mb: Option<u64>,    /// Browsers must log in with the access key before they get the web UI
+    /// or API (issue #70). Turning it off restores the old behaviour, where
+    /// anyone who can reach the port can use the API. Written only when off.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub require_login: bool,
+}
+
+/// Longest any IMAP timeout may be set to.
+pub const MAX_IMAP_TIMEOUT_SECS: u64 = 3600;
+/// Largest `imap_max_message_mb`: the IMAP library refuses responses over
+/// 512 MiB, so a larger message could never be fetched.
+pub const MAX_IMAP_MESSAGE_MB: u64 = 500;
+
+impl GlobalSettings {
+    /// Refuses limits that would mean "no limit" or nonsense: zero, or more
+    /// than [`MAX_IMAP_TIMEOUT_SECS`] / [`MAX_IMAP_MESSAGE_MB`].
+    pub fn validate(&self) -> Result<()> {
+        let timeouts = [
+            ("imap_connect_timeout_secs", self.imap_connect_timeout_secs),
+            ("imap_idle_timeout_secs", self.imap_idle_timeout_secs),
+            ("imap_command_timeout_secs", self.imap_command_timeout_secs),
+        ];
+        for (name, value) in timeouts {
+            if let Some(v) = value
+                && !(1..=MAX_IMAP_TIMEOUT_SECS).contains(&v) {
+                return Err(Error::Config(format!(
+                    "settings.{} must be between 1 and {} seconds, not {}",
+                    name, MAX_IMAP_TIMEOUT_SECS, v
+                )));
+            }
+        }
+        if let Some(mb) = self.imap_max_message_mb
+            && !(1..=MAX_IMAP_MESSAGE_MB).contains(&mb) {
+            return Err(Error::Config(format!(
+                "settings.imap_max_message_mb must be between 1 and {}, not {}",
+                MAX_IMAP_MESSAGE_MB, mb
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn is_true(value: &bool) -> bool {
@@ -241,6 +296,11 @@ impl Default for GlobalSettings {
             download_dir: None,
             ask_download_location: false,
             web_server_enabled: true,
+            imap_connect_timeout_secs: None,
+            imap_idle_timeout_secs: None,
+            imap_command_timeout_secs: None,
+            imap_max_message_mb: None,
+            require_login: true,
         }
     }
 }
@@ -386,6 +446,7 @@ impl AppConfig {
             .map_err(|e| Error::Config(format!("Failed to read config file {}: {}", config_path.display(), e)))?;
         let config: AppConfig = serde_norway::from_str(&content)
             .map_err(|e| Error::Serialization(format!("Failed to parse config {}: {}", config_path.display(), e)))?;
+        config.settings.validate().map_err(|e| Error::Config(format!("{}: {}", config_path.display(), e)))?;
 
         config.ensure_dirs()?;
         Ok(config)
@@ -426,11 +487,45 @@ impl AppConfig {
         Ok(())
     }
 
+    /// The account with exactly this id.
+    pub fn account_by_id(&self, id: &str) -> Option<&AccountConfig> {
+        self.accounts.iter().find(|a| a.id == id)
+    }
+
+    pub fn account_by_id_mut(&mut self, id: &str) -> Option<&mut AccountConfig> {
+        self.accounts.iter_mut().find(|a| a.id == id)
+    }
+
+    /// Index of the account named by an id, or else by an email address:
+    /// the only live account with it, or else the only account with it. An
+    /// id always wins; an address that still names several accounts names
+    /// none of them.
+    fn position(&self, id_or_email: &str) -> Option<usize> {
+        if let Some(i) = self.accounts.iter().position(|a| a.id == id_or_email) {
+            return Some(i);
+        }
+        let only = |live_only: bool| {
+            let mut found = self
+                .accounts
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.email == id_or_email && !(live_only && a.is_archive()));
+            match (found.next(), found.next()) {
+                (Some((i, _)), None) => Some(i),
+                _ => None,
+            }
+        };
+        only(true).or_else(|| only(false))
+    }
+
+    /// The account with this id, or else the only account with this email
+    /// address (a convenience for the command line; the API uses
+    /// [`Self::account_by_id`]).
     pub fn get_account(&self, id_or_email: &str) -> Option<&AccountConfig> {
-        self.accounts.iter().find(|a| a.id == id_or_email || a.email == id_or_email)
+        self.position(id_or_email).map(|i| &self.accounts[i])
     }
 
     pub fn get_account_mut(&mut self, id_or_email: &str) -> Option<&mut AccountConfig> {
-        self.accounts.iter_mut().find(|a| a.id == id_or_email || a.email == id_or_email)
+        self.position(id_or_email).map(|i| &mut self.accounts[i])
     }
 }

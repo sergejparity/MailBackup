@@ -24,23 +24,10 @@ fn get_desktop_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".config").join("autostart").join(format!("{}.desktop", APP_IDENTIFIER)))
 }
 
-/// Sets or removes autostart registration for the current application
-pub fn set_autostart(enabled: bool) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let plist_path = match get_plist_path() {
-            Some(p) => p,
-            None => return Err(Error::Config("Could not determine user home directory".into())),
-        };
-
-        if enabled {
-            let exe_path = get_executable_path()?;
-            if let Some(parent) = plist_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            let plist_content = format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
+/// The LaunchAgent that starts `exe` at login (macOS). The path is XML-escaped.
+pub fn launch_agent_plist(exe: &std::path::Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -57,9 +44,58 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
 </dict>
 </plist>
 "#,
-                APP_IDENTIFIER,
-                exe_path.display()
-            );
+        APP_IDENTIFIER,
+        crate::service::xml_escape(&exe.to_string_lossy())
+    )
+}
+
+/// The autostart entry that starts `exe` at login (Linux, XDG).
+pub fn desktop_entry(exe: &std::path::Path) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={}\nComment=MailBackup Studio Email Backup Utility\nExec={}\nStartupNotify=false\nTerminal=false\n",
+        APP_NAME,
+        desktop_exec_quote(&exe.to_string_lossy())
+    )
+}
+
+/// One `Exec=` argument, quoted per the Desktop Entry specification: inside
+/// double quotes `"`, `` ` ``, `$` and `\` take a backslash, `%` is written
+/// `%%`, and since the value is also a string value, every backslash is
+/// doubled once more. Line breaks can't be represented and become spaces.
+pub fn desktop_exec_quote(arg: &str) -> String {
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    for c in arg.chars() {
+        match c {
+            '"' | '`' | '$' | '\\' => {
+                quoted.push('\\');
+                quoted.push(c);
+            }
+            '%' => quoted.push_str("%%"),
+            '\n' | '\r' => quoted.push(' '),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted.replace('\\', "\\\\")
+}
+
+/// Sets or removes autostart registration for the current application
+pub fn set_autostart(enabled: bool) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = match get_plist_path() {
+            Some(p) => p,
+            None => return Err(Error::Config("Could not determine user home directory".into())),
+        };
+
+        if enabled {
+            let exe_path = get_executable_path()?;
+            if let Some(parent) = plist_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let plist_content = launch_agent_plist(&exe_path);
 
             std::fs::write(&plist_path, plist_content)?;
         } else if plist_path.exists() {
@@ -76,7 +112,7 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
         if enabled {
             let exe_path = get_executable_path()?;
             let val = format!("\"{}\"", exe_path.display());
-            let status = Command::new("reg")
+            let status = Command::new(crate::service::trusted_program("reg")?)
                 .args(["add", run_key, "/v", "MailBackupStudio", "/t", "REG_SZ", "/d", &val, "/f"])
                 .status()
                 .map_err(|e| Error::Config(format!("Failed to execute reg add: {}", e)))?;
@@ -85,7 +121,7 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
                 return Err(Error::Config("reg add command failed".into()));
             }
         } else {
-            let _ = Command::new("reg")
+            let _ = Command::new(crate::service::trusted_program("reg")?)
                 .args(["delete", run_key, "/v", "MailBackupStudio", "/f"])
                 .status();
         }
@@ -105,19 +141,7 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
 
-            let desktop_content = format!(
-                r#"[Desktop Entry]
-Type=Application
-Version=1.0
-Name={}
-Comment=MailBackup Studio Email Backup Utility
-Exec="{}"
-StartupNotify=false
-Terminal=false
-"#,
-                APP_NAME,
-                exe_path.display()
-            );
+            let desktop_content = desktop_entry(&exe_path);
 
             std::fs::write(&desktop_path, desktop_content)?;
         } else if desktop_path.exists() {
@@ -144,7 +168,8 @@ pub fn is_autostart_registered() -> bool {
     {
         use std::process::Command;
         let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-        Command::new("reg")
+        let Ok(reg) = crate::service::trusted_program("reg") else { return false };
+        Command::new(reg)
             .args(["query", run_key, "/v", "MailBackupStudio"])
             .output()
             .map(|o| o.status.success())
@@ -159,5 +184,55 @@ pub fn is_autostart_registered() -> bool {
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The Desktop Entry spec's own unescaping, written independently:
+    /// string-level `\\` -> `\`, then inside quotes `\x` -> `x`, then `%%` -> `%`.
+    fn desktop_unquote(exec: &str) -> String {
+        let mut string_level = String::new();
+        let mut chars = exec.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                string_level.push(chars.next().unwrap());
+            } else {
+                string_level.push(c);
+            }
+        }
+        let inner = string_level.strip_prefix('"').and_then(|s| s.strip_suffix('"')).expect("quoted");
+        let mut out = String::new();
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                out.push(chars.next().unwrap());
+            } else {
+                out.push(c);
+            }
+        }
+        out.replace("%%", "%")
+    }
+
+    #[test]
+    fn exec_paths_with_special_characters_survive_quoting() {
+        for path in [
+            "/opt/MailBackup Studio/mailbackup-gui",
+            "/home/a&b/100%/mail\\backup",
+            "/tmp/$HOME/`id`/\"quoted\"",
+        ] {
+            let exec = desktop_exec_quote(path);
+            assert_eq!(desktop_unquote(&exec), path, "{}", exec);
+        }
+        assert!(desktop_entry(Path::new("/a b/x")).contains("Exec=\"/a b/x\"\n"));
+    }
+
+    #[test]
+    fn the_launch_agent_escapes_the_path() {
+        let plist = launch_agent_plist(Path::new("/Applications/A&B <x>.app/run"));
+        assert!(plist.contains("<string>/Applications/A&amp;B &lt;x&gt;.app/run</string>"), "{}", plist);
     }
 }

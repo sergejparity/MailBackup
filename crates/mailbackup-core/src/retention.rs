@@ -21,7 +21,9 @@ impl<'a> RetentionManager<'a> {
         Self { db, storage }
     }
 
-    /// Enforces local retention policy for an account.
+    /// Enforces local retention policy for an account: messages archived
+    /// more than `retention_days` ago are removed (issue #73: counted from
+    /// when MailBackup backed them up, not from the date the mail claims).
     /// If retention_days is None, no messages are deleted (kept forever).
     pub fn enforce_retention(
         &self,
@@ -50,7 +52,7 @@ impl<'a> RetentionManager<'a> {
         };
 
         let cutoff_date = now - Duration::days(days as i64);
-        let expired_messages = self.db.get_messages_older_than(account_id, cutoff_date)?;
+        let expired_messages = self.db.get_messages_archived_before(account_id, cutoff_date)?;
 
         for msg in expired_messages {
             // Delete database record and FTS index
@@ -73,7 +75,7 @@ impl<'a> RetentionManager<'a> {
 
         if report.pruned_count > 0 {
             info!(
-                "Retention policy for account '{}': pruned {} messages older than {} days (reclaimed {} bytes)",
+                "Retention policy for account '{}': pruned {} messages backed up more than {} days ago (reclaimed {} bytes)",
                 account_id, report.pruned_count, days, report.reclaimed_bytes
             );
         }

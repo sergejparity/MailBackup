@@ -449,7 +449,7 @@ impl ServiceEnv {
 pub fn ownership_candidates(config_path: &Path) -> Vec<PathBuf> {
     let mut paths = vec![config_path.to_path_buf()];
     if let Some(dir) = config_path.parent() {
-        for name in [".credentials_store.json", "credentials_store.json", ".credentials_key"] {
+        for name in [".credentials_store.json", "credentials_store.json", ".credentials_key", crate::web_access::KEY_FILE] {
             paths.push(dir.join(name));
         }
     }
@@ -590,12 +590,20 @@ fn is_slug(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// `<uid>_<first 12 hex chars of SHA-256>.eml`
-fn is_eml_name(name: &str) -> bool {
+/// `<uid>_<first 12 hex chars of SHA-256>.eml`, or after a re-scan
+/// `<uid>_g<generation>_<12 hex>.eml` (`StorageEngine::store_eml_in_generation`).
+/// Nothing looser.
+pub(crate) fn is_eml_name(name: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let Some(stem) = name.strip_suffix(".eml") else { return false };
-    let Some((uid, hash)) = stem.split_once('_') else { return false };
-    !uid.is_empty()
-        && uid.bytes().all(|b| b.is_ascii_digit())
+    let parts: Vec<&str> = stem.split('_').collect();
+    let (uid, generation, hash) = match parts.as_slice() {
+        [uid, hash] => (*uid, None, *hash),
+        [uid, generation, hash] => (*uid, Some(*generation), *hash),
+        _ => return false,
+    };
+    digits(uid)
+        && generation.is_none_or(|g| g.strip_prefix('g').is_some_and(digits))
         && hash.len() == 12
         && hash.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -1184,6 +1192,28 @@ pub fn set_service_enabled_in(_env: &ServiceEnv, _enabled: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn archive_file_names_with_and_without_a_generation() {
+        for ok in ["5_0123456789ab.eml", "123_g2_abcdefABCDEF.eml", "1_g0_000000000000.eml"] {
+            assert!(super::is_eml_name(ok), "{}", ok);
+        }
+        for bad in [
+            "5_g_0123456789ab.eml",
+            "5_gx_0123456789ab.eml",
+            "5_G2_0123456789ab.eml",
+            "5_g1_g2_0123456789ab.eml",
+            "5_g2_0123456789a.eml",
+            "5_g2_0123456789abc.eml",
+            "_0123456789ab.eml",
+            "5_g2_0123456789ab.txt",
+            "../5_0123456789ab.eml",
+            "5_0123456789ab.eml/x",
+            "5/_g2_0123456789ab.eml",
+        ] {
+            assert!(!super::is_eml_name(bad), "{}", bad);
+        }
+    }
+
     use super::*;
 
     #[test]

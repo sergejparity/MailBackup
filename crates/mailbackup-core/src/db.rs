@@ -52,8 +52,10 @@ fn folder_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FolderRecord> {
 
 /// Catalog schema version (`PRAGMA user_version`). 1 added UID generations
 /// (issue #17), 2 the account transitions of "start a new archive" (#31), 3
-/// server-guaranteed message ids (#33).
-const SCHEMA_VERSION: i64 = 3;
+/// server-guaranteed message ids (#33), 4 messages skipped for their size
+/// (#72). A binary that predates a version refuses the catalog, so an older
+/// MailBackup can't pass over a skipped message as if it were backed up.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// `messages` as of schema version 1. `uid_generation` deliberately has no
 /// default: binaries older than 0.4.0 don't know about generations, and their
@@ -157,6 +159,23 @@ pub struct ServerIdState {
     pub kind: String,
     pub reason: String,
     pub detected_at: String,
+}
+
+/// A message that was not backed up (issue #72); see
+/// [`Database::record_skipped`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedMessage {
+    pub account_id: String,
+    pub folder_id: String,
+    pub folder_name: String,
+    pub uid_generation: u32,
+    pub uid: u32,
+    pub reason: String,
+    pub size_bytes: u64,
+    pub limit_bytes: u64,
+    pub first_skipped_at: String,
+    pub last_checked_at: String,
+    pub retry_requested: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -706,6 +725,25 @@ impl Database {
             -- can be checked and undone if their source turns out
             -- inconsistent. `needs_check` is set when it does, and stays set
             -- until the check is done, whatever happens to the distrust.
+            -- Messages not backed up because they are larger than the
+            -- configured limit (#72). A record lets the folder checkpoint pass
+            -- the UID; it stays until the message is archived or gone.
+            CREATE TABLE IF NOT EXISTS skipped_messages (
+                folder_id TEXT NOT NULL,
+                uid_generation INTEGER NOT NULL,
+                uid INTEGER NOT NULL,
+                account_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                limit_bytes INTEGER NOT NULL,
+                first_skipped_at TEXT NOT NULL,
+                last_checked_at TEXT NOT NULL,
+                retry_requested INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(folder_id, uid_generation, uid),
+                FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_skipped_messages_account ON skipped_messages(account_id);
+
             CREATE TABLE IF NOT EXISTS server_id_rebinds (
                 message_id TEXT PRIMARY KEY,
                 account_id TEXT NOT NULL,
@@ -733,6 +771,147 @@ impl Database {
         add_server_id_columns(&conn)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
+    }
+
+    /// Records that `uid` of the folder's `generation` was not backed up for
+    /// `reason`. Returns whether the record is new (an existing one is only
+    /// marked checked).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_skipped(
+        &self,
+        account_id: &str,
+        folder_id: &str,
+        generation: u32,
+        uid: u32,
+        reason: &str,
+        size_bytes: u64,
+        limit_bytes: u64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let inserted = conn.execute(
+            r#"INSERT OR IGNORE INTO skipped_messages
+               (folder_id, uid_generation, uid, account_id, reason, size_bytes, limit_bytes, first_skipped_at, last_checked_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)"#,
+            params![folder_id, generation, uid, account_id, reason, size_bytes as i64, limit_bytes as i64, now],
+        )?;
+        if inserted == 0 {
+            conn.execute(
+                "UPDATE skipped_messages SET last_checked_at = ?4, limit_bytes = ?5 WHERE folder_id = ?1 AND uid_generation = ?2 AND uid = ?3",
+                params![folder_id, generation, uid, now, limit_bytes as i64],
+            )?;
+        }
+        Ok(inserted > 0)
+    }
+
+    /// The folder's skipped messages of `generation` to try again: those the
+    /// user asked to retry, and those that now fit `limit_bytes`.
+    pub fn skipped_to_retry(&self, folder_id: &str, generation: u32, limit_bytes: u64) -> Result<Vec<SkippedMessage>> {
+        self.query_skipped(
+            "s.folder_id = ?1 AND s.uid_generation = ?2 AND (s.retry_requested <> 0 OR s.size_bytes <= ?3)",
+            params![folder_id, generation, limit_bytes as i64],
+        )
+    }
+
+    /// Skipped messages of an account (all accounts with `None`).
+    pub fn skipped_messages(&self, account_id: Option<&str>) -> Result<Vec<SkippedMessage>> {
+        match account_id {
+            Some(id) => self.query_skipped("s.account_id = ?1", params![id]),
+            None => self.query_skipped("1 = 1", params![]),
+        }
+    }
+
+    fn query_skipped(&self, condition: &str, args: impl rusqlite::Params) -> Result<Vec<SkippedMessage>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            r#"SELECT s.account_id, s.folder_id, f.remote_name, s.uid_generation, s.uid, s.reason, s.size_bytes,
+                      s.limit_bytes, s.first_skipped_at, s.last_checked_at, s.retry_requested
+               FROM skipped_messages s JOIN folders f ON f.id = s.folder_id
+               WHERE {} ORDER BY s.account_id, f.remote_name, s.uid_generation, s.uid"#,
+            condition
+        ))?;
+        let rows = stmt.query_map(args, |r| {
+            Ok(SkippedMessage {
+                account_id: r.get(0)?,
+                folder_id: r.get(1)?,
+                folder_name: r.get(2)?,
+                uid_generation: r.get(3)?,
+                uid: r.get(4)?,
+                reason: r.get(5)?,
+                size_bytes: r.get::<_, i64>(6)? as u64,
+                limit_bytes: r.get::<_, i64>(7)? as u64,
+                first_skipped_at: r.get(8)?,
+                last_checked_at: r.get(9)?,
+                retry_requested: r.get::<_, i64>(10)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The message was archived or is gone from the server: no longer skipped.
+    pub fn delete_skipped(&self, folder_id: &str, generation: u32, uid: u32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM skipped_messages WHERE folder_id = ?1 AND uid_generation = ?2 AND uid = ?3",
+            params![folder_id, generation, uid],
+        )?;
+        Ok(())
+    }
+
+    /// A retry that didn't archive the message: checked now, retry done.
+    pub fn touch_skipped(&self, folder_id: &str, generation: u32, uid: u32) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE skipped_messages SET last_checked_at = ?4, retry_requested = 0 WHERE folder_id = ?1 AND uid_generation = ?2 AND uid = ?3",
+            params![folder_id, generation, uid, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Drops the folder's records of other UID generations: their UIDs mean
+    /// nothing in the current one, whose scan evaluates every message again.
+    pub fn delete_skipped_of_other_generations(&self, folder_id: &str, generation: u32) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM skipped_messages WHERE folder_id = ?1 AND uid_generation <> ?2",
+            params![folder_id, generation],
+        )?)
+    }
+
+    /// Asks the next sync to try the account's skipped messages again,
+    /// whatever the size limit. Returns how many were marked.
+    pub fn request_skipped_retry(&self, account_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("UPDATE skipped_messages SET retry_requested = 1 WHERE account_id = ?1", params![account_id])?)
+    }
+
+    /// The archived files of an account's messages (of one folder with
+    /// `Some`), in folder and UID order: what an export needs, nothing more.
+    pub fn message_paths(&self, account_id: &str, folder_id: Option<&str>) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT m.relative_path FROM messages m JOIN folders f ON f.id = m.folder_id
+               WHERE f.account_id = ?1 AND (?2 IS NULL OR m.folder_id = ?2)
+               ORDER BY f.remote_name, m.uid_generation, m.uid"#,
+        )?;
+        let paths = stmt.query_map(params![account_id, folder_id], |r| r.get(0))?;
+        Ok(paths.collect::<rusqlite::Result<Vec<String>>>()?)
+    }
+
+    /// Whether the catalog knows `name` as an account id or as a name a
+    /// "start a new archive" switch used (finished or not): any folder or
+    /// message of that account, or any side of an account transition.
+    pub fn account_name_in_use(&self, name: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            r#"SELECT EXISTS(SELECT 1 FROM folders WHERE account_id = ?1)
+                   OR EXISTS(SELECT 1 FROM messages WHERE account_id = ?1)
+                   OR EXISTS(SELECT 1 FROM account_transitions
+                             WHERE live_id = ?1 OR archive_id = ?1
+                                OR old_credential_ref = ?1 OR staged_credential_ref = ?1)"#,
+            params![name],
+            |r| r.get(0),
+        )?)
     }
 
     /// Highest transition number ever recorded for `live_id` (0 if none),
@@ -1631,6 +1810,16 @@ impl Database {
                     tokens.join(" ")
                 }
             };
+            // Checked on its own first: in the full query SQLite may never
+            // evaluate it (no rows to join), and a malformed one is the
+            // caller's mistake, not a server error (issue #75)
+            if let Err(e) = conn.query_row(
+                "SELECT count(*) FROM (SELECT 1 FROM messages_fts WHERE messages_fts MATCH ?1 LIMIT 1)",
+                [&fts_query],
+                |_| Ok(()),
+            ) {
+                return Err(crate::Error::InvalidInput(format!("The search can't be understood: {}", e)));
+            }
             conditions.push("messages_fts MATCH ?".to_string());
             params.push(rusqlite::types::Value::Text(fts_query));
         }
@@ -1773,7 +1962,17 @@ impl Database {
             )
         };
 
-        let mut stmt = conn.prepare(&sql)?;
+        // A malformed query (e.g. an unbalanced quote) is the caller's mistake
+        let invalid_query = |e: rusqlite::Error| -> crate::Error {
+            let text = e.to_string();
+            let lower = text.to_ascii_lowercase();
+            if has_fts && (lower.contains("fts5") || lower.contains("unterminated string")) {
+                crate::Error::InvalidInput(format!("The search can't be understood: {}", text))
+            } else {
+                e.into()
+            }
+        };
+        let mut stmt = conn.prepare(&sql).map_err(invalid_query)?;
         let rows = stmt.query_map(params_from_iter(params), |row| {
             let date_str: Option<String> = row.get(6)?;
             let date = date_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc)));
@@ -1789,29 +1988,37 @@ impl Database {
                 relative_path: row.get(7)?,
                 snippet: snippet_to_html(&row.get::<_, Option<String>>(8)?.unwrap_or_default()),
             })
-        })?;
+        })
+        .map_err(invalid_query)?;
 
         let mut results = Vec::new();
         for r in rows {
-            results.push(r?);
+            results.push(r.map_err(invalid_query)?);
         }
         Ok(results)
     }
 
-    pub fn get_messages_older_than(
+    /// The account's messages archived before `cutoff`, oldest first: what
+    /// retention removes (issue #73). Counted from when MailBackup archived
+    /// each message (`created_at`), never from its `Date:` header, which the
+    /// sender writes, or the server's INTERNALDATE, which APPEND and
+    /// migrations can set. `created_at` is set once, when the row is
+    /// inserted; re-binds to a new UID or generation keep it.
+    pub fn get_messages_archived_before(
         &self,
         account_id: &str,
-        cutoff_date: DateTime<Utc>,
+        cutoff: DateTime<Utc>,
     ) -> Result<Vec<MessageRecord>> {
         let conn = self.conn.lock().unwrap();
-        let cutoff_str = cutoff_date.to_rfc3339();
+        let cutoff_str = cutoff.to_rfc3339();
 
+        // julianday() compares instants whatever offset a row was written with
         let mut stmt = conn.prepare(
             r#"
             SELECT id, account_id, folder_id, uid, message_id, subject, from_addr, to_addrs, cc_addrs, date, size_bytes, relative_path, sha256_hash, is_remote_deleted, created_at
             FROM messages
-            WHERE account_id = ?1 AND date IS NOT NULL AND date < ?2
-            ORDER BY date ASC
+            WHERE account_id = ?1 AND julianday(created_at) < julianday(?2)
+            ORDER BY julianday(created_at) ASC
             "#,
         )?;
 

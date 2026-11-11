@@ -67,6 +67,13 @@ pub struct Mailbox {
     /// (connection number, UIDVALIDITY): switch to it when that connection
     /// arrives
     pub uidvalidity_on_connection: Option<(usize, u32)>,
+    /// Never answer a command starting with this (e.g. "EXAMINE"), and keep
+    /// the connection open (issue #72)
+    pub stall_on: Option<String>,
+    /// Send half of this UID's body, then nothing more (connection kept open)
+    pub stall_body_of: Option<u32>,
+    /// Send this UID's body one byte at a time, this many ms apart
+    pub trickle_body_of: Option<(u32, u64)>,
 }
 
 #[derive(Clone)]
@@ -234,9 +241,18 @@ where
         let tag = parts.next().unwrap_or("*").to_string();
         let command = parts.next().unwrap_or("").to_string();
         let upper = command.to_ascii_uppercase();
-        mailbox.lock().unwrap().raw_commands.push((connection, command.clone()));
+        let stall = {
+            let mut mb = mailbox.lock().unwrap();
+            mb.raw_commands.push((connection, command.clone()));
+            mb.stall_on.as_ref().is_some_and(|prefix| upper.starts_with(prefix.as_str()))
+        };
+        if stall {
+            std::future::pending::<()>().await;
+        }
         let mut out: Vec<u8> = Vec::new();
         let mut close_after = false;
+        // A body to send slowly or only half of: (body, ms between bytes)
+        let mut slow_body: Option<(Vec<u8>, Option<u64>)> = None;
         if upper.starts_with("CAPABILITY") {
             let mut mb = mailbox.lock().unwrap();
             mb.commands.push("CAPABILITY".into());
@@ -327,6 +343,11 @@ where
                     format!("* {} FETCH (UID {}{} INTERNALDATE \"{}\" BODY[] {{{}}}\r\n", seq, uid, id_attr, date, body.len())
                         .bytes(),
                 );
+                let trickle = mb.trickle_body_of.filter(|(u, _)| *u == uid).map(|(_, ms)| ms);
+                if mb.stall_body_of == Some(uid) || trickle.is_some() {
+                    slow_body = Some((body, trickle));
+                    break;
+                }
                 out.extend(&body);
                 out.extend(b")\r\n");
             }
@@ -338,6 +359,27 @@ where
             close_after = true;
         } else {
             out.extend(format!("{} OK done\r\n", tag).bytes());
+        }
+        if let Some((body, trickle)) = slow_body {
+            let _ = writer.write_all(&out).await;
+            let _ = writer.flush().await;
+            match trickle {
+                Some(every_ms) => {
+                    for byte in &body {
+                        tokio::time::sleep(std::time::Duration::from_millis(every_ms)).await;
+                        if writer.write_all(&[*byte]).await.is_err() || writer.flush().await.is_err() {
+                            return Next::Close;
+                        }
+                    }
+                }
+                None => {
+                    let _ = writer.write_all(&body[..body.len() / 2]).await;
+                    let _ = writer.flush().await;
+                }
+            }
+            // Keep the connection open without sending anything more
+            std::future::pending::<()>().await;
+            return Next::Close;
         }
         if writer.write_all(&out).await.is_err() || writer.flush().await.is_err() {
             return Next::Close;
@@ -405,6 +447,8 @@ pub async fn sync_with_engine(
     account: &AccountConfig,
 ) -> mailbackup_core::error::Result<SyncProgress> {
     let port = server.port;
+    // The engine's limits apply to the connection, as in production
+    let guard = |tcp: TcpStream| engine.guard_stream(tcp);
     let user = account.username.clone();
     engine
         .sync_with(
@@ -413,7 +457,7 @@ pub async fn sync_with_engine(
                 let user = user.clone();
                 async move {
                     let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
-                    async_imap::Client::new(tcp)
+                    async_imap::Client::new(guard(tcp))
                         .login(&user, "pw")
                         .await
                         .map_err(|(e, _)| mailbackup_core::error::Error::Imap(e.to_string()))
@@ -473,4 +517,14 @@ pub fn eml_files(a: &Archive) -> usize {
 
 pub fn stale_result<T>(r: mailbackup_core::error::Result<T>) -> bool {
     matches!(r, Err(mailbackup_core::error::Error::StaleSync(_)))
+}
+
+/// Sets when a message was archived (`created_at`), which retention counts
+/// from (issue #73), through a second connection to the catalog file.
+pub fn set_archived_at(a: &Archive, message_id: &str, when: &str) {
+    let conn = rusqlite::Connection::open(a._dir.path().join("catalog.db")).unwrap();
+    let changed = conn
+        .execute("UPDATE messages SET created_at = ?1 WHERE id = ?2", rusqlite::params![when, message_id])
+        .unwrap();
+    assert_eq!(changed, 1, "message {} exists", message_id);
 }

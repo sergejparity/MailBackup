@@ -22,7 +22,11 @@ window.fetch = (input, init = {}) => {
   if (!isApiUrl(url)) return nativeFetch(input, init);
   const headers = new Headers(init.headers || (typeof input === 'string' ? undefined : input.headers));
   headers.set('X-MailBackup-Token', API_TOKEN);
-  return nativeFetch(input, { ...init, headers });
+  return nativeFetch(input, { ...init, headers }).then((res) => {
+    // The session ended (idle, logout elsewhere, new access key): log in again
+    if (res.status === 401 && res.headers.get('X-MailBackup-Login')) window.location.replace('/');
+    return res;
+  });
 };
 
 // Downloads `url` (a same-origin /api/ download route) with a ticket that
@@ -949,6 +953,114 @@ function initEventListeners() {
   });
 }
 
+// A change that was saved may still carry a warning from the server (the
+// scheduler couldn't take it over, issue #71): show that instead of the
+// plain confirmation, and for longer.
+function showSavedOrWarning(responseText, savedMessage) {
+  const at = (responseText || '').indexOf('Warning:');
+  if (at >= 0) showToast(`Saved. ${responseText.slice(at)}`, 9000);
+  else showToast(savedMessage);
+}
+
+// Browser access key (issue #70): shown only on request
+async function showWebKey() {
+  try {
+    const res = await fetch('/api/web-key');
+    if (!res.ok) {
+      showToast(`Couldn't read the access key: ${await res.text()}`);
+      return;
+    }
+    const data = await res.json();
+    document.getElementById('web-key-value').textContent = data.key;
+  } catch (err) {
+    showToast(`Network error: ${err}`);
+  }
+}
+
+async function regenerateWebKey() {
+  if (!confirm('Create a new access key? Every browser that is logged in, this one included, has to log in again with the new key.')) return;
+  try {
+    const res = await fetch('/api/web-key/regenerate', { method: 'POST' });
+    if (!res.ok) {
+      showToast(`Couldn't regenerate the key: ${await res.text()}`);
+      return;
+    }
+    const data = await res.json();
+    document.getElementById('web-key-value').textContent = data.key;
+    showToast('New access key created. Browsers must log in with it again.', 6000);
+  } catch (err) {
+    showToast(`Network error: ${err}`);
+  }
+}
+
+async function logOutOfBrowser() {
+  try {
+    await fetch('/api/logout', { method: 'POST' });
+  } finally {
+    window.location.replace('/');
+  }
+}
+
+document.getElementById('btn-web-key-show')?.addEventListener('click', showWebKey);
+document.getElementById('btn-web-key-regenerate')?.addEventListener('click', regenerateWebKey);
+document.getElementById('btn-web-logout')?.addEventListener('click', logOutOfBrowser);
+
+// Messages not backed up because of their size (issue #72), counted by account
+async function loadSkippedMessages() {
+  try {
+    const res = await fetch('/api/skipped');
+    if (!res.ok) return;
+    const counts = {};
+    (await res.json()).forEach((s) => { counts[s.account_id] = (counts[s.account_id] || 0) + 1; });
+    state.skippedByAccount = counts;
+  } catch (err) {
+    console.error('Failed to load skipped messages:', err);
+  }
+}
+
+async function retrySkipped(accountId) {
+  try {
+    const res = await fetch(`/api/accounts/${encodeURIComponent(accountId)}/skipped/retry`, { method: 'POST' });
+    if (!res.ok) {
+      showToast(`Retry failed: ${await res.text()}`);
+      return;
+    }
+    const { marked } = await res.json();
+    showToast(`${marked} message(s) will be fetched on the next sync, whatever their size.`, 6000);
+  } catch (err) {
+    showToast(`Network error: ${err}`);
+  }
+}
+
+// Accounts the scheduler left out because their schedule is invalid, by id
+// (see /api/scheduler/status)
+async function loadSchedulerStatus() {
+  try {
+    const res = await fetch('/api/scheduler/status');
+    if (!res.ok) return;
+    const status = await res.json();
+    state.schedulerSkipped = Object.fromEntries((status.skipped || []).map((s) => [s.account_id, s]));
+    state.schedulerProblem = !status.running
+      ? 'The backup scheduler is not running; no scheduled backups are made.'
+      : status.last_reload_error
+        ? `Scheduled backups still follow earlier settings: ${status.last_reload_error}`
+        : status.default_schedule_error
+          ? `The default schedule in config.yaml is invalid; accounts without their own schedule run daily at midnight. ${status.default_schedule_error}`
+          : '';
+  } catch (err) {
+    console.error('Failed to load the scheduler status:', err);
+  }
+}
+
+// Rows whose address already has an account update it instead of being
+// refused (issue #74). A change re-validates a preview that is showing.
+function csvUpdateExisting() {
+  return !!document.getElementById('csv-update-existing')?.checked;
+}
+document.getElementById('csv-update-existing')?.addEventListener('change', () => {
+  if (state.csvImportReport && el.btnPreviewCsv) el.btnPreviewCsv.click();
+});
+
 function showToast(msg, duration = 3000) {
   el.toastMessage.textContent = msg;
   el.toast.style.display = 'flex';
@@ -1018,6 +1130,8 @@ async function loadAccounts() {
     const res = await fetch('/api/accounts');
     if (!res.ok) return;
     state.accounts = await res.json();
+    await loadSchedulerStatus();
+    await loadSkippedMessages();
     renderAccounts();
     renderModalAccounts();
 
@@ -1115,13 +1229,27 @@ function renderModalAccounts() {
     el.modalAccountsList.innerHTML = `<p style="color: var(--text-dim);">No accounts configured yet.</p>`;
     return;
   }
+  if (state.schedulerProblem) {
+    const problem = document.createElement('div');
+    problem.style.cssText = 'color: var(--accent-rose); font-size: 0.8rem; margin-bottom: 8px;';
+    problem.textContent = `⚠ ${state.schedulerProblem}`;
+    el.modalAccountsList.appendChild(problem);
+  }
 
   state.accounts.forEach(acc => {
     const row = document.createElement('div');
     row.className = 'account-table-row';
-    const retentionText = acc.retention_days ? `${acc.retention_days} days` : 'Forever';
+    const retentionText = acc.retention_days ? `${acc.retention_days} days after backup` : 'Forever';
     const scheduleText = acc.schedule || 'Default (Daily)';
     const statusText = acc.enabled ? '<span style="color: var(--accent-emerald); font-weight: 600;">Enabled</span>' : '<span style="color: var(--text-dim);">Disabled</span>';
+    const skipped = (state.schedulerSkipped || {})[acc.id];
+    const scheduleWarning = skipped
+      ? `<div style="font-size: 0.75rem; color: var(--accent-rose); margin-top: 2px;">⚠ No scheduled backup: ${escapeHtml(skipped.error)}</div>`
+      : '';
+    const skippedCount = (state.skippedByAccount || {})[acc.id] || 0;
+    const skippedWarning = skippedCount
+      ? `<div style="font-size: 0.75rem; color: var(--accent-rose); margin-top: 2px;">⚠ Backup incomplete: ${skippedCount} message(s) are larger than the size limit and not backed up. <button class="btn btn-sm btn-ghost" data-action="retry-skipped">Retry</button></div>`
+      : '';
 
     row.innerHTML = `
       <div>
@@ -1129,6 +1257,8 @@ function renderModalAccounts() {
         <div style="font-size: 0.75rem; color: var(--text-dim); margin-top: 2px;">
           Server: ${escapeHtml(acc.imap_server)}:${acc.imap_port} • Schedule: <code>${escapeHtml(scheduleText)}</code> • Retention: ${retentionText}
         </div>
+        ${scheduleWarning}
+        ${skippedWarning}
       </div>
       <div style="display: flex; gap: 8px;">
         <button class="btn btn-sm btn-secondary" data-action="edit">Edit</button>
@@ -1138,6 +1268,7 @@ function renderModalAccounts() {
     // Bound here rather than via inline onclick attributes, which the Content-Security-Policy blocks.
     row.querySelector('[data-action="edit"]').addEventListener('click', () => openEditAccount(acc.id));
     row.querySelector('[data-action="remove"]').addEventListener('click', () => deleteAccount(acc.id));
+    row.querySelector('[data-action="retry-skipped"]')?.addEventListener('click', () => retrySkipped(acc.id));
     el.modalAccountsList.appendChild(row);
   });
 }
@@ -1278,7 +1409,7 @@ async function saveAccountEdit(accountId, payload) {
     });
 
     if (res.ok) {
-      showToast('Account settings updated successfully! ✅');
+      showSavedOrWarning(await res.text(), 'Account settings updated successfully! ✅');
       closeModal(el.editAccountModal);
       await loadAccounts();
     } else {
@@ -1840,7 +1971,7 @@ async function handleAddAccount(e) {
     });
 
     if (res.ok) {
-      showToast('Account added successfully! ✅');
+      showSavedOrWarning(await res.text(), 'Account added successfully! ✅');
       closeModal(el.settingsModal);
       el.addAccountForm.reset();
       await loadAccounts();
@@ -2224,7 +2355,10 @@ async function handleExportMbox(e, forceOverwrite = false) {
 
     if (res.ok) {
       const result = await res.json();
-      showToast(`Exported ${result.exported_count} message(s) to ${result.output_path || 'archive'}! ✅`);
+      const missing = result.skipped_count
+        ? ` ${result.skipped_count} message(s) could not be read and are not in it.`
+        : '';
+      showToast(`Exported ${result.exported_count} message(s) to ${result.output_path || 'archive'}! ✅${missing}`, missing ? 8000 : 3000);
       closeModal(el.exportModal);
     } else if (res.status === 409) {
       const conflict = await res.json();
@@ -3097,7 +3231,7 @@ async function handlePreviewCsv() {
     const res = await fetch('/api/accounts/import-csv', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ csv_data: csvData, dry_run: true })
+      body: JSON.stringify({ csv_data: csvData, dry_run: true, update_existing: csvUpdateExisting() })
     });
 
     if (res.ok) {
@@ -3148,13 +3282,13 @@ function renderCsvPreview(report) {
     if (report.valid_accounts && report.valid_accounts.length > 0) {
       el.csvPreviewTbody.innerHTML = report.valid_accounts.map(acc => `
         <tr>
-          <td><span class="badge" style="background: rgba(34, 197, 94, 0.15); color: #4ade80; font-size: 11px;">Valid</span></td>
+          <td><span class="badge" style="background: rgba(34, 197, 94, 0.15); color: #4ade80; font-size: 11px;">${acc.action === 'update' ? 'Update' : 'New'}</span></td>
           <td style="font-weight: 500;">${escapeHtml(acc.name)}</td>
           <td>${escapeHtml(acc.email)}</td>
           <td><span class="badge" style="background: rgba(99, 102, 241, 0.15); color: #818cf8; text-transform: uppercase; font-size: 10px;">${escapeHtml(acc.provider)}</span></td>
           <td style="font-family: monospace; font-size: 12px; color: var(--text-secondary);">${escapeHtml(acc.server)}:${acc.port}</td>
           <td style="font-family: monospace; font-size: 12px; color: var(--text-secondary);">${escapeHtml(acc.username)}</td>
-          <td style="font-family: monospace; font-size: 12px; color: var(--text-secondary);">${acc.schedule || '0 0 * * *'}</td>
+          <td style="font-family: monospace; font-size: 12px; color: var(--text-secondary);">${escapeHtml(acc.schedule || '0 0 * * *')}</td>
         </tr>
       `).join('');
       if (el.btnConfirmCsvImport) el.btnConfirmCsvImport.disabled = false;
@@ -3181,12 +3315,13 @@ async function handleConfirmCsvImport() {
     const res = await fetch('/api/accounts/import-csv', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ csv_data: csvData, dry_run: false })
+      body: JSON.stringify({ csv_data: csvData, dry_run: false, update_existing: csvUpdateExisting() })
     });
 
     if (res.ok) {
       const report = await res.json();
-      showToast(`Successfully imported ${report.imported_count || 0} account(s)! 🎉`);
+      const updated = report.update_count ? ` (${report.update_count} updated)` : '';
+      showToast(`Successfully imported ${report.imported_count || 0} account(s)${updated}! 🎉`);
       clearCsvImport();
       closeModal(el.settingsModal);
       await loadAccounts();

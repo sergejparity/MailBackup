@@ -4,6 +4,9 @@ use crate::storage::StorageEngine;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidImportAccount {
+    /// Line of the row in the file
+    #[serde(default)]
+    pub line: usize,
     pub id: String,
     pub name: String,
     pub email: String,
@@ -307,10 +310,21 @@ pub fn parse_accounts_csv(content: &str) -> CsvImportReport {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+        // A schedule that can't run is a row error, not an account that is
+        // silently never backed up (issue #71)
+        if let Some(Err(e)) = schedule.as_deref().map(crate::scheduler::validate_schedule) {
+            report.errors.push(CsvRowError {
+                line: row_num,
+                raw_content: raw_str,
+                error: format!("{} (account '{}')", e, email),
+            });
+            continue;
+        }
 
         let id = StorageEngine::sanitize_slug(&email);
 
         report.valid_accounts.push(ValidImportAccount {
+            line: row_num,
             id,
             name,
             email,

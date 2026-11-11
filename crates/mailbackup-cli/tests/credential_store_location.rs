@@ -29,9 +29,10 @@ fn cli(home: &Path, cwd: &Path, args: &[&str], password: &str) {
     assert!(output.status.success(), "{:?}\n{}", args, String::from_utf8_lossy(&output.stderr));
 }
 
-fn add_args<'a>(config: &'a str, id: &'a str) -> Vec<&'a str> {
+fn add_args<'a>(config: &'a str, id: &'a str, email: &'a str) -> Vec<&'a str> {
     vec![
-        "--config", config, "account", "add", "--id", id, "--name", id, "--email", "user@example.com",
+        // One account per address (issue #74), so each call has its own
+        "--config", config, "account", "add", "--id", id, "--name", id, "--email", email,
         "--provider", "generic", "--server", "imap.example.com", "--port", "993", "--username", "user",
         "--password-stdin", "--retention-days", "30",
     ]
@@ -54,8 +55,8 @@ fn cli_server_and_service_share_the_store_of_a_custom_config() {
     let config_path = custom.join("config.yaml");
 
     // Absolute --config, then a relative one from another folder
-    cli(&home, tmp.path(), &add_args(config_path.to_str().unwrap(), "abs"), "pw-abs");
-    cli(&home, &tmp.path().join("work"), &add_args("custom/config.yaml", "rel"), "pw-rel");
+    cli(&home, tmp.path(), &add_args(config_path.to_str().unwrap(), "abs", "abs@example.com"), "pw-abs");
+    cli(&home, &tmp.path().join("work"), &add_args("custom/config.yaml", "rel", "rel@example.com"), "pw-rel");
 
     assert!(custom.join(".credentials_store.json").exists(), "stored next to the config");
     assert!(!home.join(".mailbackup/.credentials_store.json").exists(), "not in ~/.mailbackup");
@@ -86,7 +87,7 @@ fn credentials_an_older_cli_kept_in_the_home_folder_are_migrated() {
 
     // An older CLI: the account went into the custom config, its password into
     // ~/.mailbackup, next to a password of the default config
-    cli(&home, tmp.path(), &add_args(config_path.to_str().unwrap(), "old"), "placeholder");
+    cli(&home, tmp.path(), &add_args(config_path.to_str().unwrap(), "old", "old@example.com"), "placeholder");
     std::fs::remove_file(custom.join(".credentials_store.json")).unwrap();
     std::fs::remove_file(custom.join(".credentials_key")).unwrap();
     let legacy = CredentialStore::with_paths(base.join(".credentials_store.json"), base.join(".credentials_key"))

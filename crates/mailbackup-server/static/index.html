@@ -497,6 +497,7 @@
                   <option value="180">180 Days</option>
                   <option value="365">1 Year</option>
                 </select>
+                <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 4px;">Messages are removed from the archive this many days after MailBackup backed them up, whatever date the mail itself shows.</div>
               </div>
               <div class="form-group">
                 <label>Schedule (Cron or Interval)</label>
@@ -554,6 +555,10 @@
                 <textarea id="csv-raw-textarea" class="form-input csv-textarea" placeholder="email,password,name,server,port,username&#10;user@example.com,AppPass123,Work Email,mail.example.com,993,user@example.com&#10;john.doe@gmail.com,abcd-efgh-ijkl-mnop,Personal Gmail,,,john.doe@gmail.com&#10;alice@company.com,Secret2026,Alice Smith,outlook.office365.com,993,alice@company.com" spellcheck="false" autocomplete="off"></textarea>
               </div>
 
+              <label style="display: flex; align-items: center; gap: 8px; font-size: 0.85rem; margin-bottom: 8px; cursor: pointer;">
+                <input type="checkbox" id="csv-update-existing">
+                Update existing accounts (otherwise rows for addresses that already have an account are skipped)
+              </label>
               <div class="bulk-import-actions">
                 <button type="button" id="btn-preview-csv" class="btn btn-primary">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -788,6 +793,17 @@
                       When off, MailBackup Studio opens no network port: the desktop window works on its own, scheduled backups keep running, and no browser or other program can reach the interface.
                     </div>
                     <div id="web-server-note" style="font-size: 0.78rem; color: var(--text-secondary); margin-top: 6px; line-height: 1.45;"></div>
+                  </div>
+                </div>
+                <!-- Browser access key (issue #70) -->
+                <div id="web-key-row" style="font-size: 0.8rem; line-height: 1.45;">
+                  <div style="font-weight: 500;">Access key</div>
+                  <div style="color: var(--text-secondary); margin: 2px 0 6px;">A browser asks for this key once, then stays logged in for 12 hours of use. Regenerating it logs every browser out.</div>
+                  <code id="web-key-value" style="display: block; word-break: break-all; margin-bottom: 6px;">••••••••••••••••</code>
+                  <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                    <button type="button" class="btn btn-sm btn-secondary" id="btn-web-key-show">Show</button>
+                    <button type="button" class="btn btn-sm btn-secondary" id="btn-web-key-regenerate">Regenerate</button>
+                    <button type="button" class="btn btn-sm btn-ghost" id="btn-web-logout">Log out of this browser</button>
                   </div>
                 </div>
               </div>
@@ -1134,10 +1150,11 @@
                 <option value="180">180 Days</option>
                 <option value="365">1 Year</option>
               </select>
+              <small class="form-hint">Counted from when MailBackup backed each message up, not from the date the mail shows.</small>
             </div>
             <div class="form-group">
               <label>Schedule (Cron or Interval)</label>
-              <input type="text" id="edit-schedule" class="form-input" placeholder="0 0 * * * or every 6h" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off">
+              <input type="text" id="edit-schedule" class="form-input" placeholder="0 0 * * * (daily) or 0 */6 * * * (every 6 hours)" autocapitalize="none" autocorrect="off" spellcheck="false" autocomplete="off">
               <small class="form-hint">Standard cron e.g. <code>0 0 * * *</code> (daily) or <code>0 */6 * * *</code> (every 6h)</small>
             </div>
             <div class="form-group" style="flex-direction: row; align-items: center; gap: 8px;">

@@ -23,6 +23,54 @@ pub fn normalize_cron(expr: &str) -> String {
     }
 }
 
+/// The schedule every account falls back to when `settings.default_schedule`
+/// itself can't be used.
+pub const FALLBACK_SCHEDULE: &str = "0 0 * * *";
+
+/// Checks a schedule with the parser the scheduler itself uses and returns
+/// it normalized (see [`normalize_cron`]). `Error::InvalidInput` if it is
+/// empty or doesn't parse.
+pub fn validate_schedule(expr: &str) -> Result<String> {
+    let invalid = |why: String| Error::InvalidInput(format!("Invalid schedule '{}': {}", expr.trim().escape_debug(), why));
+    if expr.trim().is_empty() {
+        return Err(invalid("it is empty".to_string()));
+    }
+    let normalized = normalize_cron(expr);
+    match Job::new_async(normalized.as_str(), |_uuid, _lock| Box::pin(async {})) {
+        Ok(_) => Ok(normalized),
+        Err(e) => Err(invalid(format!(
+            "expected a cron expression of five fields (minute hour day month weekday) such as '0 3 * * *' or '0 */6 * * *', or @hourly / @daily ({})",
+            e
+        ))),
+    }
+}
+
+/// An account that has no scheduled backup because its schedule doesn't parse.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SkippedSchedule {
+    pub account_id: String,
+    pub account_name: String,
+    pub schedule: String,
+    pub error: String,
+}
+
+/// What the scheduler is doing, as of its last (re)start.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SchedulerStatus {
+    /// Jobs are registered and the scheduler is started.
+    pub running: bool,
+    /// Accounts with a scheduled backup.
+    pub scheduled_accounts: usize,
+    /// Accounts left out because their schedule is invalid.
+    pub skipped: Vec<SkippedSchedule>,
+    /// `settings.default_schedule` is invalid; accounts that inherit it run
+    /// on [`FALLBACK_SCHEDULE`].
+    pub default_schedule_error: Option<String>,
+    /// The last reload failed with this; the scheduler described here is
+    /// the one from before it, still running.
+    pub last_reload_error: Option<String>,
+}
+
 pub type SchedulerStatusCallback = Arc<
     dyn Fn(
             &str, // account_id
@@ -44,6 +92,7 @@ pub struct BackupScheduler {
     /// When set, every job takes the account's sync gate and syncs the
     /// account as the config at this path has it (see `sync_gate`).
     config_path: Option<std::path::PathBuf>,
+    status: SchedulerStatus,
 }
 
 impl BackupScheduler {
@@ -65,6 +114,7 @@ impl BackupScheduler {
             credentials,
             status_listener: None,
             config_path: None,
+            status: SchedulerStatus::default(),
         })
     }
 
@@ -80,27 +130,73 @@ impl BackupScheduler {
         self.status_listener = listener;
     }
 
+    /// The scheduler's state as of its last start or reload. Reading it
+    /// logs nothing.
+    pub fn status(&self) -> &SchedulerStatus {
+        &self.status
+    }
+
     pub async fn start(&mut self) -> Result<()> {
-        self.register_jobs().await?;
-        self.scheduler.start().await.map_err(|e| {
-            Error::Other(format!("Failed to start scheduler: {}", e))
-        })?;
+        let config = self.config.clone();
+        let (scheduler, status) = self.build(&config).await?;
+        self.scheduler = scheduler;
+        self.status = status;
         info!("Backup scheduler is running");
         Ok(())
     }
 
-    async fn register_jobs(&self) -> Result<()> {
-        for account in &self.config.accounts {
+    /// A new, started scheduler with the jobs of `config`. Accounts whose
+    /// schedule doesn't parse are left out (and reported in the status);
+    /// any other failure is returned.
+    async fn build(&self, config: &AppConfig) -> Result<(JobScheduler, SchedulerStatus)> {
+        let scheduler = JobScheduler::new().await.map_err(|e| {
+            Error::Other(format!("Failed to create job scheduler: {}", e))
+        })?;
+        let mut status = self.register_jobs(&scheduler, config).await?;
+        scheduler.start().await.map_err(|e| {
+            Error::Other(format!("Failed to start scheduler: {}", e))
+        })?;
+        status.running = true;
+        Ok((scheduler, status))
+    }
+
+    async fn register_jobs(&self, scheduler: &JobScheduler, config: &AppConfig) -> Result<SchedulerStatus> {
+        let mut status = SchedulerStatus::default();
+        // An unusable default must not take down every account that inherits it
+        let default_schedule = match validate_schedule(&config.settings.default_schedule) {
+            Ok(_) => config.settings.default_schedule.as_str(),
+            Err(e) => {
+                let msg = format!("{}. Accounts without a schedule of their own run on '{}' instead.", e, FALLBACK_SCHEDULE);
+                error!("settings.default_schedule: {}", msg);
+                crate::event_log::log_event("SCHEDULE_INVALID", &format!("Default schedule: {}", msg));
+                status.default_schedule_error = Some(e.to_string());
+                FALLBACK_SCHEDULE
+            }
+        };
+        for account in &config.accounts {
             if !account.enabled || account.is_archive() {
                 continue;
             }
 
-            let raw_cron = account
-                .schedule
-                .as_deref()
-                .unwrap_or(&self.config.settings.default_schedule);
-
-            let cron_expr = normalize_cron(raw_cron);
+            let raw_cron = account.schedule.as_deref().unwrap_or(default_schedule);
+            // An invalid expression costs only this account its schedule
+            let cron_expr = match validate_schedule(raw_cron) {
+                Ok(normalized) => normalized,
+                Err(e) => {
+                    error!("No scheduled backup for account '{}': {}", account.id, e);
+                    crate::event_log::log_event(
+                        "SCHEDULE_INVALID",
+                        &format!("Account '{}' ({}) has no scheduled backup: {}", account.name, account.email, e),
+                    );
+                    status.skipped.push(SkippedSchedule {
+                        account_id: account.id.clone(),
+                        account_name: account.name.clone(),
+                        schedule: raw_cron.to_string(),
+                        error: e.to_string(),
+                    });
+                    continue;
+                }
+            };
 
             let account_clone = account.clone();
             let db_clone = self.db.clone();
@@ -108,6 +204,7 @@ impl BackupScheduler {
             let creds_clone = self.credentials.clone();
             let status_listener_clone = self.status_listener.clone();
             let config_path_clone = self.config_path.clone();
+            let limits = crate::imap::Limits::from_settings(&config.settings);
 
             info!(
                 "Registering scheduled backup for account '{}' ({}) with cron: '{}' (normalized: '{}')",
@@ -162,7 +259,7 @@ impl BackupScheduler {
                         }
                     };
 
-                    let sync_engine = ImapSyncEngine::new(db.clone(), storage.clone());
+                    let sync_engine = ImapSyncEngine::new(db.clone(), storage.clone()).with_limits(limits);
                     let listener_cb = status_listener.clone();
                     let acc_id_cb = acc.id.clone();
                     let acc_name_cb = acc.name.clone();
@@ -174,6 +271,21 @@ impl BackupScheduler {
                     };
 
                     match sync_engine.sync_account(&acc, &password, Some(progress_cb)).await {
+                        // Stopped part-way, or messages left out for their size:
+                        // incomplete, never a success
+                        Ok(progress) if progress.incomplete_reason().is_some() => {
+                            let err_msg = format!(
+                                "Scheduled background sync of account '{}' is incomplete after {} message(s): {}",
+                                acc.name,
+                                progress.processed_messages,
+                                progress.incomplete_reason().unwrap_or_default()
+                            );
+                            error!("{}", err_msg);
+                            crate::event_log::log_event("SYNC_ERROR", &err_msg);
+                            if let Some(ref l) = status_listener {
+                                l(&acc.id, &acc.name, "error", Some(&progress), Some(&err_msg));
+                            }
+                        }
                         Ok(progress) => {
                             let mb = (progress.downloaded_bytes as f64) / (1024.0 * 1024.0);
                             let msg = format!(
@@ -218,15 +330,17 @@ impl BackupScheduler {
                         }
                     }
                 })
-            }).map_err(|e| Error::Other(format!("Invalid cron expression '{}' (raw: '{}'): {}", cron_expr, raw_cron, e)))?;
+            // The expression parsed above, so this is the scheduler failing
+            }).map_err(|e| Error::Other(format!("Failed to create the job for '{}' ('{}'): {}", account.id, cron_expr, e)))?;
 
-            self.scheduler.add(job).await.map_err(|e| {
+            scheduler.add(job).await.map_err(|e| {
                 Error::Other(format!("Failed to add job to scheduler: {}", e))
             })?;
+            status.scheduled_accounts += 1;
         }
 
         // Register daily log rotation and retention maintenance job (runs daily at midnight)
-        let log_retention = self.config.settings.log_retention_days;
+        let log_retention = config.settings.log_retention_days;
         let daily_cron = normalize_cron("0 0 * * *");
         let log_rotation_job = Job::new_async(&daily_cron, move |_uuid, _lock| {
             Box::pin(async move {
@@ -266,22 +380,36 @@ impl BackupScheduler {
             })
         }).map_err(|e| Error::Other(format!("Failed to register daily log rotation job: {}", e)))?;
 
-        self.scheduler.add(log_rotation_job).await.map_err(|e| {
+        scheduler.add(log_rotation_job).await.map_err(|e| {
             Error::Other(format!("Failed to add log rotation job to scheduler: {}", e))
         })?;
 
-        Ok(())
+        Ok(status)
     }
 
+    /// Replaces the running jobs with those of `new_config`. The replacement
+    /// is built and started first; only then is the running scheduler shut
+    /// down. If the replacement fails, the running one stays as it is, with
+    /// the configuration it had, and the error is returned.
     pub async fn reload(&mut self, new_config: Arc<AppConfig>) -> Result<()> {
-        let listener = self.status_listener.clone();
-        let _ = self.scheduler.shutdown().await;
+        let (scheduler, status) = match self.build(&new_config).await {
+            Ok(built) => built,
+            Err(e) => {
+                error!("Scheduler reload failed; scheduled backups keep the previous settings: {}", e);
+                crate::event_log::log_event(
+                    "SCHEDULER_RELOAD_FAILED",
+                    &format!("Scheduled backups keep the previous settings: {}", e),
+                );
+                self.status.last_reload_error = Some(e.to_string());
+                return Err(e);
+            }
+        };
+        let mut old = std::mem::replace(&mut self.scheduler, scheduler);
+        if let Err(e) = old.shutdown().await {
+            warn!("Couldn't stop the previous scheduler cleanly: {}", e);
+        }
         self.config = new_config;
-        self.scheduler = JobScheduler::new().await.map_err(|e| {
-            Error::Other(format!("Failed to recreate job scheduler: {}", e))
-        })?;
-        self.status_listener = listener;
-        self.start().await?;
+        self.status = status;
         info!("Backup scheduler reloaded with updated account configurations");
         Ok(())
     }

@@ -20,6 +20,14 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use tracing::info;
 
+/// What an export wrote: messages written, and messages skipped because
+/// their file couldn't be read (deleted by retention meanwhile, damaged).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExportCount {
+    pub written: usize,
+    pub skipped: usize,
+}
+
 pub struct MboxExporter<'a> {
     storage: &'a StorageEngine,
 }
@@ -34,22 +42,27 @@ impl<'a> MboxExporter<'a> {
     pub fn export_to_writer<W: Write>(
         &self,
         eml_relative_paths: &[String],
-        mut writer: W,
+        writer: W,
     ) -> Result<usize> {
-        let mut count = 0;
+        Ok(self.export_counted(eml_relative_paths, writer)?.written)
+    }
 
+    /// [`Self::export_to_writer`], also counting the messages skipped
+    /// because their file couldn't be read. A write error ends the export.
+    pub fn export_counted<W: Write>(&self, eml_relative_paths: &[String], mut writer: W) -> Result<ExportCount> {
+        let mut count = ExportCount::default();
         for rel_path in eml_relative_paths {
             let eml_bytes = match self.storage.read_eml(rel_path) {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     tracing::warn!("Skipping {}: {}", rel_path, e);
+                    count.skipped += 1;
                     continue;
                 }
             };
             write_message(&mut writer, &eml_bytes)?;
-            count += 1;
+            count.written += 1;
         }
-
         writer.flush()?;
         Ok(count)
     }
@@ -71,6 +84,16 @@ impl<'a> MboxExporter<'a> {
         output_path: impl AsRef<Path>,
         overwrite: bool,
     ) -> Result<usize> {
+        Ok(self.export_to_mbox_counted(eml_relative_paths, output_path, overwrite)?.written)
+    }
+
+    /// [`Self::export_to_mbox_with`] with the counts of [`ExportCount`].
+    pub fn export_to_mbox_counted(
+        &self,
+        eml_relative_paths: &[String],
+        output_path: impl AsRef<Path>,
+        overwrite: bool,
+    ) -> Result<ExportCount> {
         let output_path = output_path.as_ref();
         if let Some(parent) = output_path.parent()
             && !parent.as_os_str().is_empty() {
@@ -86,8 +109,8 @@ impl<'a> MboxExporter<'a> {
         }
         let file = options.open(output_path)?;
         let writer = BufWriter::new(file);
-        let count = self.export_to_writer(eml_relative_paths, writer)?;
-        info!("Exported {} messages to mbox: {}", count, output_path.display());
+        let count = self.export_counted(eml_relative_paths, writer)?;
+        info!("Exported {} messages to mbox ({} skipped): {}", count.written, count.skipped, output_path.display());
         Ok(count)
     }
 }

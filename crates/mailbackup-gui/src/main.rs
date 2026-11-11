@@ -29,7 +29,11 @@ fn ui_url(port: u16) -> Result<tauri::Url, String> {
     let config_dir = config_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
     if mailbackup_server::runtime::verify_genuine(&config_dir, port).is_some() {
         println!("Using the MailBackup server already running on port {}", port);
-        return format!("http://127.0.0.1:{}/", port).parse().map_err(|e| format!("{}", e));
+        // Logged in for the user with a single-use ticket, only after the
+        // server proved itself (issue #70); without one the window shows the
+        // login page
+        let path = mailbackup_server::runtime::desktop_login_path(&config_dir, port).unwrap_or_else(|| "/".to_string());
+        return format!("http://127.0.0.1:{}{}", port, path).parse().map_err(|e| format!("{}", e));
     }
     let server = tauri::async_runtime::block_on(mailbackup_server::Server::build(None, Some(port), false))
         .map_err(|e| e.to_string())?;
@@ -106,7 +110,9 @@ fn handle_download<R: tauri::Runtime>(
             }
         }
         DownloadEvent::Finished { url, path, success } => {
-            if let Some(message) = finish_message(reservations.finish(url.as_str(), path, success)) {
+            let finish = reservations.finish(url.as_str(), path, success);
+            let mark = mark_saved(url.path(), &finish);
+            if let Some(message) = finish_message(finish, mark) {
                 let _ = webview.eval(toast_script(&message));
             }
             true
@@ -143,13 +149,33 @@ fn choose_destination(
     Some(reservations.reserve(&dir, name, key))
 }
 
+/// Marks a saved attachment or message as downloaded from the internet
+/// (issue #75), on the final file (after a `.part` was renamed over the
+/// one it replaces). Returns a warning for the toast if marking failed; an
+/// unsupported file system only gets a log line.
+fn mark_saved(url_path: &str, finish: &Finish) -> Option<String> {
+    let Finish::Saved(Some(path)) = finish else { return None };
+    if !mailbackup_core::download_mark::is_mail_content(url_path) {
+        return None;
+    }
+    match mailbackup_core::download_mark::mark_from_internet(path) {
+        Ok(mailbackup_core::download_mark::Mark::Unsupported(why)) => {
+            eprintln!("{} can't be marked as downloaded from the internet: {}", path.display(), why);
+            None
+        }
+        Ok(_) => None,
+        Err(e) => Some(format!("it couldn't be marked as downloaded from the internet ({}); open it with care", e)),
+    }
+}
+
 /// The toast for a download's end; none for a refused or cancelled one,
-/// which said so already.
-fn finish_message(finish: Finish) -> Option<String> {
+/// which said so already. `warning` is added to a successful save.
+fn finish_message(finish: Finish, warning: Option<String>) -> Option<String> {
+    let warning = warning.map(|w| format!("; {}", w)).unwrap_or_default();
     match finish {
         Finish::Refused => None,
-        Finish::Saved(Some(path)) => Some(format!("Saved {}", path.display())),
-        Finish::Saved(None) => Some("Download saved".to_string()),
+        Finish::Saved(Some(path)) => Some(format!("Saved {}{}", path.display(), warning)),
+        Finish::Saved(None) => Some(format!("Download saved{}", warning)),
         Finish::Failed => Some("The download failed".to_string()),
     }
 }
@@ -177,7 +203,9 @@ fn download_in_process<R: tauri::Runtime>(app: tauri::AppHandle<R>, url: tauri::
             Ok(request) => request,
             Err(_) => return,
         };
-        let response = server.handle_in_process(request, PROTOCOL_ORIGIN).await;
+        // Authorized (and its ticket used up) now, before the Save dialog;
+        // the body streams to the file afterwards, never all in memory (issue #78)
+        let response = server.handle_in_process_streaming(request, PROTOCOL_ORIGIN).await;
         if !response.status().is_success() {
             eprintln!("Download of {} failed: {}", url.path(), response.status());
             notify("The download failed");
@@ -196,13 +224,16 @@ fn download_in_process<R: tauri::Runtime>(app: tauri::AppHandle<R>, url: tauri::
             tauri::async_runtime::spawn_blocking(move || choose_destination(&name, None, &reservations, &key)).await
         };
         let Ok(Some(path)) = chosen else {
+            // Dropping the response stops whatever was producing it
             reservations.finish(&key, None, false);
             notify("Download cancelled");
             return;
         };
-        match write_new_file(&path, response.body()) {
+        match mailbackup_server::streaming::save_body(response.into_body(), &path).await {
             Ok(()) => {
-                if let Some(message) = finish_message(reservations.finish(&key, Some(path), true)) {
+                let finish = reservations.finish(&key, Some(path), true);
+                let mark = mark_saved(url.path(), &finish);
+                if let Some(message) = finish_message(finish, mark) {
                     notify(&message);
                 }
             }
@@ -216,17 +247,12 @@ fn download_in_process<R: tauri::Runtime>(app: tauri::AppHandle<R>, url: tauri::
     });
 }
 
-/// Writes `bytes` to a new file at `path`. Fails if anything exists there
-/// (another program may have created it since the name was chosen), and
-/// then leaves it alone; a file it created but couldn't fill is removed.
+/// What the #68 regression tests write through: the production path
+/// (`streaming::save_body`), which creates the file exclusively and removes
+/// only a file it created.
+#[cfg(test)]
 fn write_new_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-    if let Err(e) = std::io::Write::write_all(&mut file, bytes).and_then(|()| file.sync_all()) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(e);
-    }
-    Ok(())
+    tauri::async_runtime::block_on(mailbackup_server::streaming::save_body(bytes.to_vec().into(), path))
 }
 
 /// The file name a `Content-Disposition` header gives (`filename*` in
@@ -313,7 +339,10 @@ fn save_dialog(dir: &std::path::Path, name: &str) -> SaveChoice {
             $d.FileName = $env:MAILBACKUP_SAVE_NAME; $d.OverwritePrompt = $true; \
             $owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true }; \
             if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName; exit 0 } else { exit 1 }";
-        match std::process::Command::new("powershell")
+        let Ok(powershell) = mailbackup_core::service::trusted_program("powershell") else {
+            return SaveChoice::Unavailable;
+        };
+        match std::process::Command::new(powershell)
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .env("MAILBACKUP_SAVE_DIR", dir)
             .env("MAILBACKUP_SAVE_NAME", name)
@@ -329,7 +358,10 @@ fn save_dialog(dir: &std::path::Path, name: &str) -> SaveChoice {
         let script = "on run argv\n\
             POSIX path of (choose file name with prompt \"Save download\" default name (item 2 of argv) default location (POSIX file (item 1 of argv)))\n\
             end run";
-        match std::process::Command::new("osascript").arg("-e").arg(script).arg(dir).arg(name).output() {
+        let Ok(osascript) = mailbackup_core::service::trusted_program("osascript") else {
+            return SaveChoice::Unavailable;
+        };
+        match std::process::Command::new(osascript).arg("-e").arg(script).arg(dir).arg(name).output() {
             // Cancel is AppleScript error -128
             Ok(out) if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("-128") => SaveChoice::Cancelled,
             Ok(out) if out.status.success() => chosen(out),
@@ -351,6 +383,8 @@ fn save_dialog(dir: &std::path::Path, name: &str) -> SaveChoice {
             ("kdialog", vec!["--title".into(), "Save download".into(), "--getsavefilename".into(), start.clone().into()]),
         ];
         for (program, args) in attempts {
+            // From fixed system folders only, never from PATH (issue #75)
+            let Ok(program) = mailbackup_core::service::trusted_program(program) else { continue };
             if let Ok(out) = std::process::Command::new(program).args(&args).output() {
                 return chosen(out);
             }
@@ -460,7 +494,7 @@ impl Reservations {
             Some(Download::Running { path: part, replaces: Some(target) }) => {
                 // On failure the `.part` file is left alone: whoever wrote it
                 // removes their own partial file (the webviews do, and
-                // `write_new_file` does), and if the failure was that another
+                // `streaming::save_body` does), and if the failure was that another
                 // program had created it first, it isn't ours
                 if success && std::fs::rename(&part, &target).is_ok() {
                     Finish::Saved(Some(target))

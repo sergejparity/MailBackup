@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use console::{style, Emoji};
 use dialoguer::{Input, Password, Select};
 use indicatif::{ProgressBar, ProgressStyle};
-use mailbackup_core::config::{AccountConfig, AppConfig, AuthType, FolderFilter, ProviderType};
+use mailbackup_core::config::{AccountConfig, AppConfig, ProviderType};
 use mailbackup_core::db::Database;
 use mailbackup_core::imap::ImapSyncEngine;
 use mailbackup_core::keyring::CredentialStore;
@@ -51,6 +51,12 @@ enum Commands {
     #[command(about = "Run the unattended background scheduler daemon")]
     Daemon,
 
+    #[command(about = "Print the access key a browser needs to log in to the web UI")]
+    WebKey {
+        #[arg(long, help = "Replace it with a new key; every browser has to log in again")]
+        regenerate: bool,
+    },
+
     #[command(about = "Start the embedded Web UI and REST API server")]
     Serve(ServeArgs),
 }
@@ -67,6 +73,16 @@ enum AccountCommands {
     Test {
         #[arg(help = "Account ID or email address")]
         account: String,
+    },
+
+    #[command(
+        about = "List the account's messages that are not backed up because of their size, and fetch them on the next sync whatever the size limit"
+    )]
+    RetrySkipped {
+        #[arg(help = "Account ID or email address")]
+        account: String,
+        #[arg(long, help = "Only list them; don't mark them for retry")]
+        list: bool,
     },
 
     #[command(about = "Remove an account configuration and stored credentials")]
@@ -198,7 +214,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Account(AccountCommands::Add(args)) => {
-            handle_account_add(&mut config, cli.config.as_deref(), &credentials, args)?;
+            handle_account_add(&mut config, &config_path, &db, &storage, &credentials, args)?;
         }
         Commands::Account(AccountCommands::List) => {
             handle_account_list(&config, &db)?;
@@ -208,6 +224,30 @@ async fn main() -> Result<()> {
         }
         Commands::Account(AccountCommands::Remove { account }) => {
             handle_account_remove(&mut config, cli.config.as_deref(), &credentials, &account)?;
+        }
+        Commands::Account(AccountCommands::RetrySkipped { account, list }) => {
+            let acc = config.get_account(&account).context(format!("Account '{}' not found", account))?;
+            let skipped = db.skipped_messages(Some(&acc.id))?;
+            if skipped.is_empty() {
+                println!("{} Account '{}' has no skipped messages.", CHECK_EMOJI, acc.id);
+            } else {
+                println!("Messages of '{}' that are not backed up:", acc.id);
+                for s in &skipped {
+                    println!(
+                        "  {} UID {}: {:.1} MB (limit {:.0} MB), since {}{}",
+                        s.folder_name,
+                        s.uid,
+                        s.size_bytes as f64 / 1048576.0,
+                        s.limit_bytes as f64 / 1048576.0,
+                        s.first_skipped_at,
+                        if s.retry_requested { " (retry requested)" } else { "" }
+                    );
+                }
+                if !list {
+                    let marked = db.request_skipped_retry(&acc.id)?;
+                    println!("{} {} message(s) will be fetched on the next sync.", CHECK_EMOJI, marked);
+                }
+            }
         }
         Commands::Account(AccountCommands::ServerIds { account, trust, reset, source }) => {
             handle_account_server_ids(&mut config, cli.config.as_deref(), &db, &account, trust.as_deref(), reset, source.as_deref())?;
@@ -226,6 +266,22 @@ async fn main() -> Result<()> {
         }
         Commands::Daemon => {
             handle_daemon(config, &config_path, db, storage, credentials).await?;
+        }
+        Commands::WebKey { regenerate } => {
+            let config_dir = config_path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+            let key = if regenerate {
+                mailbackup_core::web_access::regenerate_key(&config_dir)?
+            } else {
+                mailbackup_core::web_access::load_or_create_key(&config_dir)?
+            };
+            // The key alone on stdout, so it can be piped; the rest on stderr
+            println!("{}", key);
+            if regenerate {
+                eprintln!("New access key saved; browsers that were logged in must log in again.");
+            }
+            if !config.settings.require_login {
+                eprintln!("Note: settings.require_login is off, so the web UI doesn't ask for it.");
+            }
         }
         Commands::Serve(args) => {
             println!("{} Starting MailBackup Studio on http://127.0.0.1:{}", MAIL_EMOJI, args.port);
@@ -329,7 +385,9 @@ fn check_password(password: String, source: &str) -> Result<String> {
 
 fn handle_account_add(
     config: &mut AppConfig,
-    config_path: Option<&std::path::Path>,
+    config_path: &std::path::Path,
+    db: &Database,
+    storage: &StorageEngine,
     credentials: &CredentialStore,
     args: AddAccountArgs,
 ) -> Result<()> {
@@ -372,7 +430,7 @@ fn handle_account_add(
         }
     };
 
-    let (def_server, def_port, def_tls) = provider_choice.default_server();
+    let (def_server, def_port, _) = provider_choice.default_server();
 
     let email = match args.email {
         Some(e) => e,
@@ -384,10 +442,8 @@ fn handle_account_add(
         None => Input::new().with_prompt("Account display name").default(email.clone()).interact_text()?,
     };
 
-    let id = match args.id {
-        Some(i) => i,
-        None => StorageEngine::sanitize_slug(&email),
-    };
+    // Without --id, a free id is derived from the address when saving
+    let id = args.id;
 
     let imap_server = match args.server {
         Some(s) => s,
@@ -422,36 +478,32 @@ fn handle_account_add(
     };
 
     let schedule = args.schedule.or_else(|| Some("0 0 * * *".to_string()));
+    if let Some(schedule) = &schedule {
+        mailbackup_core::scheduler::validate_schedule(schedule)?;
+    }
 
-    let account = AccountConfig {
-        id: id.clone(),
-        name,
-        email,
-        provider: provider_choice,
-        imap_server,
-        imap_port,
-        use_tls: def_tls,
-        auth_type: AuthType::Password,
-        username,
-        schedule,
-        retention_days,
-        folder_filter: FolderFilter::default(),
-        gmail_smart_labels: true,
-        enabled: true,
-        storage_namespace: None,
-        credential_ref: None,
-        archive: None,
-        trust_server_ids: false,
-    };
-
-    // Store password securely, bound to this server/port/username
-    credentials.set_account_password(&account, &password)?;
-
-    config.accounts.retain(|a| a.id != id);
-    config.accounts.push(account);
-
-    let save_path = config_path.unwrap_or_else(|| mailbackup_core::config::default_config_path().leak());
-    config.save(save_path)?;
+    // Refuses an address that already has an account and never reuses
+    // another account's id or password (issue #74)
+    let account = mailbackup_core::accounts::create(
+        config,
+        config_path,
+        db,
+        storage,
+        credentials,
+        mailbackup_core::accounts::NewAccount {
+            name,
+            email,
+            provider: provider_choice,
+            imap_server,
+            imap_port,
+            username,
+            password,
+            schedule,
+            retention_days,
+            requested_id: id,
+        },
+    )?;
+    let id = account.id;
 
     println!("\n{} Account '{}' configured successfully and credentials saved securely!", CHECK_EMOJI, id);
     Ok(())
@@ -737,7 +789,8 @@ async fn handle_sync(
                 .unwrap(),
         );
 
-        let sync_engine = ImapSyncEngine::new(db.clone(), storage.clone());
+        let sync_engine =
+            ImapSyncEngine::new(db.clone(), storage.clone()).with_limits(mailbackup_core::imap::Limits::from_settings(&config.settings));
         let pb_clone = pb.clone();
         let progress_cb = move |p: &mailbackup_core::imap::SyncProgress| {
             pb_clone.set_message(format!(
@@ -749,7 +802,17 @@ async fn handle_sync(
             ));
         };
 
-        match sync_engine.sync_account(acc, &password, Some(progress_cb)).await {
+        // A sync that stopped part-way, or left messages out for their size,
+        // is incomplete: reported as an error
+        let result = match sync_engine.sync_account(acc, &password, Some(progress_cb)).await {
+            Ok(p) if p.incomplete_reason().is_some() => Err(mailbackup_core::Error::Other(format!(
+                "incomplete after {} message(s): {}",
+                p.processed_messages,
+                p.incomplete_reason().unwrap_or_default()
+            ))),
+            other => other,
+        };
+        match result {
             Ok(progress) => {
                 let mb = (progress.downloaded_bytes as f64) / (1024.0 * 1024.0);
                 mailbackup_core::event_log::log_event(

@@ -1,0 +1,27 @@
+# Dependency updates (issue #81). Update PRs run CI with the read-only token
+# like any pull request.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Compatible updates together in one PR; major versions get their own
+      cargo-compatible:
+        update-types:
+          - minor
+          - patch
+
+  # Keeps the SHA-pinned `uses:` lines current. Tool versions given in `with:`
+  # or `run:` (TAURI_CLI_VERSION, the clippy and MSRV toolchains) are not
+  # updated by this and are bumped by hand.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"

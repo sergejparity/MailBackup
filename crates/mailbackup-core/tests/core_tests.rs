@@ -385,9 +385,13 @@ fn test_retention_policy_pruning() {
 
     assert!(stored.absolute_path.exists());
 
-    // Enforce 90-day retention
+    // Retention counts from when the message was backed up (issue #73): today
+    // a 90-day policy keeps it, whatever its old Date says...
     let retention = RetentionManager::new(&db, &storage);
-    let report = retention.enforce_retention("acc1", Some(90)).unwrap();
+    assert_eq!(retention.enforce_retention("acc1", Some(90)).unwrap().pruned_count, 0);
+    assert!(stored.absolute_path.exists());
+    // ...and 91 days after it was backed up, it goes
+    let report = retention.enforce_retention_as_of("acc1", Some(90), Utc::now() + Duration::days(91)).unwrap();
 
     assert_eq!(report.pruned_count, 1);
     assert!(!stored.absolute_path.exists()); // Physical file deleted
@@ -1103,4 +1107,17 @@ fn every_listed_log_file_can_be_downloaded() {
     for path in created {
         let _ = std::fs::remove_file(path);
     }
+}
+
+
+/// Issue #75: a malformed full-text query is the caller's mistake (400), not
+/// a server error
+#[test]
+fn a_malformed_search_query_is_invalid_input() {
+    let db = mailbackup_core::db::Database::open_in_memory().unwrap();
+    for query in ["\"unbalanced", "\"a\" AND", "\"x\" NEAR("] {
+        let err = db.search_fts(query, 10).unwrap_err();
+        assert!(matches!(err, mailbackup_core::Error::InvalidInput(_)), "{:?}: {:?}", query, err);
+    }
+    assert!(db.search_fts("plain words", 10).unwrap().is_empty());
 }
