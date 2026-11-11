@@ -5,6 +5,13 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+
+/// Held from writing the executables until the CLI has exited. Without it, a
+/// test that forks while the other still has its new executable open for
+/// writing hands that descriptor to the child, and running the file fails
+/// with ETXTBSY ("Text file busy").
+static EXEC_LOCK: Mutex<()> = Mutex::new(());
 
 /// A copy of the CLI next to a fake `mailbackup-server` that records its
 /// arguments, so `serve` runs the fake instead of a real server.
@@ -25,6 +32,7 @@ fn cli_with_fake_server(dir: &Path, args_file: &Path) -> PathBuf {
 }
 
 fn run_serve(extra: &[&str], web_port: u16) -> (String, Vec<String>, PathBuf, tempfile::TempDir) {
+    let _exec = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let bin = tmp.path().join("bin");
