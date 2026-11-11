@@ -78,9 +78,236 @@ fn folder_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FolderRecord> {
 /// Catalog schema version (`PRAGMA user_version`). 1 added UID generations
 /// (issue #17), 2 the account transitions of "start a new archive" (#31), 3
 /// server-guaranteed message ids (#33), 4 messages skipped for their size
-/// (#72). A binary that predates a version refuses the catalog, so an older
-/// MailBackup can't pass over a skipped message as if it were backed up.
-pub const SCHEMA_VERSION: i64 = 4;
+/// (#72), 5 a durable integer key for messages that links the search index,
+/// and a numeric date (#79). A binary that predates a version refuses the
+/// catalog, so an older MailBackup can't pass over a skipped message as if it
+/// were backed up, or write to an index it doesn't understand.
+pub const SCHEMA_VERSION: i64 = 5;
+
+/// `messages` as of schema version 5 (issue #79):
+/// - `seq` is an explicit `INTEGER PRIMARY KEY`, so it is the rowid and,
+///   unlike an implicit rowid, survives `VACUUM` and table rebuilds; the
+///   search index row of a message has `rowid = seq`.
+/// - `id` stays the message's public id (`UNIQUE`, referenced by
+///   `attachments` and `server_id_rebinds`).
+/// - `date_ts` is `date` as Unix seconds, so date filters and sorting compare
+///   instants whatever offset `date` was written with.
+fn messages_v5_ddl(table: &str) -> String {
+    format!(
+        r#"CREATE TABLE IF NOT EXISTS {} (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                account_id TEXT NOT NULL,
+                folder_id TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                message_id TEXT,
+                subject TEXT,
+                from_addr TEXT,
+                to_addrs TEXT,
+                cc_addrs TEXT,
+                date TEXT,
+                size_bytes INTEGER NOT NULL,
+                relative_path TEXT NOT NULL,
+                sha256_hash TEXT NOT NULL,
+                is_remote_deleted INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                uid_generation INTEGER NOT NULL,
+                server_id_kind TEXT,
+                server_id TEXT,
+                server_id_source TEXT,
+                date_ts INTEGER,
+                FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE,
+                UNIQUE(folder_id, uid_generation, uid)
+            );"#,
+        table
+    )
+}
+
+/// The search index as of schema 5: one row per message, `rowid = messages.seq`.
+fn messages_fts_v5_ddl(table: &str) -> String {
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS {} USING fts5(subject, from_addr, to_addrs, body_text, attachment_names, tokenize = 'porter unicode61');",
+        table
+    )
+}
+
+/// Indexes that need schema-5 columns.
+const V5_INDEXES: &str = r#"
+            CREATE INDEX IF NOT EXISTS idx_messages_path ON messages(relative_path);
+            CREATE INDEX IF NOT EXISTS idx_messages_date_ts ON messages(date_ts);
+"#;
+
+/// What the schema-5 migration did with the old search index (logged).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct IndexMigration {
+    pub messages: usize,
+    /// Messages that had no index row: one was made from their headers
+    pub rebuilt: usize,
+    /// Messages that had several index rows: merged without losing a term
+    pub merged: usize,
+    /// Index rows of messages that no longer exist: dropped
+    pub orphans: usize,
+}
+
+/// The values of one column of a message's old index rows, merged: each
+/// distinct value once, in order, separated by line breaks. Every term any of
+/// them had is in the result. (A phrase can match across the line break: the
+/// accepted limitation documented in issue #79.)
+fn merge_index_values<'a>(values: impl Iterator<Item = &'a str>) -> String {
+    let mut distinct: Vec<&str> = Vec::new();
+    for v in values {
+        if !distinct.contains(&v) {
+            distinct.push(v);
+        }
+    }
+    distinct.retain(|v| !v.is_empty());
+    distinct.join("\n")
+}
+
+/// Schema 4 → 5 (issue #79), following SQLite's table-rebuild procedure:
+/// foreign keys off, one transaction, foreign-key check before commit. Any
+/// failure rolls everything back and leaves the schema-4 catalog as it was.
+fn migrate_to_v5(conn: &mut Connection) -> Result<Option<IndexMigration>> {
+    let limit = conn.limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH)? as usize;
+    migrate_to_v5_with_limit(conn, limit)
+}
+
+fn migrate_to_v5_with_limit(conn: &mut Connection, value_limit: usize) -> Result<Option<IndexMigration>> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    // Already in the schema-5 shape (a catalog whose version was set back,
+    // or a rebuild that committed): nothing to rebuild
+    if version >= 5 || has_column(conn, "messages", "seq")? {
+        return Ok(None);
+    }
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = (|| -> Result<IndexMigration> {
+        let tx = conn.transaction()?;
+        let mut report = IndexMigration::default();
+
+        tx.execute_batch(&messages_v5_ddl("messages_v5"))?;
+        tx.execute_batch(
+            r#"INSERT INTO messages_v5 (
+                   id, account_id, folder_id, uid, message_id, subject, from_addr, to_addrs, cc_addrs, date,
+                   size_bytes, relative_path, sha256_hash, is_remote_deleted, created_at, uid_generation,
+                   server_id_kind, server_id, server_id_source, date_ts)
+               SELECT id, account_id, folder_id, uid, message_id, subject, from_addr, to_addrs, cc_addrs, date,
+                   size_bytes, relative_path, sha256_hash, is_remote_deleted, created_at, uid_generation,
+                   server_id_kind, server_id, server_id_source, unixepoch(date)
+               FROM messages ORDER BY rowid;"#,
+        )?;
+
+        // Which old index rows belong to which message, on disk: only the
+        // ids are read here, and each message's rows (with their text) are
+        // read when it is indexed, so memory stays at one message whatever
+        // the size of the archive (review of #92)
+        tx.execute_batch(
+            r#"DROP TABLE IF EXISTS temp.fts_v4_rows;
+               CREATE TEMP TABLE fts_v4_rows (message_id TEXT NOT NULL, fts_rowid INTEGER NOT NULL);
+               INSERT INTO temp.fts_v4_rows (message_id, fts_rowid) SELECT message_id, rowid FROM messages_fts;
+               CREATE INDEX temp.fts_v4_rows_by_message ON fts_v4_rows (message_id, fts_rowid);"#,
+        )?;
+        report.orphans = tx.query_row(
+            "SELECT count(DISTINCT message_id) FROM temp.fts_v4_rows WHERE message_id NOT IN (SELECT id FROM messages_v5)",
+            [],
+            |r| r.get(0),
+        )?;
+
+        tx.execute_batch(&messages_fts_v5_ddl("messages_fts_v5"))?;
+        {
+            let mut messages = tx.prepare("SELECT seq, id, subject, from_addr, to_addrs FROM messages_v5 ORDER BY seq")?;
+            let mut attachments = tx.prepare("SELECT filename FROM attachments WHERE message_id = ?1 ORDER BY rowid")?;
+            let mut insert = tx.prepare(
+                "INSERT INTO messages_fts_v5 (rowid, subject, from_addr, to_addrs, body_text, attachment_names) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            // One message's old index rows, in their order
+            let mut old_rows = tx.prepare(
+                r#"SELECT f.subject, f.from_addr, f.to_addrs, f.body_text, f.attachment_names
+                   FROM temp.fts_v4_rows m JOIN messages_fts f ON f.rowid = m.fts_rowid
+                   WHERE m.message_id = ?1 ORDER BY m.fts_rowid"#,
+            )?;
+            let mut rows = messages.query([])?;
+            while let Some(r) = rows.next()? {
+                report.messages += 1;
+                let (seq, id): (i64, String) = (r.get(0)?, r.get(1)?);
+                let text = |r: &rusqlite::Row<'_>, i: usize| -> rusqlite::Result<String> {
+                    Ok(r.get::<_, Option<String>>(i)?.unwrap_or_default())
+                };
+                let old: Vec<[String; 5]> = old_rows
+                    .query_map(params![id], |o| Ok([text(o, 0)?, text(o, 1)?, text(o, 2)?, text(o, 3)?, text(o, 4)?]))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let values: [String; 5] = match (old.len(), old) {
+                    (0, _) => {
+                        // Nothing was indexed: index what the catalog knows
+                        report.rebuilt += 1;
+                        let names: Vec<String> = attachments
+                            .query_map(params![id], |a| a.get::<_, String>(0))?
+                            .collect::<rusqlite::Result<_>>()?;
+                        [text(r, 2)?, text(r, 3)?, text(r, 4)?, String::new(), names.join(" ")]
+                    }
+                    (1, mut rows) => rows.remove(0),
+                    (_, rows) => {
+                        report.merged += 1;
+                        let merged: [String; 5] = std::array::from_fn(|c| merge_index_values(rows.iter().map(|row| row[c].as_str())));
+                        // Every distinct old value is in the merged one
+                        for row in &rows {
+                            for (c, value) in row.iter().enumerate() {
+                                if !merged[c].contains(value.as_str()) {
+                                    return Err(crate::Error::Other(format!("search index merge lost text of message {}", id)));
+                                }
+                            }
+                        }
+                        if let Some(c) = merged.iter().position(|v| v.len() > value_limit) {
+                            return Err(crate::Error::Other(format!(
+                                "The search index entries of message {} can't be merged: column {} would be {} bytes, more than SQLite's limit of {}. The catalog was left unchanged.",
+                                id, c, merged[c].len(), value_limit
+                            )));
+                        }
+                        merged
+                    }
+                };
+                insert.execute(params![seq, values[0], values[1], values[2], values[3], values[4]])?;
+            }
+        }
+        tx.execute_batch("DROP TABLE temp.fts_v4_rows;")?;
+
+        let indexed: i64 = tx.query_row("SELECT count(*) FROM messages_fts_v5", [], |r| r.get(0))?;
+        if indexed as usize != report.messages {
+            return Err(crate::Error::Other(format!(
+                "Search index migration produced {} entries for {} messages; the catalog was left unchanged",
+                indexed, report.messages
+            )));
+        }
+
+        tx.execute_batch(
+            r#"DROP TABLE messages;
+               ALTER TABLE messages_v5 RENAME TO messages;
+               DROP TABLE messages_fts;
+               ALTER TABLE messages_fts_v5 RENAME TO messages_fts;"#,
+        )?;
+        tx.execute_batch(MESSAGES_INDEXES)?;
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_server_id ON messages(folder_id, server_id_kind, server_id);",
+        )?;
+        tx.execute_batch(V5_INDEXES)?;
+        let violations: i64 = tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
+        if violations > 0 {
+            return Err(crate::Error::Other(format!(
+                "Catalog migration found {} broken references; the database was left unchanged",
+                violations
+            )));
+        }
+        tx.pragma_update(None, "user_version", 5)?;
+        tx.commit()?;
+        Ok(report)
+    })();
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    let report = result?;
+    tracing::info!(
+        "Catalog upgraded to schema 5: {} messages indexed ({} rebuilt from headers, {} merged from duplicates, {} orphaned index rows dropped)",
+        report.messages, report.rebuilt, report.merged, report.orphans
+    );
+    Ok(Some(report))
+}
 
 /// `messages` as of schema version 1. `uid_generation` deliberately has no
 /// default: binaries older than 0.4.0 don't know about generations, and their
@@ -369,7 +596,6 @@ fn move_account_rows(tx: &Connection, from: &str, to: &str) -> Result<()> {
         params![from, to],
     )?;
     tx.execute("UPDATE messages SET account_id = ?2 WHERE account_id = ?1", params![from, to])?;
-    tx.execute("UPDATE messages_fts SET account_id = ?2 WHERE account_id = ?1", params![from, to])?;
     Ok(())
 }
 
@@ -478,6 +704,7 @@ fn insert_message_tx(tx: &Connection, m: &NewMessage<'_>) -> Result<String> {
     let new_id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
     let date_str = m.date.map(|d| d.to_rfc3339());
+    let date_ts = m.date.map(|d| d.timestamp());
     let (id_kind, id_value, id_source) = match m.server_id {
         Some(s) => (Some(s.id.kind.as_str()), Some(s.id.value.as_str()), Some(s.source)),
         None => (None, None, None),
@@ -488,15 +715,17 @@ fn insert_message_tx(tx: &Connection, m: &NewMessage<'_>) -> Result<String> {
         INSERT INTO messages (
             id, account_id, folder_id, uid, message_id, subject, from_addr,
             to_addrs, cc_addrs, date, size_bytes, relative_path, sha256_hash,
-            is_remote_deleted, created_at, uid_generation, server_id_kind, server_id, server_id_source
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14, ?15, ?16, ?17, ?18)
+            is_remote_deleted, created_at, uid_generation, server_id_kind, server_id, server_id_source, date_ts
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14, ?15, ?16, ?17, ?18, ?19)
         "#,
         params![
             new_id, m.account_id, m.folder_id, m.uid, m.message_id, m.subject, m.from_addr,
             m.to_addrs, m.cc_addrs, date_str, m.size_bytes as i64, m.relative_path, m.sha256_hash, now, m.generation,
-            id_kind, id_value, id_source
+            id_kind, id_value, id_source, date_ts
         ],
     )?;
+    // `seq`, the row's durable integer key: the search index row's rowid
+    let seq = tx.last_insert_rowid();
 
     // Insert attachments
     let mut att_names = Vec::new();
@@ -516,12 +745,11 @@ fn insert_message_tx(tx: &Connection, m: &NewMessage<'_>) -> Result<String> {
     let att_names_str = att_names.join(" ");
     tx.execute(
         r#"
-        INSERT INTO messages_fts (message_id, account_id, subject, from_addr, to_addrs, body_text, attachment_names)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        INSERT INTO messages_fts (rowid, subject, from_addr, to_addrs, body_text, attachment_names)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         "#,
         params![
-            new_id,
-            m.account_id,
+            seq,
             m.subject.unwrap_or(""),
             m.from_addr.unwrap_or(""),
             m.to_addrs.unwrap_or(""),
@@ -710,17 +938,8 @@ impl Database {
                 FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
             );
 
-            -- FTS5 Full-Text Search Table
-            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-                message_id UNINDEXED,
-                account_id UNINDEXED,
-                subject,
-                from_addr,
-                to_addrs,
-                body_text,
-                attachment_names,
-                tokenize = 'porter unicode61'
-            );
+            -- FTS5 full-text search, one row per message, rowid = messages.seq
+            {fts}
 
             CREATE TABLE IF NOT EXISTS sync_history (
                 id TEXT PRIMARY KEY,
@@ -806,11 +1025,13 @@ impl Database {
                 FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
             );
             "#
-        .replace("{messages}", &messages_ddl("messages"))
+        .replace("{messages}", &messages_v5_ddl("messages"))
+        .replace("{fts}", &messages_fts_v5_ddl("messages_fts"))
         .replace("{indexes}", MESSAGES_INDEXES);
         if fresh {
             conn.execute_batch(&schema)?;
             add_server_id_columns(&conn)?;
+            conn.execute_batch(V5_INDEXES)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             return Ok(());
         }
@@ -818,6 +1039,8 @@ impl Database {
         // Tables added later than `messages` (no-ops when present)
         conn.execute_batch(&schema)?;
         add_server_id_columns(&conn)?;
+        migrate_to_v5(&mut conn)?;
+        conn.execute_batch(V5_INDEXES)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
@@ -1857,14 +2080,17 @@ impl Database {
 
         if let Some(df) = filter.date_from.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             let date = parse_date_filter(df)?;
-            conditions.push("date(m.date) >= ?".to_string());
-            params.push(rusqlite::types::Value::Text(date.format("%Y-%m-%d").to_string()));
+            // From the start of that day (UTC), as an instant
+            conditions.push("m.date_ts >= ?".to_string());
+            params.push(rusqlite::types::Value::Integer(date.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp()));
         }
 
         if let Some(dt) = filter.date_to.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             let date = parse_date_filter(dt)?;
-            conditions.push("date(m.date) <= ?".to_string());
-            params.push(rusqlite::types::Value::Text(date.format("%Y-%m-%d").to_string()));
+            // Up to the end of that day (UTC): before the next one starts
+            conditions.push("m.date_ts < ?".to_string());
+            let next = date.succ_opt().unwrap_or(date).and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp();
+            params.push(rusqlite::types::Value::Integer(next));
         }
 
         if let Some(acc) = filter.account_id.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "ALL") {
@@ -1941,7 +2167,7 @@ impl Database {
                     m.id, m.account_id, f.remote_name, m.subject, m.from_addr, m.to_addrs, m.date, m.relative_path,
                     snippet(messages_fts, -1, char(2), char(3), '...', 15) as snip
                 FROM messages_fts
-                JOIN messages m ON m.id = messages_fts.message_id
+                JOIN messages m ON m.seq = messages_fts.rowid
                 JOIN folders f ON f.id = m.folder_id
                 {}
                 ORDER BY messages_fts.rank, m.date DESC
@@ -2051,7 +2277,7 @@ impl Database {
         let tx = conn.transaction()?;
         let mut deleted = 0;
         {
-            let mut fts = tx.prepare_cached("DELETE FROM messages_fts WHERE message_id = ?1")?;
+            let mut fts = tx.prepare_cached("DELETE FROM messages_fts WHERE rowid = (SELECT seq FROM messages WHERE id = ?1)")?;
             let mut msg = tx.prepare_cached("DELETE FROM messages WHERE id = ?1")?;
             for id in message_ids {
                 fts.execute(params![id])?;
@@ -2064,7 +2290,7 @@ impl Database {
 
     pub fn delete_message_record(&self, message_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM messages_fts WHERE message_id = ?1", params![message_id])?;
+        conn.execute("DELETE FROM messages_fts WHERE rowid = (SELECT seq FROM messages WHERE id = ?1)", params![message_id])?;
         conn.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
         Ok(())
     }
@@ -2160,5 +2386,46 @@ impl Database {
             total_messages,
             total_bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A merged index value over SQLite's length limit fails the migration
+    /// with the message's id, and nothing is changed (issue #79).
+    #[test]
+    fn an_index_merge_over_the_length_limit_changes_nothing() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&messages_ddl("messages")).unwrap();
+        add_server_id_columns(&conn).unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE folders (id TEXT PRIMARY KEY);
+               CREATE TABLE attachments (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, filename TEXT NOT NULL,
+                   mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL);
+               CREATE VIRTUAL TABLE messages_fts USING fts5(message_id UNINDEXED, account_id UNINDEXED, subject,
+                   from_addr, to_addrs, body_text, attachment_names);
+               INSERT INTO folders VALUES ('f');
+               INSERT INTO messages (id, account_id, folder_id, uid, size_bytes, relative_path, sha256_hash, created_at, uid_generation)
+                   VALUES ('m1', 'acc', 'f', 1, 1, 'p', 'h', '2026-01-01T00:00:00+00:00', 0);
+               INSERT INTO messages_fts (message_id, account_id, body_text) VALUES ('m1', 'acc', 'first body of twenty bytes');
+               INSERT INTO messages_fts (message_id, account_id, body_text) VALUES ('m1', 'acc', 'second body of twenty bytes');
+               PRAGMA user_version = 4;"#,
+        )
+        .unwrap();
+        let err = migrate_to_v5_with_limit(&mut conn, 40).unwrap_err().to_string();
+        assert!(err.contains("m1") && err.contains("left unchanged"), "{}", err);
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 4);
+        assert!(!has_column(&conn, "messages", "seq").unwrap(), "the old messages table");
+        let rows: i64 = conn.query_row("SELECT count(*) FROM messages_fts WHERE message_id = 'm1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 2, "the old index rows are untouched");
+
+        // With room for the merged value it goes through, keeping both bodies
+        let report = migrate_to_v5_with_limit(&mut conn, 1000).unwrap().unwrap();
+        assert_eq!((report.messages, report.merged), (1, 1));
+        let body: String = conn.query_row("SELECT body_text FROM messages_fts WHERE rowid = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(body, "first body of twenty bytes\nsecond body of twenty bytes");
     }
 }
