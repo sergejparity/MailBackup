@@ -12,23 +12,17 @@
 //! - saves the password only under that new, unused name, and removes it
 //!   again if the config can't be saved.
 //!
-//! The whole step runs under one cross-process lock, so two creations (in
-//! this process or another) can't choose the same id, and it changes the
-//! config file as it is under that lock, so neither drops the other's
-//! account.
+//! The whole step runs under the config lock ([`ConfigLock`]), which every
+//! config writer in every process holds, so two creations can't choose the
+//! same id, and it changes the config file as it is under that lock, so no
+//! other writer's change is dropped.
 
-use crate::config::{AccountConfig, AppConfig, AuthType, FolderFilter, ProviderType};
+use crate::config::{AccountConfig, AppConfig, AuthType, ConfigLock, FolderFilter, ProviderType};
 use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::keyring::CredentialStore;
 use crate::storage::StorageEngine;
-use crate::sync_gate::SyncGate;
 use std::path::Path;
-
-/// Name of the lock held while an account is created. Not a valid account id
-/// (ids never contain `~` unless a transition added it), and lock files are
-/// named by the hex of the name, so it can't clash with an account's gate.
-const CREATE_LOCK: &str = "~create-account~";
 
 /// What the user entered for a new account.
 #[derive(Debug, Clone)]
@@ -140,8 +134,9 @@ pub fn create(
         crate::scheduler::validate_schedule(schedule)?;
     }
 
-    // One creation at a time, in any process
-    let _lock = SyncGate::acquire(config_path, CREATE_LOCK)?;
+    // One config change at a time, in any process: no other writer saves
+    // between reading the file below and saving it
+    let _lock = ConfigLock::acquire(config_path)?;
     let on_disk = AppConfig::load_existing(config_path)?;
     let mut configs: Vec<&AppConfig> = vec![&*config];
     configs.extend(on_disk.as_ref());
@@ -285,7 +280,9 @@ pub fn new_account_from_row(row: &crate::csv_import::ValidImportAccount) -> NewA
 /// server-id trust, folder filter or `enabled`. The row always carries a
 /// password, so a changed connection gets the password entered for it.
 ///
-/// If the config can't be saved, the previous password is put back.
+/// Runs under the config lock and starts from the config file as it is then:
+/// `config` is replaced by it first, so changes other processes saved are
+/// kept. If the config can't be saved, the previous password is put back.
 pub fn update_from_row(
     config: &mut AppConfig,
     config_path: &Path,
@@ -296,6 +293,9 @@ pub fn update_from_row(
     if let Some(schedule) = &row.schedule {
         crate::scheduler::validate_schedule(schedule)?;
     }
+    // Changes the file as it is now, not an older copy
+    let _lock = ConfigLock::acquire(config_path)?;
+    config.reload_from(config_path, &_lock)?;
     let current = config.account_by_id(id).cloned().ok_or_else(|| Error::AccountNotFound(id.to_string()))?;
     if current.is_archive() {
         return Err(Error::AccountArchived(id.to_string()));
