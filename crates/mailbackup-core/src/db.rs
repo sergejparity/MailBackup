@@ -1998,20 +1998,27 @@ impl Database {
         Ok(results)
     }
 
-    pub fn get_messages_older_than(
+    /// The account's messages archived before `cutoff`, oldest first: what
+    /// retention removes (issue #73). Counted from when MailBackup archived
+    /// each message (`created_at`), never from its `Date:` header, which the
+    /// sender writes, or the server's INTERNALDATE, which APPEND and
+    /// migrations can set. `created_at` is set once, when the row is
+    /// inserted; re-binds to a new UID or generation keep it.
+    pub fn get_messages_archived_before(
         &self,
         account_id: &str,
-        cutoff_date: DateTime<Utc>,
+        cutoff: DateTime<Utc>,
     ) -> Result<Vec<MessageRecord>> {
         let conn = self.conn.lock().unwrap();
-        let cutoff_str = cutoff_date.to_rfc3339();
+        let cutoff_str = cutoff.to_rfc3339();
 
+        // julianday() compares instants whatever offset a row was written with
         let mut stmt = conn.prepare(
             r#"
             SELECT id, account_id, folder_id, uid, message_id, subject, from_addr, to_addrs, cc_addrs, date, size_bytes, relative_path, sha256_hash, is_remote_deleted, created_at
             FROM messages
-            WHERE account_id = ?1 AND date IS NOT NULL AND date < ?2
-            ORDER BY date ASC
+            WHERE account_id = ?1 AND julianday(created_at) < julianday(?2)
+            ORDER BY julianday(created_at) ASC
             "#,
         )?;
 

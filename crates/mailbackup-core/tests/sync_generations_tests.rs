@@ -227,6 +227,11 @@ async fn copies_never_share_a_file_that_retention_could_delete() {
     let rows = archived(&a);
     assert_eq!(rows.len(), 2);
     assert_ne!(rows[0].0.relative_path, rows[1].0.relative_path, "each copy has its own file");
+    // Retention counts from when a copy was archived (issue #73): the
+    // re-bound copy was archived in early March, the second copy later
+    let (rebound, second) = if rows[0].0.uid == 1 { (&rows[0].0, &rows[1].0) } else { (&rows[1].0, &rows[0].0) };
+    set_archived_at(&a, &rebound.id, "2026-03-03T10:00:00+00:00");
+    set_archived_at(&a, &second.id, "2026-03-20T10:00:00+00:00");
 
     // Retention as of 25 March, 10 days: the early-March row expires, the
     // later one is kept and must stay readable
@@ -250,11 +255,15 @@ fn retention_keeps_a_file_another_row_still_uses() {
     let path = stored.relative_path.to_string_lossy().to_string();
     let date = |s: &str| Some(chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc));
     for (uid, when) in [(1, "2026-03-03T10:00:00Z"), (2, "2026-03-20T10:00:00Z")] {
-        a.db.insert_message(
-            "acc", &folder.id, uid, None, Some("A"), None, None, None, date(when), stored.size_bytes, &path,
-            &stored.sha256, None, &[],
-        )
-        .unwrap();
+        let id = a
+            .db
+            .insert_message(
+                "acc", &folder.id, uid, None, Some("A"), None, None, None, date(when), stored.size_bytes, &path,
+                &stored.sha256, None, &[],
+            )
+            .unwrap();
+        // Retention counts from the archive time (issue #73)
+        set_archived_at(&a, &id, when);
     }
     let report = RetentionManager::new(&a.db, &a.storage)
         .enforce_retention_as_of("acc", Some(10), date("2026-03-25T00:00:00Z").unwrap())

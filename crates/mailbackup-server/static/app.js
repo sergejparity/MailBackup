@@ -1239,7 +1239,7 @@ function renderModalAccounts() {
   state.accounts.forEach(acc => {
     const row = document.createElement('div');
     row.className = 'account-table-row';
-    const retentionText = acc.retention_days ? `${acc.retention_days} days` : 'Forever';
+    const retentionText = acc.retention_days ? `${acc.retention_days} days after backup` : 'Forever';
     const scheduleText = acc.schedule || 'Default (Daily)';
     const statusText = acc.enabled ? '<span style="color: var(--accent-emerald); font-weight: 600;">Enabled</span>' : '<span style="color: var(--text-dim);">Disabled</span>';
     const skipped = (state.schedulerSkipped || {})[acc.id];
