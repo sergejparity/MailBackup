@@ -2,13 +2,88 @@ use crate::error::{Error, Result};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use tracing::{debug, warn};
 use uuid::Uuid;
+
+/// Name of the lock file at the root of the data folder (issue #79).
+pub const STORAGE_LOCK_FILE: &str = ".storage.lock";
+
+/// The storage lifetime lock of a data folder, held while it lives: shared by
+/// archivers, exclusive by pruning. See [`StorageEngine::lock_shared`].
+///
+/// While any is held, this process's data folder stays the one it was taken
+/// in: a relocation ([`StorageEngine::relocate`]) waits for every guard to be
+/// released, and guards asked for meanwhile wait for the relocation, so a
+/// guarded operation never resolves paths in two folders (issue #79).
+#[derive(Debug)]
+pub struct StorageLock {
+    gate: Arc<BaseGate>,
+    _file: std::fs::File,
+}
+
+impl Drop for StorageLock {
+    fn drop(&mut self) {
+        self.gate.leave();
+    }
+}
+
+/// Keeps the data folder fixed while storage lifetime locks are held.
+#[derive(Debug, Default)]
+struct BaseGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    /// Storage lifetime locks held in this process
+    held: usize,
+    /// A relocation is waiting for them or running
+    relocating: bool,
+}
+
+impl BaseGate {
+    /// One more guard; waits while a relocation is waiting or running.
+    fn enter(&self) {
+        let mut state = self.state.lock().unwrap();
+        while state.relocating {
+            state = self.changed.wait(state).unwrap();
+        }
+        state.held += 1;
+    }
+
+    fn leave(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.held -= 1;
+        self.changed.notify_all();
+    }
+
+    /// Runs `f` with no guard held and none taken until it returns. One
+    /// relocation at a time; new guards wait from the moment this is called.
+    fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
+        let mut state = self.state.lock().unwrap();
+        while state.relocating {
+            state = self.changed.wait(state).unwrap();
+        }
+        state.relocating = true;
+        while state.held > 0 {
+            state = self.changed.wait(state).unwrap();
+        }
+        drop(state);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        let mut state = self.state.lock().unwrap();
+        state.relocating = false;
+        self.changed.notify_all();
+        drop(state);
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct StorageEngine {
     base_dir: Arc<RwLock<PathBuf>>,
+    gate: Arc<BaseGate>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +98,7 @@ impl StorageEngine {
     pub fn new(base_dir: impl AsRef<Path>) -> Self {
         Self {
             base_dir: Arc::new(RwLock::new(base_dir.as_ref().to_path_buf())),
+            gate: Arc::default(),
         }
     }
 
@@ -30,20 +106,98 @@ impl StorageEngine {
         self.base_dir.read().unwrap().clone()
     }
 
+    /// Switches to another data folder, once no storage lifetime lock is
+    /// held in this process. Prefer [`Self::relocate`], which also moves the
+    /// data without a gap between copying and switching.
     pub fn set_base_dir(&self, new_dir: impl AsRef<Path>) {
-        let mut w = self.base_dir.write().unwrap();
-        *w = new_dir.as_ref().to_path_buf();
+        self.gate.exclusive(|| *self.base_dir.write().unwrap() = new_dir.as_ref().to_path_buf());
+    }
+
+    /// Moves to `new_base` as one step (issue #79): waits until no storage
+    /// lifetime lock is held in this process and keeps new ones waiting,
+    /// takes the current folder's lock exclusively (so archivers of other
+    /// processes there are done), copies the data if `move_existing`, and
+    /// switches. Returns the number of files copied. On an error the folder
+    /// stays the current one.
+    pub fn relocate(&self, new_base: impl AsRef<Path>, move_existing: bool) -> Result<u64> {
+        let new_base = new_base.as_ref().to_path_buf();
+        self.gate.exclusive(|| {
+            let copied = if move_existing {
+                self.copy_locked(&new_base)?
+            } else {
+                crate::private_fs::create_dir_all(&new_base)?;
+                0
+            };
+            *self.base_dir.write().unwrap() = new_base.clone();
+            Ok(copied)
+        })
+    }
+
+    fn lock_file(&self) -> Result<std::fs::File> {
+        let base = self.base_dir();
+        crate::private_fs::create_dir_all(&base)?;
+        let mut options = crate::private_fs::options();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            // Never follow a symlink planted at the lock path
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        Ok(options.open(base.join(STORAGE_LOCK_FILE))?)
+    }
+
+    /// The storage lifetime lock, shared (issue #79). An archiver holds it
+    /// from before it decides to use a file (a new one, or an existing copy it
+    /// re-binds or finds already in place) until the catalog row naming that
+    /// file is committed. Many archivers can hold it at once, in any process.
+    pub fn lock_shared(&self) -> Result<StorageLock> {
+        self.gate.enter();
+        let gate = self.gate.clone();
+        let file = self.lock_file().and_then(|f| Ok(f.lock_shared().map(|_| f)?));
+        match file {
+            Ok(file) => Ok(StorageLock { gate, _file: file }),
+            Err(e) => {
+                gate.leave();
+                Err(e)
+            }
+        }
+    }
+
+    /// The storage lifetime lock, exclusive: pruning holds it while it deletes
+    /// rows and then removes files no row references any more, so no archiver
+    /// in any process is between choosing a file and committing its row.
+    pub fn lock_exclusive(&self) -> Result<StorageLock> {
+        self.gate.enter();
+        let gate = self.gate.clone();
+        let file = self.lock_file().and_then(|f| Ok(f.lock().map(|_| f)?));
+        match file {
+            Ok(file) => Ok(StorageLock { gate, _file: file }),
+            Err(e) => {
+                gate.leave();
+                Err(e)
+            }
+        }
     }
 
     pub fn get_absolute_path(&self, relative_path: impl AsRef<Path>) -> PathBuf {
         self.base_dir().join(relative_path)
     }
 
-    /// Migrates existing backup data from current base_dir to new_base_dir.
-    /// Returns the number of files migrated.
+    /// Copies the data of the current folder to `new_base_dir`, without
+    /// switching to it (see [`Self::relocate`]), under the same exclusion.
+    /// Returns the number of files copied.
     pub fn migrate_data(&self, new_base_dir: impl AsRef<Path>) -> Result<u64> {
+        self.gate.exclusive(|| self.copy_locked(new_base_dir.as_ref()))
+    }
+
+    /// The copy of [`Self::migrate_data`]; the caller holds the gate. The
+    /// current folder's lock is held exclusively throughout, so no archiver
+    /// of another process is between storing a file there and committing its
+    /// row. The lock file itself is not copied: each folder has its own.
+    fn copy_locked(&self, new_base: &Path) -> Result<u64> {
         let old_base = self.base_dir();
-        let new_base = new_base_dir.as_ref().to_path_buf();
+        let new_base = new_base.to_path_buf();
 
         if old_base == new_base {
             return Ok(0);
@@ -54,6 +208,8 @@ impl StorageEngine {
         if !old_base.exists() {
             return Ok(0);
         }
+        let old_lock = self.lock_file()?;
+        old_lock.lock()?;
 
         let mut copied_count = 0u64;
 
@@ -66,8 +222,8 @@ impl StorageEngine {
                 let file_type = entry.file_type()?;
                 let file_name = entry.file_name();
 
-                // Skip temporary staging directory
-                if file_name == ".staging" {
+                // Skip temporary staging directory and the lock file
+                if file_name == ".staging" || file_name == STORAGE_LOCK_FILE {
                     continue;
                 }
 
@@ -137,12 +293,28 @@ impl StorageEngine {
         date: Option<DateTime<Utc>>,
         raw_bytes: &[u8],
     ) -> Result<StoredMessageInfo> {
+        self.store_eml_hashed(account_id, folder_name, uid, generation, date, raw_bytes, &Self::compute_sha256(raw_bytes))
+    }
+
+    /// [`Self::store_eml_in_generation`] for bytes whose SHA-256 the caller
+    /// already computed (so a body is hashed once).
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_eml_hashed(
+        &self,
+        account_id: &str,
+        folder_name: &str,
+        uid: u32,
+        generation: u32,
+        date: Option<DateTime<Utc>>,
+        raw_bytes: &[u8],
+        sha256: &str,
+    ) -> Result<StoredMessageInfo> {
         let folder_slug = Self::sanitize_slug(folder_name);
         let date_time = date.unwrap_or_else(Utc::now);
         let year_str = date_time.format("%Y").to_string();
         let month_str = date_time.format("%m").to_string();
 
-        let sha256 = Self::compute_sha256(raw_bytes);
+        let sha256 = sha256.to_string();
         let size_bytes = raw_bytes.len() as u64;
 
         // Target file name: <uid>_<sha256_prefix>.eml, or
@@ -161,8 +333,9 @@ impl StorageEngine {
         let base = self.base_dir();
         let absolute_path = base.join(&relative_path);
 
-        // If target already exists and size matches, verify hash
-        if absolute_path.exists()
+        // If target already exists and size matches, verify hash (the size
+        // first: a file of another size can't match, and isn't read)
+        if std::fs::metadata(&absolute_path).is_ok_and(|m| m.len() == size_bytes)
             && let Ok(existing_bytes) = std::fs::read(&absolute_path) {
             let existing_hash = Self::compute_sha256(&existing_bytes);
             if existing_hash == sha256 {

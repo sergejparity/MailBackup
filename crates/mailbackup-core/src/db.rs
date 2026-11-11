@@ -31,6 +31,31 @@ pub struct FolderRecord {
 const FOLDER_COLUMNS: &str =
     "id, account_id, remote_name, local_slug, uidvalidity, last_synced_uid, message_count, updated_at, remote_identity, uid_generation";
 
+/// Maps a row of `SELECT {MESSAGE_COLUMNS}` (in this order) to a record.
+fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
+    let date_str: Option<String> = row.get(9)?;
+    let date = date_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc)));
+    let created_str: String = row.get(14)?;
+    let created_at = DateTime::parse_from_rfc3339(&created_str).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now());
+    Ok(MessageRecord {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        folder_id: row.get(2)?,
+        uid: row.get(3)?,
+        message_id: row.get(4)?,
+        subject: row.get(5)?,
+        from_addr: row.get(6)?,
+        to_addrs: row.get(7)?,
+        cc_addrs: row.get(8)?,
+        date,
+        size_bytes: row.get(10)?,
+        relative_path: row.get(11)?,
+        sha256_hash: row.get(12)?,
+        is_remote_deleted: row.get::<_, i64>(13)? != 0,
+        created_at,
+    })
+}
+
 fn folder_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FolderRecord> {
     let updated_at_str: String = row.get(7)?;
     let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
@@ -529,6 +554,26 @@ fn insert_server_id_state(
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
     current_path: Arc<Mutex<PathBuf>>,
+    /// The last storage statistics with the catalog state they were counted
+    /// in (issue #79): counting scans every message, and the dashboard asks
+    /// often. See [`Database::get_storage_stats`].
+    stats_cache: Arc<Mutex<Option<(CatalogState, StorageStats)>>>,
+}
+
+/// Identifies one state of the catalog: SQLite's `data_version` changes
+/// whenever another connection (any process) commits, `total_changes` when
+/// this one changes a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatalogState {
+    data_version: i64,
+    total_changes: u64,
+}
+
+fn catalog_state(conn: &Connection) -> rusqlite::Result<CatalogState> {
+    Ok(CatalogState {
+        data_version: conn.query_row("PRAGMA data_version", [], |r| r.get(0))?,
+        total_changes: conn.total_changes(),
+    })
 }
 
 impl Database {
@@ -542,6 +587,7 @@ impl Database {
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
             current_path: Arc::new(Mutex::new(p)),
+            stats_cache: Arc::default(),
         };
         db.init_schema()?;
         Ok(db)
@@ -553,6 +599,7 @@ impl Database {
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
             current_path: Arc::new(Mutex::new(PathBuf::from(":memory:"))),
+            stats_cache: Arc::default(),
         };
         db.init_schema()?;
         Ok(db)
@@ -608,6 +655,8 @@ impl Database {
 
             *conn_guard = new_conn;
             *self.current_path.lock().unwrap() = new_p.to_path_buf();
+            // Another connection's counters: nothing cached applies to it
+            *self.stats_cache.lock().unwrap() = None;
         }
 
         // Ensure schema and tables exist on the relocated connection
@@ -1622,30 +1671,7 @@ impl Database {
             LIMIT 1
             "#,
             params![sha256_hash],
-            |row| {
-                let date_str: Option<String> = row.get(9)?;
-                let date = date_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc)));
-                let created_str: String = row.get(14)?;
-                let created_at = DateTime::parse_from_rfc3339(&created_str).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now());
-
-                Ok(MessageRecord {
-                    id: row.get(0)?,
-                    account_id: row.get(1)?,
-                    folder_id: row.get(2)?,
-                    uid: row.get(3)?,
-                    message_id: row.get(4)?,
-                    subject: row.get(5)?,
-                    from_addr: row.get(6)?,
-                    to_addrs: row.get(7)?,
-                    cc_addrs: row.get(8)?,
-                    date,
-                    size_bytes: row.get(10)?,
-                    relative_path: row.get(11)?,
-                    sha256_hash: row.get(12)?,
-                    is_remote_deleted: row.get::<_, i64>(13)? != 0,
-                    created_at,
-                })
-            },
+            message_from_row,
         ).optional()?;
         Ok(msg)
     }
@@ -1660,30 +1686,7 @@ impl Database {
             LIMIT 1
             "#,
             params![message_id],
-            |row| {
-                let date_str: Option<String> = row.get(9)?;
-                let date = date_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc)));
-                let created_str: String = row.get(14)?;
-                let created_at = DateTime::parse_from_rfc3339(&created_str).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now());
-
-                Ok(MessageRecord {
-                    id: row.get(0)?,
-                    account_id: row.get(1)?,
-                    folder_id: row.get(2)?,
-                    uid: row.get(3)?,
-                    message_id: row.get(4)?,
-                    subject: row.get(5)?,
-                    from_addr: row.get(6)?,
-                    to_addrs: row.get(7)?,
-                    cc_addrs: row.get(8)?,
-                    date,
-                    size_bytes: row.get(10)?,
-                    relative_path: row.get(11)?,
-                    sha256_hash: row.get(12)?,
-                    is_remote_deleted: row.get::<_, i64>(13)? != 0,
-                    created_at,
-                })
-            },
+            message_from_row,
         ).optional()?;
         Ok(msg)
     }
@@ -2022,30 +2025,7 @@ impl Database {
             "#,
         )?;
 
-        let rows = stmt.query_map(params![account_id, cutoff_str], |row| {
-            let date_str: Option<String> = row.get(9)?;
-            let date = date_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc)));
-            let created_str: String = row.get(14)?;
-            let created_at = DateTime::parse_from_rfc3339(&created_str).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now());
-
-            Ok(MessageRecord {
-                id: row.get(0)?,
-                account_id: row.get(1)?,
-                folder_id: row.get(2)?,
-                uid: row.get(3)?,
-                message_id: row.get(4)?,
-                subject: row.get(5)?,
-                from_addr: row.get(6)?,
-                to_addrs: row.get(7)?,
-                cc_addrs: row.get(8)?,
-                date,
-                size_bytes: row.get(10)?,
-                relative_path: row.get(11)?,
-                sha256_hash: row.get(12)?,
-                is_remote_deleted: row.get::<_, i64>(13)? != 0,
-                created_at,
-            })
-        })?;
+        let rows = stmt.query_map(params![account_id, cutoff_str], message_from_row)?;
 
         let mut list = Vec::new();
         for r in rows {
@@ -2062,6 +2042,24 @@ impl Database {
             params![relative_path],
             |r| r.get(0),
         )?)
+    }
+
+    /// Deletes these messages (and their search entries) in one transaction;
+    /// returns the rows that were deleted, so the caller can check their files.
+    pub fn delete_message_records(&self, message_ids: &[String]) -> Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut deleted = 0;
+        {
+            let mut fts = tx.prepare_cached("DELETE FROM messages_fts WHERE message_id = ?1")?;
+            let mut msg = tx.prepare_cached("DELETE FROM messages WHERE id = ?1")?;
+            for id in message_ids {
+                fts.execute(params![id])?;
+                deleted += msg.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub fn delete_message_record(&self, message_id: &str) -> Result<()> {
@@ -2082,30 +2080,7 @@ impl Database {
             "#,
         )?;
 
-        let rows = stmt.query_map(params![folder_id], |row| {
-            let date_str: Option<String> = row.get(9)?;
-            let date = date_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc)));
-            let created_str: String = row.get(14)?;
-            let created_at = DateTime::parse_from_rfc3339(&created_str).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc::now());
-
-            Ok(MessageRecord {
-                id: row.get(0)?,
-                account_id: row.get(1)?,
-                folder_id: row.get(2)?,
-                uid: row.get(3)?,
-                message_id: row.get(4)?,
-                subject: row.get(5)?,
-                from_addr: row.get(6)?,
-                to_addrs: row.get(7)?,
-                cc_addrs: row.get(8)?,
-                date,
-                size_bytes: row.get(10)?,
-                relative_path: row.get(11)?,
-                sha256_hash: row.get(12)?,
-                is_remote_deleted: row.get::<_, i64>(13)? != 0,
-                created_at,
-            })
-        })?;
+        let rows = stmt.query_map(params![folder_id], message_from_row)?;
 
         let mut list = Vec::new();
         for r in rows {
@@ -2153,7 +2128,22 @@ impl Database {
         Ok(())
     }
 
+    /// Counts of the catalog, counted again only when the catalog has
+    /// changed since (here or in another process); see
+    /// [`Self::count_storage_stats`].
     pub fn get_storage_stats(&self) -> Result<StorageStats> {
+        let state = catalog_state(&self.conn.lock().unwrap())?;
+        if let Some((counted_in, stats)) = self.stats_cache.lock().unwrap().as_ref()
+            && *counted_in == state {
+            return Ok(stats.clone());
+        }
+        let stats = self.count_storage_stats()?;
+        *self.stats_cache.lock().unwrap() = Some((state, stats.clone()));
+        Ok(stats)
+    }
+
+    /// Counts of the catalog as they are now (a scan of every message).
+    pub fn count_storage_stats(&self) -> Result<StorageStats> {
         let conn = self.conn.lock().unwrap();
         let total_accounts: u32 = conn.query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))?;
         let total_folders: u32 = conn.query_row("SELECT COUNT(*) FROM folders", [], |r| r.get(0))?;
