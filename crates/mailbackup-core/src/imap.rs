@@ -773,15 +773,9 @@ impl ImapSyncEngine {
 
         // UIDs this generation already archived (an earlier, interrupted run)
         // need no fetch
-        let mut resolved: HashSet<u32> = HashSet::new();
-        let mut pending = Vec::new();
-        for &uid in &uids {
-            if self.db.message_exists_in_generation(&folder_rec.id, generation, uid)? {
-                resolved.insert(uid);
-            } else {
-                pending.push(uid);
-            }
-        }
+        let archived = self.db.archived_uids_above(&folder_rec.id, generation, last_uid)?;
+        let (done, mut pending): (Vec<u32>, Vec<u32>) = uids.iter().partition(|uid| archived.contains(uid));
+        let mut resolved: HashSet<u32> = done.into_iter().collect();
 
         info!("Folder '{}': {} new messages to download", folder_name, pending.len());
         progress.total_messages += pending.len() as u32;
