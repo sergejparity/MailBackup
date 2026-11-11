@@ -582,3 +582,29 @@ fn default_config_location_follows_the_home_folder() {
     assert_eq!(mailbackup_core::config::default_base_dir(), home.join(".mailbackup"));
     assert_eq!(mailbackup_core::config::default_config_path(), home.join(".mailbackup").join("config.yaml"));
 }
+
+
+/// Issue #73: retention right after upgrading a schema-3 catalog counts from
+/// when each row was archived. Every row of the fixture was archived on
+/// 2026-11-04 15:35 UTC, with mail dates from 6 October to 2 November.
+#[test]
+fn retention_after_the_upgrade_counts_from_the_archive_time() {
+    use mailbackup_core::retention::RetentionManager;
+    let (_dir, db, storage) = open_catalog();
+    let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc);
+    let count = |db: &Database| db.get_storage_stats().unwrap().total_messages;
+    assert_eq!(count(&db), 9);
+
+    // A day after archiving, a 30-day policy keeps everything, the mail
+    // dated 6 October (more than 30 days earlier) included
+    let report = RetentionManager::new(&db, &storage).enforce_retention_as_of("acct-live", Some(30), at("2026-11-05T15:35:28Z")).unwrap();
+    assert_eq!(report.pruned_count, 0);
+    assert_eq!(count(&db), 9);
+
+    // 31 days after archiving, every row of the account expires; other
+    // accounts (and the read-only archives) are untouched
+    let report = RetentionManager::new(&db, &storage).enforce_retention_as_of("acct-live", Some(30), at("2026-12-05T15:36:00Z")).unwrap();
+    assert_eq!(report.pruned_count, 6);
+    assert_eq!(count(&db), 3);
+    assert!(db.get_messages_archived_before("acct-moved", at("2027-01-01T00:00:00Z")).unwrap().len() == 1);
+}

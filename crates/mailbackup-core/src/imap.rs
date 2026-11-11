@@ -971,6 +971,9 @@ impl ImapSyncEngine {
         let usable = |path: &str, sha256: &str| {
             self.storage.read_eml(path).is_ok_and(|bytes| StorageEngine::compute_sha256(&bytes) == sha256)
         };
+        // Re-binds choose existing files: retention mustn't remove them
+        // before the new bindings are committed (issue #79)
+        let _storage_lock = self.storage.lock_shared()?;
         let mut rebound = 0usize;
         for &uid in pending {
             let (Some(id), Some(size)) = (ids.get(&uid), sizes.get(&uid)) else {
@@ -1053,6 +1056,7 @@ impl ImapSyncEngine {
                     return self.db.mark_id_rebind_verified(&p.message_id);
                 }
                 warn!("UID {} in '{}' doesn't hold the copy it was re-bound to by id; archiving what it holds", uid, target.folder_name);
+                let _storage_lock = self.storage.lock_shared()?;
                 let (stored, parsed) = self.store_new(target, uid, body, item.internal_date)?;
                 let rel_path = stored.relative_path.to_string_lossy().to_string();
                 let att_refs: Vec<(&str, &str, u64)> =
@@ -1365,6 +1369,11 @@ impl ImapSyncEngine {
             self.distrust(target, s.id.kind, &reason)?;
         }
 
+        // From choosing a file (an intact existing copy, or the one stored
+        // below) until its row is committed, retention mustn't remove it
+        // (issue #79)
+        let _storage_lock = self.storage.lock_shared()?;
+
         // Already archived under an earlier generation: bind that copy to
         // this UID instead of storing the message again, if its file is intact
         let usable = |path: &str| {
@@ -1379,7 +1388,7 @@ impl ImapSyncEngine {
             return Ok(());
         }
 
-        let (stored, parsed) = self.store_new(target, uid, raw_body, internal_date)?;
+        let (stored, parsed) = self.store_new_hashed(target, uid, raw_body, &sha256, internal_date)?;
         let rel_path = stored.relative_path.to_string_lossy().to_string();
         let att_refs: Vec<(&str, &str, u64)> = parsed.attachments.iter().map(|(n, m, s)| (n.as_str(), m.as_str(), *s)).collect();
         self.db.insert_new_message(&new_message(target, uid, &rel_path, &stored, &parsed, &att_refs, sourced))?;
@@ -1398,14 +1407,27 @@ impl ImapSyncEngine {
         raw_body: &[u8],
         internal_date: Option<DateTime<Utc>>,
     ) -> Result<(crate::storage::StoredMessageInfo, ParsedMessage)> {
+        self.store_new_hashed(target, uid, raw_body, &StorageEngine::compute_sha256(raw_body), internal_date)
+    }
+
+    /// [`Self::store_new`] for a body whose SHA-256 is already known.
+    fn store_new_hashed(
+        &self,
+        target: &FolderTarget<'_>,
+        uid: u32,
+        raw_body: &[u8],
+        sha256: &str,
+        internal_date: Option<DateTime<Utc>>,
+    ) -> Result<(crate::storage::StoredMessageInfo, ParsedMessage)> {
         let parsed = parse_message(raw_body, internal_date);
-        let stored = self.storage.store_eml_in_generation(
+        let stored = self.storage.store_eml_hashed(
             target.account.storage_namespace(),
             target.folder_name,
             uid,
             target.generation,
             parsed.date,
             raw_body,
+            sha256,
         )?;
         Ok((stored, parsed))
     }

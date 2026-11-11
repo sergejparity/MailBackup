@@ -21,7 +21,7 @@ Built with a modular architecture featuring:
 - **Mbox Export**: On-demand and scheduled export to standard RFC 4155 `.mbox` archives.
 - **Strictly Non-Destructive**: Never deletes messages from remote mail servers (`EXAMINE` read-only IMAP mode).
 - **SQLite Catalog & FTS5**: Sub-second full-text search across all accounts, subjects, senders, body texts, and attachment names.
-- **Configurable Retention**: Automatic local pruning policy (e.g. retain 90 days, 1 year, or keep forever).
+- **Configurable Retention**: Automatic local pruning policy (e.g. retain 90 days, 1 year, or keep forever). A message is removed that many days after MailBackup backed it up, never earlier because the mail carries an old date.
 - **Security**: OS Keyring integration (macOS Keychain, Windows Credential Manager, Linux Secret Service) with secure local fallback.
 
 ---
