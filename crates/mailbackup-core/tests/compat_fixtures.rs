@@ -390,28 +390,170 @@ fn open_catalog() -> (tempfile::TempDir, Database, StorageEngine) {
 #[test]
 fn catalog_opens_with_every_row_as_written() {
     let (dir, db, _) = open_catalog();
-    drop(db); // opened (and schema-checked) by the current code
+    drop(db); // opened (and upgraded) by the current code
     let conn = rusqlite::Connection::open(dir.path().join("mailbackup.db")).unwrap();
     let now = compat::catalog::snapshot(&conn);
     let written = read_json(&fixtures_root().join("catalog").join("snapshot.json"));
-    // Written at schema 3; opening upgrades it. Every object it had is kept
-    // exactly, and the only new ones are those of later schema versions
+    // Written at schema 3; opening upgrades it
     assert_eq!(written["user_version"], 3);
     assert_eq!(now["user_version"], mailbackup_core::db::SCHEMA_VERSION);
+
+    // Schema 5 rebuilt `messages` and the search index (issue #79); every
+    // other object is kept exactly as written
+    let rebuilt = |o: &serde_json::Value| {
+        let table = o["tbl_name"].as_str().unwrap();
+        table == "messages" || table.starts_with("messages_fts") || table == "sqlite_sequence"
+    };
     let (written_schema, now_schema) = (written["schema"].as_array().unwrap(), now["schema"].as_array().unwrap());
-    for object in written_schema {
+    for object in written_schema.iter().filter(|o| !rebuilt(o)) {
         assert!(now_schema.contains(object), "kept as written: {}", object);
     }
     let added: Vec<&str> = now_schema
         .iter()
-        .filter(|o| !written_schema.contains(o))
+        .filter(|o| !rebuilt(o) && !written_schema.contains(o))
         .map(|o| o["name"].as_str().unwrap())
         .collect();
-    // Schema 4 (issue #72)
-    assert_eq!(added, ["idx_skipped_messages_account", "sqlite_autoindex_skipped_messages_1", "skipped_messages"]);
-    for (table, rows) in written["tables"].as_object().unwrap() {
-        assert_eq!(&now["tables"][table], rows, "table {}", table);
+    // Schema 4 (issue #72), and the folder list index on attachments (#77)
+    assert_eq!(
+        added,
+        ["idx_attachments_message", "idx_skipped_messages_account", "sqlite_autoindex_skipped_messages_1", "skipped_messages"]
+    );
+    // The indexes on `messages` it had, recreated with the same definitions
+    for object in written_schema.iter().filter(|o| o["tbl_name"] == "messages" && o["name"].as_str().unwrap().starts_with("idx_")) {
+        assert!(now_schema.contains(object), "recreated as written: {}", object);
     }
+
+    for (table, rows) in written["tables"].as_object().unwrap() {
+        match table.as_str() {
+            // Every row and value as written, plus `seq` and `date_ts`
+            "messages" => {
+                let now_rows = now["tables"]["messages"].as_array().unwrap();
+                assert_eq!(now_rows.len(), rows.as_array().unwrap().len());
+                for (old, new) in rows.as_array().unwrap().iter().zip(now_rows) {
+                    let mut stripped = new.as_object().unwrap().clone();
+                    let date_ts = stripped.remove("date_ts").unwrap();
+                    assert!(stripped.remove("seq").unwrap().is_i64());
+                    assert_eq!(&serde_json::Value::Object(stripped), old);
+                    let date = old["date"].as_str().map(|d| chrono::DateTime::parse_from_rfc3339(d).unwrap().timestamp());
+                    assert_eq!(date_ts.as_i64(), date, "date_ts of {}", old["id"]);
+                }
+            }
+            // The same text for every message (index rowids are new)
+            "messages_fts" => {
+                let by_message = |rows: &serde_json::Value| -> std::collections::BTreeMap<String, serde_json::Value> {
+                    rows.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|r| {
+                            let mut r = r.as_object().unwrap().clone();
+                            r.remove("rowid");
+                            (r["message_id"].as_str().unwrap().to_string(), serde_json::Value::Object(r))
+                        })
+                        .collect()
+                };
+                assert_eq!(by_message(&now["tables"]["messages_fts"]), by_message(rows));
+            }
+            _ => assert_eq!(&now["tables"][table], rows, "table {}", table),
+        }
+    }
+}
+
+/// Issue #79: the schema-5 rebuild keeps every searchable term. Built on a
+/// copy of the v3 fixture whose old index is damaged the ways the issue
+/// lists: a message without an index row, two identical rows, two rows with
+/// different words, and a row of a message that no longer exists.
+#[test]
+fn the_index_rebuild_loses_no_searchable_term() {
+    let dir = copy_fixture(&fixtures_root().join("catalog"));
+    let path = dir.path().join("mailbackup.db");
+    let ids: Vec<String> = {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM messages ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let (missing, identical, differing) = (&ids[0], &ids[1], &ids[2]);
+        conn.execute("DELETE FROM messages_fts WHERE message_id = ?1", [missing]).unwrap();
+        conn.execute(
+            "INSERT INTO messages_fts (message_id, account_id, subject, from_addr, to_addrs, body_text, attachment_names)
+             SELECT message_id, account_id, subject, from_addr, to_addrs, body_text, attachment_names FROM messages_fts WHERE message_id = ?1",
+            [identical],
+        )
+        .unwrap();
+        conn.execute("UPDATE messages_fts SET body_text = 'quixotic longer text with many many words' WHERE message_id = ?1", [differing]).unwrap();
+        conn.execute(
+            "INSERT INTO messages_fts (message_id, account_id, subject, from_addr, to_addrs, body_text, attachment_names)
+             SELECT message_id, account_id, subject, from_addr, to_addrs, 'zephyr', attachment_names FROM messages_fts WHERE message_id = ?1",
+            [differing],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages_fts (message_id, account_id, subject, body_text) VALUES ('gone', 'acct-live', 'orphan', 'orphanword')",
+            [],
+        )
+        .unwrap();
+        ids
+    };
+
+    let db = Database::open(&path).unwrap();
+    let hits = |q: &str| -> Vec<String> { db.search_fts(q, 50).unwrap().into_iter().map(|r| r.message_id).collect() };
+    // Both bodies of the merged message are searchable, the shorter one too
+    assert_eq!(hits("zephyr"), [ids[2].clone()]);
+    assert_eq!(hits("quixotic"), [ids[2].clone()]);
+    // The message without an index row was indexed from its headers
+    let subject = db.get_message_by_id(&ids[0]).unwrap().unwrap().subject.unwrap();
+    assert!(hits(&subject).contains(&ids[0]), "{} finds {}", subject, ids[0]);
+    // The orphan is gone, and there is exactly one index row per message
+    assert!(hits("orphanword").is_empty());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let (rows, messages): (i64, i64) = (
+        conn.query_row("SELECT count(*) FROM messages_fts", [], |r| r.get(0)).unwrap(),
+        conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0)).unwrap(),
+    );
+    assert_eq!(rows, messages);
+    let identical_text: String = conn
+        .query_row("SELECT f.subject FROM messages_fts f JOIN messages m ON m.seq = f.rowid WHERE m.id = ?1", [&ids[1]], |r| r.get(0))
+        .unwrap();
+    assert!(!identical_text.contains('\n'), "identical rows are kept once: {:?}", identical_text);
+
+    // The documented limitation: a phrase can match across the joint
+    assert_eq!(hits("\"many words zephyr\""), [ids[2].clone()]);
+
+    // The index survives VACUUM: rowids are the explicit `seq`
+    conn.execute_batch("VACUUM").unwrap();
+    drop(conn);
+    assert_eq!(hits("zephyr"), [ids[2].clone()]);
+}
+
+/// A migration that fails changes nothing: here the catalog has a broken
+/// reference, which the foreign-key check before commit refuses.
+#[test]
+fn a_failed_schema_5_migration_leaves_the_catalog_as_it_was() {
+    let dir = copy_fixture(&fixtures_root().join("catalog"));
+    let path = dir.path().join("mailbackup.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // Enforced by default in this build of SQLite: off, to plant the damage
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO attachments (id, message_id, filename, mime_type, size_bytes) VALUES ('x', 'no-such-message', 'a.pdf', 'application', 1)",
+            [],
+        )
+        .unwrap();
+    }
+    let before = compat::catalog::snapshot(&rusqlite::Connection::open(&path).unwrap());
+    assert!(Database::open(&path).is_err());
+    let after = compat::catalog::snapshot(&rusqlite::Connection::open(&path).unwrap());
+    // Earlier steps (schema 4's new table) commit on their own; the schema-5
+    // rebuild didn't: messages and the old index are exactly as before
+    assert_eq!(after["tables"]["messages"], before["tables"]["messages"]);
+    assert_eq!(after["tables"]["messages_fts"], before["tables"]["messages_fts"]);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert!(conn.prepare("SELECT message_id FROM messages_fts LIMIT 0").is_ok(), "the old index shape");
+    assert!(conn.prepare("SELECT seq FROM messages LIMIT 0").is_err(), "the old messages table");
 }
 
 #[test]

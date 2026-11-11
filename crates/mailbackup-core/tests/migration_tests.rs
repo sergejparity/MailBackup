@@ -142,7 +142,9 @@ fn a_v0_catalog_is_migrated_with_everything_intact() {
     let indexes: i64 = conn
         .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages' AND name LIKE 'idx_%'", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(indexes, 5, "indexes recreated, plus the server id one");
+    // The four recreated, the server id one (schema 3), the path, numeric
+    // date and three folder list ones (schema 5)
+    assert_eq!(indexes, 10, "indexes recreated, plus the later ones");
     // Deleting the message still cascades to its attachment
     conn.execute_batch("PRAGMA foreign_keys = ON; DELETE FROM messages WHERE id = 'm1';").unwrap();
     let left: i64 = conn.query_row("SELECT COUNT(*) FROM attachments", [], |r| r.get(0)).unwrap();
