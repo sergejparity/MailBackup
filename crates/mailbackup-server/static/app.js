@@ -841,7 +841,10 @@ function initEventListeners() {
   if (el.sortSelect) {
     el.sortSelect.addEventListener('change', (e) => {
       state.currentSort = e.target.value;
-      renderMessages(state.messages);
+      // A folder is sorted by the server, from its first page; search
+      // results (one bounded list) are sorted here
+      if (state.folderList) loadFolderMessages(state.folderList.folderId);
+      else renderMessages(state.messages);
     });
   }
 
@@ -1467,16 +1470,86 @@ async function selectFolder(folder) {
   await loadFolderMessages(folder.id);
 }
 
-async function loadFolderMessages(folderId) {
-  el.emailItemsContainer.innerHTML = `<div class="empty-state"><p>Loading messages...</p></div>`;
+// The folder list is loaded a page at a time, in the order the server
+// sorts it (issue #77). Each load has a number; a response is used only if
+// it belongs to the folder and order still shown, so a slow page of one
+// folder is never added to another.
+const FOLDER_SORTS = { newest: ['date', 'desc'], oldest: ['date', 'asc'], sender: ['sender', 'asc'], subject: ['subject', 'asc'] };
+const FOLDER_PAGE_SIZE = 200;
+let folderListRequest = 0;
+
+// Leaves the paged folder list (a search replaces it): its pages in flight
+// are ignored and nothing more is loaded
+function leaveFolderList() {
+  state.folderList = null;
+  folderListRequest += 1;
+}
+
+async function loadFolderMessages(folderId, append = false) {
+  if (!append || !state.folderList || state.folderList.folderId !== folderId) {
+    state.folderList = { folderId, cursor: null, total: null, loading: false, done: false };
+    state.messages = [];
+    el.emailItemsContainer.innerHTML = `<div class="empty-state"><p>Loading messages...</p></div>`;
+    append = false;
+  }
+  const list = state.folderList;
+  if (list.loading || list.done) return;
+  list.loading = true;
+  const request = ++folderListRequest;
+  const [sort, order] = FOLDER_SORTS[state.currentSort] || FOLDER_SORTS.newest;
+  const params = new URLSearchParams({ sort, order, limit: String(FOLDER_PAGE_SIZE) });
+  if (append && list.cursor) params.set('cursor', list.cursor);
+  const current = () => request === folderListRequest && state.folderList === list;
   try {
-    const res = await fetch(`/api/folders/${folderId}/messages`);
-    if (!res.ok) return;
-    state.messages = await res.json();
-    renderMessages(state.messages);
+    const res = await fetch(`/api/folders/${encodeURIComponent(folderId)}/messages?${params.toString()}`);
+    if (!current()) return;
+    if (!res.ok) {
+      // A cursor the server no longer accepts: start over from the top
+      if (res.status === 400 && append) {
+        list.loading = false;
+        loadFolderMessages(folderId);
+      }
+      return;
+    }
+    const page = await res.json();
+    if (!current()) return;
+    list.cursor = page.next_cursor;
+    list.done = !page.next_cursor;
+    const grew = list.total !== null && page.total > list.total;
+    list.total = page.total;
+    showFolderCount(page.total, grew);
+    state.messages = state.messages.concat(page.messages);
+    renderMessages(page.messages, { append, serverSorted: true });
   } catch (err) {
     console.error('Failed to load messages:', err);
+  } finally {
+    list.loading = false;
   }
+}
+
+// The folder's message count; when it grew while the list was open, a way
+// to see the new mail (pages already shown don't change)
+function showFolderCount(total, grew) {
+  el.folderMsgCount.textContent = `${total.toLocaleString()} messages`;
+  if (!grew) return;
+  const reload = document.createElement('button');
+  reload.type = 'button';
+  reload.className = 'btn btn-sm btn-ghost';
+  reload.textContent = 'New messages, reload';
+  reload.addEventListener('click', () => state.folderList && loadFolderMessages(state.folderList.folderId));
+  el.folderMsgCount.append(' · ', reload);
+}
+
+// Loads the next page when the end of the list scrolls into view
+const folderListSentinel = document.createElement('div');
+folderListSentinel.className = 'folder-list-sentinel';
+folderListSentinel.style.height = '1px';
+if ('IntersectionObserver' in window) {
+  new IntersectionObserver((entries) => {
+    if (entries.some((e) => e.isIntersecting) && state.folderList && !state.folderList.done) {
+      loadFolderMessages(state.folderList.folderId, true);
+    }
+  }, { root: el.emailItemsContainer, rootMargin: '400px' }).observe(folderListSentinel);
 }
 
 function formatMailDateTime(rawDate) {
@@ -1492,9 +1565,9 @@ function formatMailDateTime(rawDate) {
   });
 }
 
-function renderMessages(messages) {
-  el.emailItemsContainer.innerHTML = '';
-  if (!messages || messages.length === 0) {
+function renderMessages(messages, { append = false, serverSorted = false } = {}) {
+  if (!append) el.emailItemsContainer.innerHTML = '';
+  if (!append && (!messages || messages.length === 0)) {
     el.emailItemsContainer.innerHTML = `
       <div class="empty-state">
         <div class="empty-icon">📭</div>
@@ -1505,8 +1578,9 @@ function renderMessages(messages) {
     return;
   }
 
-  const sorted = applySort(messages);
+  const sorted = serverSorted ? messages : applySort(messages);
 
+  folderListSentinel.remove();
   sorted.forEach(msg => {
     const card = document.createElement('div');
     card.className = `email-card ${msg.id === state.selectedMessageId ? 'active' : ''}`;
@@ -1526,6 +1600,10 @@ function renderMessages(messages) {
     card.addEventListener('click', () => selectMessage(msg.id));
     el.emailItemsContainer.appendChild(card);
   });
+  // More pages of the folder: watch the end of the list
+  if (serverSorted && state.folderList && !state.folderList.done) {
+    el.emailItemsContainer.appendChild(folderListSentinel);
+  }
 }
 
 async function selectMessage(messageId) {
@@ -1627,6 +1705,7 @@ async function selectMessage(messageId) {
 }
 
 async function performSearch(query) {
+  leaveFolderList();
   el.currentFolderTitle.textContent = `Search: "${query}"`;
   el.emailItemsContainer.innerHTML = `<div class="empty-state"><p>Searching across all archives...</p></div>`;
 
@@ -1854,6 +1933,7 @@ async function handleAdvancedSearchSubmit(e) {
 }
 
 async function executeAdvancedSearch(params, desc) {
+  leaveFolderList();
   if (el.globalSearch) el.globalSearch.value = '';
   el.currentFolderTitle.innerHTML = desc
     ? `<span>Filtered: ${escapeHtml(desc)}</span> <button type="button" class="btn-clear-search" id="btn-clear-search" title="Clear search and return to mailbox">✕ Clear</button>`

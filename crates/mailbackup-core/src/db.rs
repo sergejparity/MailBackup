@@ -131,11 +131,109 @@ fn messages_fts_v5_ddl(table: &str) -> String {
     )
 }
 
-/// Indexes that need schema-5 columns.
+/// Indexes that need schema-5 columns. The `folder_*` ones serve the paged
+/// folder list (issue #77): each is exactly the order of one [`ListSort`],
+/// so a page is read straight from the index.
 const V5_INDEXES: &str = r#"
             CREATE INDEX IF NOT EXISTS idx_messages_path ON messages(relative_path);
             CREATE INDEX IF NOT EXISTS idx_messages_date_ts ON messages(date_ts);
+            CREATE INDEX IF NOT EXISTS idx_messages_folder_date ON messages(folder_id, COALESCE(date_ts, -9223372036854775807), seq);
+            CREATE INDEX IF NOT EXISTS idx_messages_folder_sender ON messages(folder_id, COALESCE(from_addr, '') COLLATE NOCASE, seq);
+            CREATE INDEX IF NOT EXISTS idx_messages_folder_subject ON messages(folder_id, COALESCE(subject, '') COLLATE NOCASE, seq);
+            CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 "#;
+
+/// An order of the folder list (issue #77). Each is total: it ends in a
+/// column that is unique per row, so pages never overlap or skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListSort {
+    /// By `date_ts`, then `seq`. Messages without a date sort as the oldest:
+    /// last when newest come first, first when oldest come first.
+    Date,
+    /// By UID generation, then UID (unique within a generation).
+    Uid,
+    /// By sender, case-insensitively, then `seq`.
+    Sender,
+    /// By subject, case-insensitively, then `seq`.
+    Subject,
+}
+
+impl ListSort {
+    pub fn parse(s: &str) -> Option<ListSort> {
+        match s {
+            "date" => Some(ListSort::Date),
+            "uid" => Some(ListSort::Uid),
+            "sender" => Some(ListSort::Sender),
+            "subject" => Some(ListSort::Subject),
+            _ => None,
+        }
+    }
+
+    /// The order's key, as SQL expressions over `messages` (no alias, so
+    /// they match the index expressions exactly).
+    fn keys(self) -> &'static [&'static str] {
+        match self {
+            ListSort::Date => &["COALESCE(date_ts, -9223372036854775807)", "seq"],
+            ListSort::Uid => &["uid_generation", "uid"],
+            ListSort::Sender => &["COALESCE(from_addr, '') COLLATE NOCASE", "seq"],
+            ListSort::Subject => &["COALESCE(subject, '') COLLATE NOCASE", "seq"],
+        }
+    }
+}
+
+/// One row of the folder list: what the list shows, nothing more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageListItem {
+    pub id: String,
+    pub uid: u32,
+    pub subject: Option<String>,
+    pub from_addr: Option<String>,
+    pub date: Option<DateTime<Utc>>,
+    pub size_bytes: u64,
+    pub is_remote_deleted: bool,
+    pub has_attachments: bool,
+}
+
+/// A page of the folder list.
+#[derive(Debug, Clone, Serialize)]
+pub struct MessagePage {
+    pub messages: Vec<MessageListItem>,
+    /// Where the next page starts; `None` on the last page.
+    pub next_cursor: Option<String>,
+    /// Messages in the folder now.
+    pub total: u64,
+}
+
+/// What a cursor encodes: the request it belongs to and the order key of
+/// the last row returned.
+#[derive(Debug, Serialize, Deserialize)]
+struct CursorData {
+    f: String,
+    s: ListSort,
+    d: bool,
+    k: Vec<serde_json::Value>,
+}
+
+fn invalid_cursor() -> crate::Error {
+    crate::Error::InvalidInput("The page cursor doesn't belong to this folder and order; load the list again".to_string())
+}
+
+fn sql_to_json(v: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
+    match v {
+        rusqlite::types::ValueRef::Integer(n) => serde_json::Value::from(n),
+        rusqlite::types::ValueRef::Text(t) => serde_json::Value::from(String::from_utf8_lossy(t).into_owned()),
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn json_to_sql(v: &serde_json::Value) -> Result<rusqlite::types::Value> {
+    match v {
+        serde_json::Value::Number(n) => n.as_i64().map(rusqlite::types::Value::Integer).ok_or_else(invalid_cursor),
+        serde_json::Value::String(s) => Ok(rusqlite::types::Value::Text(s.clone())),
+        _ => Err(invalid_cursor()),
+    }
+}
 
 /// What the schema-5 migration did with the old search index (logged).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1168,6 +1266,109 @@ impl Database {
         )?;
         let paths = stmt.query_map(params![account_id, folder_id], |r| r.get(0))?;
         Ok(paths.collect::<rusqlite::Result<Vec<String>>>()?)
+    }
+
+    /// A page of a folder's messages in `sort` order (`descending` reverses
+    /// it), starting after `cursor` (from the previous page of the same
+    /// folder, sort and direction; anything else is `InvalidInput`).
+    ///
+    /// Keyset paging: a message that exists while the folder is paged
+    /// appears exactly once; one added at a position already passed shows on
+    /// the next load from the first page, not later in this one.
+    pub fn list_folder_messages(
+        &self,
+        folder_id: &str,
+        sort: ListSort,
+        descending: bool,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<MessagePage> {
+        use base64::Engine;
+        let limit = limit.clamp(1, 1000);
+        let after: Option<Vec<rusqlite::types::Value>> = match cursor.filter(|c| !c.is_empty()) {
+            None => None,
+            Some(c) => {
+                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(c).map_err(|_| invalid_cursor())?;
+                let data: CursorData = serde_json::from_slice(&bytes).map_err(|_| invalid_cursor())?;
+                if data.f != folder_id || data.s != sort || data.d != descending || data.k.len() != sort.keys().len() {
+                    return Err(invalid_cursor());
+                }
+                Some(data.k.iter().map(json_to_sql).collect::<Result<_>>()?)
+            }
+        };
+
+        let keys = sort.keys();
+        let dir = if descending { "DESC" } else { "ASC" };
+        let order: Vec<String> = keys.iter().map(|k| format!("{} {}", k, dir)).collect();
+        let mut sql = format!(
+            "SELECT id, uid, subject, from_addr, date, size_bytes, is_remote_deleted,
+                    EXISTS(SELECT 1 FROM attachments a WHERE a.message_id = messages.id), {}
+             FROM messages WHERE folder_id = ?",
+            keys.join(", ")
+        );
+        let mut args: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Text(folder_id.to_string())];
+        if let Some(values) = after {
+            let placeholders = vec!["?"; values.len()].join(", ");
+            sql.push_str(&format!(" AND ({}) {} ({})", keys.join(", "), if descending { "<" } else { ">" }, placeholders));
+            args.extend(values);
+        }
+        sql.push_str(&format!(" ORDER BY {} LIMIT ?", order.join(", ")));
+        // One more than asked: tells whether there is a next page
+        args.push(rusqlite::types::Value::Integer(i64::from(limit) + 1));
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(args))?;
+        let mut messages = Vec::new();
+        let mut last_key = None;
+        let mut more = false;
+        while let Some(r) = rows.next()? {
+            if messages.len() == limit as usize {
+                more = true;
+                break;
+            }
+            let date_str: Option<String> = r.get(4)?;
+            messages.push(MessageListItem {
+                id: r.get(0)?,
+                uid: r.get(1)?,
+                subject: r.get(2)?,
+                from_addr: r.get(3)?,
+                date: date_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
+                size_bytes: r.get::<_, i64>(5)? as u64,
+                is_remote_deleted: r.get::<_, i64>(6)? != 0,
+                has_attachments: r.get::<_, i64>(7)? != 0,
+            });
+            last_key = Some((0..keys.len()).map(|i| r.get_ref(8 + i).map(sql_to_json)).collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        drop(rows);
+        let total: u64 = conn.query_row("SELECT count(*) FROM messages WHERE folder_id = ?1", params![folder_id], |r| r.get(0))?;
+        let next_cursor = match (more, last_key) {
+            (true, Some(k)) => {
+                let data = CursorData { f: folder_id.to_string(), s: sort, d: descending, k };
+                Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&data).expect("serializable")))
+            }
+            _ => None,
+        };
+        Ok(MessagePage { messages, next_cursor, total })
+    }
+
+    /// The query plan of a page query, for tests that check it is read
+    /// from its index.
+    #[doc(hidden)]
+    pub fn explain_folder_page(&self, sort: ListSort, descending: bool, with_cursor: bool) -> Result<Vec<String>> {
+        let keys = sort.keys();
+        let dir = if descending { "DESC" } else { "ASC" };
+        let order: Vec<String> = keys.iter().map(|k| format!("{} {}", k, dir)).collect();
+        let mut sql = format!("EXPLAIN QUERY PLAN SELECT id, {} FROM messages WHERE folder_id = 'f'", keys.join(", "));
+        if with_cursor {
+            let placeholders = vec!["0"; keys.len()].join(", ");
+            sql.push_str(&format!(" AND ({}) {} ({})", keys.join(", "), if descending { "<" } else { ">" }, placeholders));
+        }
+        sql.push_str(&format!(" ORDER BY {} LIMIT 200", order.join(", ")));
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let plan = stmt.query_map([], |r| r.get::<_, String>(3))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(plan)
     }
 
     /// Whether the catalog knows `name` as an account id or as a name a

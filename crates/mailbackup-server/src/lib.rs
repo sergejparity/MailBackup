@@ -1692,13 +1692,45 @@ async fn api_get_server_id_states(
     }
 }
 
+#[derive(Deserialize, Default)]
+struct MessagePageQuery {
+    /// `date` (default), `uid`, `sender` or `subject`
+    sort: Option<String>,
+    /// `desc` (default) or `asc`
+    order: Option<String>,
+    /// Rows per page, 1–1000 (default 200)
+    limit: Option<u32>,
+    /// `next_cursor` of the previous page
+    cursor: Option<String>,
+}
+
+/// A page of a folder's messages (issue #77): `{messages, next_cursor, total}`.
+/// Only what the list shows; the detail comes from `/api/messages/{id}`.
 async fn api_get_messages(
     State(state): State<AppState>,
     Path(folder_id): Path<String>,
+    Query(query): Query<MessagePageQuery>,
 ) -> impl IntoResponse {
-    match state.db.get_messages_for_folder(&folder_id) {
-        Ok(messages) => Json(messages).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    let sort = match query.sort.as_deref().map(mailbackup_core::db::ListSort::parse) {
+        None => mailbackup_core::db::ListSort::Date,
+        Some(Some(sort)) => sort,
+        Some(None) => return (StatusCode::BAD_REQUEST, "sort must be date, uid, sender or subject").into_response(),
+    };
+    let descending = match query.order.as_deref() {
+        None | Some("desc") => true,
+        Some("asc") => false,
+        Some(_) => return (StatusCode::BAD_REQUEST, "order must be asc or desc").into_response(),
+    };
+    let limit = query.limit.unwrap_or(200);
+    let db = state.db.clone();
+    let page = tokio::task::spawn_blocking(move || {
+        db.list_folder_messages(&folder_id, sort, descending, limit, query.cursor.as_deref())
+    })
+    .await
+    .unwrap_or_else(|e| Err(mailbackup_core::Error::Other(format!("listing task failed: {}", e))));
+    match page {
+        Ok(page) => Json(page).into_response(),
+        Err(e) => (error_status(&e), e.to_string()).into_response(),
     }
 }
 
@@ -5025,6 +5057,41 @@ mod tests {
             assert_eq!(res.status(), StatusCode::OK, "{}", page);
             assert!(res.headers().get(header::ETAG).is_none(), "{}", page);
             assert_eq!(res.headers().get(header::CACHE_CONTROL).unwrap(), "no-store", "{}", page);
+        }
+    }
+
+    // ---- Paged folder list (issue #77) ----
+
+    #[tokio::test]
+    async fn the_folder_list_is_paged_and_validates_its_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = archive_state(dir.path()).await;
+        let folder = state.db.get_folders("acc").unwrap().remove(0);
+        for uid in 2..=5u32 {
+            state
+                .db
+                .insert_message("acc", &folder.id, uid, None, Some("m"), None, None, None, None, 1, &format!("p{}", uid), "h", None, &[])
+                .unwrap();
+        }
+        let router = create_router(state.clone());
+        let uri = |q: &str| format!("/api/folders/{}/messages{}", folder.id, q);
+
+        let (status, body) = send(&router, "GET", &uri("?limit=2&sort=uid&order=asc"), serde_json::json!(null)).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["total"], 5);
+        assert_eq!(page["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(page["messages"][0]["uid"], 1);
+        assert!(page["messages"][0].get("relative_path").is_none(), "only what the list shows");
+        let cursor = page["next_cursor"].as_str().unwrap().to_string();
+
+        let (_, body) = send(&router, "GET", &uri(&format!("?limit=2&sort=uid&order=asc&cursor={}", cursor)), serde_json::json!(null)).await;
+        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["messages"][0]["uid"], 3);
+
+        for bad in ["?sort=size", "?order=up", &format!("?sort=date&cursor={}", cursor)] {
+            let (status, body) = send(&router, "GET", &uri(bad), serde_json::json!(null)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{}: {}", bad, body);
         }
     }
 }
