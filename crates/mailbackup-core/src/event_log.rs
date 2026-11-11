@@ -199,8 +199,21 @@ pub fn rotate_and_prune_logs(retention_days: Option<u32>) -> Result<LogRotationR
     })
 }
 
-/// Checks whether events.log contains logs from a previous day, and rotates if so
+/// The day this process last checked for rotation (issue #79): the check
+/// reads the log file, and every event would otherwise repeat it.
+static LAST_ROTATION_CHECK: std::sync::Mutex<Option<NaiveDate>> = std::sync::Mutex::new(None);
+
+/// Checks whether events.log contains logs from a previous day, and rotates
+/// if so. Done at most once a day per process.
 pub fn check_and_rotate_daily() {
+    let today = Utc::now().date_naive();
+    {
+        let mut last = LAST_ROTATION_CHECK.lock().unwrap_or_else(|e| e.into_inner());
+        if *last == Some(today) {
+            return;
+        }
+        *last = Some(today);
+    }
     let active_path = log_file_path();
     if !active_path.exists() {
         return;
@@ -213,7 +226,6 @@ pub fn check_and_rotate_daily() {
         return;
     }
 
-    let today = Utc::now().date_naive();
     if let Some(log_date) = detect_log_file_date(&active_path)
         && log_date < today {
         let _ = rotate_active_log();

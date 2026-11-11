@@ -569,6 +569,9 @@ fn scan_archive_level(dir: &Path, level: usize) -> ArchiveScan {
             } else {
                 scan.all_conform = false;
             }
+        } else if file_type.is_file() && level == 0 && name == crate::storage::STORAGE_LOCK_FILE {
+            // MailBackup's own lock file: neither content nor foreign
+            scan.accepted.push(path);
         } else if file_type.is_file() && ((level == 4 && is_eml_name(&name)) || (staging && is_staging_name(&name))) {
             scan.accepted.push(path);
             scan.has_content = true;

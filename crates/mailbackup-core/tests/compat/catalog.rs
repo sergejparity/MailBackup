@@ -26,10 +26,17 @@ pub fn snapshot(conn: &rusqlite::Connection) -> Value {
     for table in TABLES {
         tables.insert(table.to_string(), rows(conn, &format!("SELECT * FROM {} ORDER BY rowid", table)));
     }
-    tables.insert(
-        "messages_fts".to_string(),
-        rows(conn, "SELECT rowid, message_id, account_id, subject, from_addr, to_addrs, body_text, attachment_names FROM messages_fts ORDER BY rowid"),
-    );
+    // Schema 5 (issue #79) links the index by `messages.seq` instead of
+    // keeping the message id in it: read it back by message id either way
+    let old_shape = conn
+        .prepare("SELECT message_id FROM messages_fts LIMIT 0")
+        .is_ok();
+    let fts = if old_shape {
+        "SELECT rowid, message_id, account_id, subject, from_addr, to_addrs, body_text, attachment_names FROM messages_fts ORDER BY rowid"
+    } else {
+        "SELECT f.rowid AS rowid, m.id AS message_id, m.account_id AS account_id, f.subject, f.from_addr, f.to_addrs, f.body_text, f.attachment_names FROM messages_fts f JOIN messages m ON m.seq = f.rowid ORDER BY f.rowid"
+    };
+    tables.insert("messages_fts".to_string(), rows(conn, fts));
     json!({ "user_version": user_version, "schema": schema, "tables": tables })
 }
 
