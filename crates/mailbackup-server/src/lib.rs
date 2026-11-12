@@ -711,7 +711,16 @@ impl Drop for ClosingListener {
         // Fields are dropped only after this returns, so close the socket and
         // remove the runtime file first: once `closed` fires, the port is free
         // and a new runtime file for it can't be removed by this one
-        drop(self.inner.take());
+        if let Some(socket) = self.inner.take() {
+            // A child this process is spawning holds a copy of the socket from
+            // `fork` until its `exec`, and closing ours alone would leave the
+            // port listening until then: a stop wouldn't free it, and an
+            // immediate start on the same port would fail. Shutting the
+            // listening socket down stops it for every copy.
+            #[cfg(target_os = "linux")]
+            let _ = socket2::SockRef::from(&socket).shutdown(std::net::Shutdown::Both);
+            drop(socket);
+        }
         drop(self.published.take());
         if let Some(closed) = self.closed.take() {
             let _ = closed.send(());
@@ -4025,6 +4034,8 @@ mod tests {
         for _ in 0..20 {
             let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = socket.local_addr().unwrap().port();
+            #[cfg(target_os = "linux")]
+            let inode = socket_inode(&socket);
             let identity = runtime::ServerIdentity::new(port);
             let published = runtime::PublishedRuntime::publish(dir.path(), &identity).unwrap();
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -4033,9 +4044,47 @@ mod tests {
             let dropper = std::thread::spawn(move || drop(listener));
             rx.await.unwrap();
             assert!(!runtime::runtime_path(dir.path(), port).exists(), "runtime file gone before the signal");
+            #[cfg(target_os = "linux")]
+            assert!(!process_holds_socket(&inode), "socket closed before the signal");
             assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(), "port free before the signal");
             dropper.join().unwrap();
         }
+    }
+
+    // What a child gets from `fork` until its `exec`: a copy of the socket.
+    // Stopping must still free the port at once, for a start right after it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_stop_frees_the_port_while_a_copy_of_the_socket_is_open() {
+        use std::os::fd::AsFd;
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let inherited = socket.as_fd().try_clone_to_owned().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(ClosingListener { inner: Some(socket), published: None, closed: Some(tx) });
+        rx.await.unwrap();
+        let refused = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused, "nothing listens");
+        let again = tokio::net::TcpListener::bind(("127.0.0.1", port)).await;
+        assert!(again.is_ok(), "the port can be bound again: {:?}", again.err());
+        drop(inherited);
+    }
+
+    /// The kernel name of `socket` (`socket:[<inode>]`), shared by every
+    /// descriptor that refers to it.
+    #[cfg(target_os = "linux")]
+    fn socket_inode(socket: &tokio::net::TcpListener) -> std::path::PathBuf {
+        use std::os::fd::AsRawFd;
+        std::fs::read_link(format!("/proc/self/fd/{}", socket.as_raw_fd())).unwrap()
+    }
+
+    /// True if any descriptor of this process still refers to the socket.
+    #[cfg(target_os = "linux")]
+    fn process_holds_socket(inode: &std::path::Path) -> bool {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|target| target == inode))
     }
 
     // Multi-threaded: the handshake check blocks while the listener answers
@@ -4368,7 +4417,8 @@ mod tests {
         state.config.write().await.accounts.push(acc.clone());
         state.config.read().await.save(&state.config_path).unwrap();
         state.credentials.set_account_password(&acc, "old").unwrap();
-        let raw = b"From: a@example.com\r\nSubject: Archived one\r\n\r\nbody\r\n";
+        // A Date header keeps mbox envelope lines (otherwise "now") reproducible
+        let raw = b"From: a@example.com\r\nDate: Fri, 01 Jan 2021 09:05:03 +0000\r\nSubject: Archived one\r\n\r\nbody\r\n";
         let stored = state.storage.store_eml("acc", "INBOX", 1, None, raw).unwrap();
         let folder = state.db.begin_folder_sync("acc", "INBOX", "INBOX", Some(1), &acc.remote_identity()).unwrap().folder;
         state
@@ -4992,7 +5042,14 @@ mod tests {
         // A few more messages, so the stream has several chunks
         let folder = state.db.get_folders("acc").unwrap().remove(0);
         for uid in 2..40u32 {
-            let raw = format!("From: a@example.com\r\nSubject: m{}\r\n\r\n{}\r\nFrom the start\r\n", uid, "x".repeat(20_000)).into_bytes();
+            // Dated: without a Date header the envelope line says "now", and
+            // the two exports below may run in different seconds
+            let raw = format!(
+                "From: a@example.com\r\nDate: Fri, 01 Jan 2021 09:05:03 +0000\r\nSubject: m{}\r\n\r\n{}\r\nFrom the start\r\n",
+                uid,
+                "x".repeat(20_000)
+            )
+            .into_bytes();
             let stored = state.storage.store_eml("acc", "INBOX", uid, None, &raw).unwrap();
             state
                 .db
