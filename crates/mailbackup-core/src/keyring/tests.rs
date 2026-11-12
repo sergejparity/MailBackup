@@ -202,7 +202,10 @@ fn damaged_stores_are_reported_and_never_overwritten() {
 
     let mut tampered_entry = good.clone();
     let entry = tampered_entry["entries"]["account:acc"].as_str().unwrap().to_string();
-    tampered_entry["entries"]["account:acc"] = serde_json::json!(format!("{}00", &entry[..entry.len() - 2]));
+    // Always change the last hex digit (of the random auth tag): writing a fixed
+    // "00" over it left the entry intact whenever the tag ended in 0x00.
+    let flipped = if entry.ends_with('0') { '1' } else { '0' };
+    tampered_entry["entries"]["account:acc"] = serde_json::json!(format!("{}{}", &entry[..entry.len() - 1], flipped));
     let mut plaintext_entry = good.clone();
     plaintext_entry["entries"]["account:acc"] = serde_json::json!("plain");
     let mut newer = good.clone();
