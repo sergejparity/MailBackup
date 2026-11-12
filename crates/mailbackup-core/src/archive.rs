@@ -46,12 +46,15 @@ pub struct Switched {
 
 /// Retires `account_id`'s archive and moves the account to `conn`, saving the
 /// config to `config_path`. `config` is the caller's in-memory config; it is
-/// updated only if the switch commits.
+/// updated only if the switch commits. The caller holds the config lock
+/// (`_lock`) and reloaded `config` under it, so the save keeps what other
+/// processes saved.
 pub fn start_new_archive(
     db: &Database,
     credentials: &CredentialStore,
     config: &mut AppConfig,
     config_path: &Path,
+    _lock: &crate::config::ConfigLock,
     account_id: &str,
     conn: &NewConnection<'_>,
 ) -> Result<Switched> {

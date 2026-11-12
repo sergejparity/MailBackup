@@ -281,6 +281,8 @@ fn a_csv_update_changes_only_what_the_row_may_change() {
         a.enabled = false;
         a.folder_filter.exclude = vec!["Kept".to_string()];
     }
+    // The update starts from the config file, so the setup is saved
+    cfg.save(&e.config_path).unwrap();
     let before = cfg.account_by_id(&account.id).unwrap().clone();
     let csv = "email,password,name,server,port,username,schedule\nme@example.com,new-pw,Renamed,mail.other.org,143,login,0 4 * * *\n";
     let row = &parse_accounts_csv(csv).valid_accounts[0];
@@ -307,6 +309,7 @@ fn a_csv_update_never_touches_an_archive() {
     let account = create(&e, &mut cfg, new("me@example.com", "pw")).unwrap();
     cfg.account_by_id_mut(&account.id).unwrap().archive =
         Some(ArchiveInfo { archived_at: chrono::Utc::now(), retired_from: "x".into(), last_source: None });
+    cfg.save(&e.config_path).unwrap();
     let row = &parse_accounts_csv("email,password\nme@example.com,other\n").valid_accounts[0];
     let err = accounts::update_from_row(&mut cfg, &e.config_path, &e.credentials, &account.id, row).unwrap_err();
     assert!(matches!(err, Error::AccountArchived(_)));
@@ -327,4 +330,71 @@ fn lookups_by_address_are_never_ambiguous() {
     assert_eq!(cfg.get_account("one@example.com").unwrap().id, two.id, "an id wins over an address");
     assert_eq!(cfg.account_by_id(&one.id).unwrap().email, "one@example.com");
     assert!(cfg.account_by_id("two@example.com").is_none(), "exact lookups don't match addresses");
+}
+
+/// Every config writer changes the file as it is under the config lock, so
+/// concurrent writers (here threads, as separate processes would be) never
+/// drop each other's changes (review of #83).
+#[test]
+fn concurrent_config_updates_all_survive() {
+    let e = env();
+    config(&e.root).save(&e.config_path).unwrap();
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let path = e.config_path.clone();
+            std::thread::spawn(move || {
+                AppConfig::update(&path, |cfg| {
+                    cfg.settings.approved_dirs.push(std::path::PathBuf::from(format!("/approved/{}", i)));
+                    Ok(())
+                })
+                .unwrap();
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let saved = AppConfig::load_existing(&e.config_path).unwrap().unwrap();
+    assert_eq!(saved.settings.approved_dirs.len(), 8, "{:?}", saved.settings.approved_dirs);
+}
+
+#[test]
+fn a_failed_config_update_leaves_the_file_as_it_was() {
+    let e = env();
+    config(&e.root).save(&e.config_path).unwrap();
+    let before = std::fs::read_to_string(&e.config_path).unwrap();
+    let err = AppConfig::update(&e.config_path, |cfg| -> mailbackup_core::Result<()> {
+        cfg.settings.log_retention_days = Some(3);
+        Err(Error::Other("refused".into()))
+    });
+    assert!(err.is_err());
+    // An invalid setting is refused by the check before saving
+    let err = AppConfig::update(&e.config_path, |cfg| {
+        cfg.settings.imap_max_message_mb = Some(0);
+        Ok(())
+    });
+    assert!(err.is_err());
+    assert_eq!(std::fs::read_to_string(&e.config_path).unwrap(), before);
+}
+
+#[test]
+fn a_csv_update_from_a_stale_copy_keeps_other_accounts() {
+    let e = env();
+    let mut ours = config(&e.root);
+    let first = create(&e, &mut ours, new("me@example.com", "old")).unwrap();
+    let stale = ours.clone();
+    // Another process adds an account
+    let mut theirs = config(&e.root);
+    create(&e, &mut theirs, new("other@example.com", "theirs")).unwrap();
+
+    let mut ours = stale;
+    let rows = parse_accounts_csv(
+        "name,email,imap_server,imap_port,username,password\nMe,me@example.com,imap2.example.com,993,me@example.com,new\n",
+    );
+    accounts::update_from_row(&mut ours, &e.config_path, &e.credentials, &first.id, &rows.valid_accounts[0]).unwrap();
+    let saved = AppConfig::load_existing(&e.config_path).unwrap().unwrap();
+    let mut ids: Vec<_> = saved.accounts.iter().map(|a| a.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, ["meexample_com", "otherexample_com"], "the other process's account is kept");
+    assert_eq!(saved.account_by_id(&first.id).unwrap().imap_server, "imap2.example.com");
 }

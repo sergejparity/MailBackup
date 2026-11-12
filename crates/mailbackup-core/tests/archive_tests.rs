@@ -3,7 +3,7 @@
 mod common;
 use common::*;
 use mailbackup_core::archive::{self, NewConnection};
-use mailbackup_core::config::{AccountConfig, AppConfig};
+use mailbackup_core::config::{AccountConfig, AppConfig, ConfigLock};
 use mailbackup_core::error::Error;
 use mailbackup_core::keyring::{CredentialStore, NoKeyring};
 use mailbackup_core::sync_gate::{self, SyncGate};
@@ -72,7 +72,7 @@ fn conn<'a>(server: &FakeImap, password: &'a str) -> NewConnection<'a> {
 
 fn switch(s: &mut Setup, to: &FakeImap, password: &str) -> archive::Switched {
     let c = conn(to, password);
-    archive::start_new_archive(&s.a.db, &s.creds, &mut s.config, &s.config_path, "acc", &c).unwrap()
+    archive::start_new_archive(&s.a.db, &s.creds, &mut s.config, &s.config_path, &ConfigLock::acquire(&s.config_path).unwrap(), "acc", &c).unwrap()
 }
 
 #[tokio::test]
@@ -342,7 +342,7 @@ async fn syncs_of_archives_or_removed_accounts_are_refused_and_a_running_sync_bl
     // A sync holding the gate: the switch is refused, nothing changes
     let held = SyncGate::try_acquire(&s.config_path, "acc").unwrap().unwrap();
     let c = conn(&server_b, "pw-b");
-    let err = archive::start_new_archive(&s.a.db, &s.creds, &mut s.config, &s.config_path, "acc", &c).err().unwrap();
+    let err = archive::start_new_archive(&s.a.db, &s.creds, &mut s.config, &s.config_path, &ConfigLock::acquire(&s.config_path).unwrap(), "acc", &c).err().unwrap();
     assert!(matches!(err, Error::AccountBusy(_)), "{}", err);
     assert!(s.config.accounts.iter().all(|a| !a.is_archive()));
     drop(held);

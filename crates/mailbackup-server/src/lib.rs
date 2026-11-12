@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use mail_parser::MessageParser;
-use mailbackup_core::config::{AccountConfig, AppConfig, AuthType, FolderFilter, ProviderType};
+use mailbackup_core::config::{AccountConfig, AppConfig, AuthType, ConfigLock, FolderFilter, ProviderType};
 use mailbackup_core::db::{AdvancedSearchFilter, Database};
 use mailbackup_core::imap::ImapSyncEngine;
 use mailbackup_core::keyring::CredentialStore;
@@ -1456,6 +1456,11 @@ async fn api_update_account(
     }
 
     let mut cfg = state.config.write().await;
+    // Held until the change is saved: no other process saves in between
+    let config_lock = match lock_and_reload(&state, &mut cfg).await {
+        Ok(lock) => lock,
+        Err(e) => return config_unreadable(e),
+    };
     let acc = match cfg.account_by_id_mut(&account_id) {
         Some(a) => a,
         None => return (StatusCode::NOT_FOUND, "Account not found").into_response(),
@@ -1538,6 +1543,7 @@ async fn api_update_account(
             &state.credentials,
             &mut cfg,
             &state.config_path,
+            &config_lock,
             &account_id,
             &conn,
         ) {
@@ -1590,6 +1596,7 @@ async fn api_update_account(
     if let Err(e) = cfg.save(&state.config_path) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save config: {}", e)).into_response();
     }
+    drop(config_lock);
 
     // Reload scheduler (still holding the gate after a switch)
     let warning = reload_scheduler(&state, &cfg).await;
@@ -1619,6 +1626,10 @@ async fn api_delete_account(
     Path(account_id): Path<String>,
 ) -> impl IntoResponse {
     let mut cfg = state.config.write().await;
+    let config_lock = match lock_and_reload(&state, &mut cfg).await {
+        Ok(lock) => lock,
+        Err(e) => return config_unreadable(e),
+    };
     let target = cfg.accounts.iter().find(|a| a.id == account_id).cloned();
     let target_name = target.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| account_id.clone());
     cfg.accounts.retain(|a| a.id != account_id);
@@ -1626,7 +1637,10 @@ async fn api_delete_account(
     if let Some(acc) = target.as_ref().filter(|a| !a.is_archive()) {
         let _ = state.credentials.delete_password(acc.credential_ref());
     }
-    let _ = cfg.save(&state.config_path);
+    if let Err(e) = cfg.save(&state.config_path) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save config: {}", e)).into_response();
+    }
+    drop(config_lock);
 
     // Reload scheduler
     let _ = reload_scheduler(&state, &cfg).await;
@@ -2372,14 +2386,21 @@ async fn api_pick_directory(State(state): State<AppState>) -> impl IntoResponse 
     let res = res.map(|p| normalize_dir(&p).unwrap_or(p));
     if let Some(ref path) = res {
         let mut cfg = state.config.write().await;
+        // The approval is saved into the config file as it is now
+        let config_lock = lock_and_reload(&state, &mut cfg).await;
+        if config_lock.is_err() {
+            error!("Couldn't read the config to save approved folder {}", path.display());
+        }
         let already_allowed = system_export_locations()
             .into_iter()
             .map(|(_, p)| p)
             .chain(cfg.settings.approved_dirs.iter().cloned())
             .any(|p| normalize_dir(&p).as_ref() == Some(path));
         if !already_allowed {
+            // Without the lock it is approved for this session only
             cfg.settings.approved_dirs.push(path.clone());
-            if let Err(e) = cfg.save(&state.config_path) {
+            if config_lock.is_ok()
+                && let Err(e) = cfg.save(&state.config_path) {
                 error!("Failed to save approved folder {}: {}", path.display(), e);
             }
         }
@@ -2648,10 +2669,8 @@ async fn api_update_settings(
 
     // 1. Move the archive data directory if requested
     if let Some(target_path) = requested_dir {
-        let current_dir = {
-            let cfg = state.config.read().await;
-            cfg.data_dir.clone()
-        };
+        // The folder in use, not only the one the config names
+        let current_dir = state.storage.base_dir();
 
         if target_path != current_dir {
             let move_existing = payload.move_existing.unwrap_or(true);
@@ -2806,7 +2825,40 @@ async fn api_update_settings(
             );
         }
 
-        if let Err(e) = cfg.save(&state.config_path) {
+        // Only what this request changed goes into the file as it is now
+        let changed = cfg.clone();
+        let saved = save_config_change(&state, &mut cfg, |disk| {
+            if resolved_storage_path.is_some() {
+                disk.data_dir = changed.data_dir.clone();
+            }
+            if resolved_db_path.is_some() {
+                disk.db_path = changed.db_path.clone();
+            }
+            let (from, to) = (&changed.settings, &mut disk.settings);
+            if payload.close_to_tray.is_some() {
+                to.close_to_tray = from.close_to_tray;
+            }
+            if payload.autostart.is_some() {
+                to.autostart = from.autostart;
+            }
+            if payload.run_as_service.is_some() {
+                to.run_as_service = from.run_as_service;
+            }
+            if payload.download_dir.is_some() {
+                to.download_dir = from.download_dir.clone();
+            }
+            if payload.web_server_enabled.is_some() {
+                to.web_server_enabled = from.web_server_enabled;
+            }
+            if payload.ask_download_location.is_some() {
+                to.ask_download_location = from.ask_download_location;
+            }
+            if payload.log_retention_days.is_some() {
+                to.log_retention_days = from.log_retention_days;
+            }
+        })
+        .await;
+        if let Err(e) = saved {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to save config: {}", e),
@@ -2901,11 +2953,71 @@ fn persisted_run_as_service(config_path: &std::path::Path, fallback: bool) -> bo
 }
 
 /// Sets `settings.run_as_service` in the config file on disk, leaving the
-/// rest of the file as it is there.
+/// rest of the file as it is there (under the config lock).
 fn persist_run_as_service(config_path: &std::path::Path, enabled: bool) -> mailbackup_core::Result<()> {
-    let mut on_disk = AppConfig::load_or_create(Some(config_path))?;
-    on_disk.settings.run_as_service = enabled;
-    on_disk.save(config_path)
+    AppConfig::update(config_path, |on_disk| {
+        on_disk.settings.run_as_service = enabled;
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// Saves a change made after side effects (installing the service, starting
+/// the listener) without overwriting what other processes saved: under the
+/// config lock, `change` is applied to the config file as it is then, which
+/// is saved and becomes `cfg`. The caller must not hold the config lock.
+async fn save_config_change(
+    state: &AppState,
+    cfg: &mut AppConfig,
+    change: impl FnOnce(&mut AppConfig),
+) -> mailbackup_core::Result<()> {
+    let lock = ConfigLock::acquire_async(state.config_path.clone()).await?;
+    let mut latest = cfg.clone();
+    latest.reload_from(&state.config_path, &lock)?;
+    change(&mut latest);
+    latest.settings.validate()?;
+    adopt_locations(state, cfg, &latest).await?;
+    latest.save(&state.config_path)?;
+    *cfg = latest;
+    Ok(())
+}
+
+/// The config lock, with `cfg` reloaded from the file under it: what the
+/// caller then changes and saves starts from what every process saved.
+async fn lock_and_reload(state: &AppState, cfg: &mut AppConfig) -> mailbackup_core::Result<ConfigLock> {
+    let lock = ConfigLock::acquire_async(state.config_path.clone()).await?;
+    let mut latest = cfg.clone();
+    latest.reload_from(&state.config_path, &lock)?;
+    adopt_locations(state, cfg, &latest).await?;
+    *cfg = latest;
+    Ok(lock)
+}
+
+/// Before `latest` becomes this server's config: if another process moved
+/// the data folder or the catalog since `current` was adopted (the file
+/// names other locations), the running storage engine and catalog switch
+/// to them, so the config reported and the files used never differ
+/// (review of #98). The other process moved the data; nothing is copied
+/// here. The storage switch waits for archivers and pruning in this
+/// process (the storage lock gate). On an error nothing is adopted.
+async fn adopt_locations(state: &AppState, current: &AppConfig, latest: &AppConfig) -> mailbackup_core::Result<()> {
+    let failed = |e: tokio::task::JoinError| mailbackup_core::Error::Other(format!("relocation task failed: {}", e));
+    if latest.data_dir != current.data_dir {
+        let (storage, dir) = (state.storage.clone(), latest.data_dir.clone());
+        tokio::task::spawn_blocking(move || storage.relocate(&dir, false)).await.map_err(failed)??;
+        tracing::info!("Using the data folder another process moved to: {}", latest.data_dir.display());
+    }
+    if latest.db_path != current.db_path {
+        let (db, path) = (state.db.clone(), latest.db_path.clone());
+        tokio::task::spawn_blocking(move || db.relocate(&path, false)).await.map_err(failed)??;
+        tracing::info!("Using the catalog another process moved to: {}", latest.db_path.display());
+    }
+    Ok(())
+}
+
+/// The answer when the config can't be read under its lock.
+fn config_unreadable(e: mailbackup_core::Error) -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't read the current config: {}", e)).into_response()
 }
 
 /// [`set_service_with_credentials`] with the install/uninstall step injected.
@@ -2987,8 +3099,10 @@ async fn api_service_toggle(
         Ok(_) => {
             {
                 let mut cfg = state.config.write().await;
-                cfg.settings.run_as_service = payload.enabled;
-                let _ = cfg.save(&state.config_path);
+                let enabled = payload.enabled;
+                if let Err(e) = save_config_change(&state, &mut cfg, |c| c.settings.run_as_service = enabled).await {
+                    error!("Couldn't save run_as_service: {}", e);
+                }
             }
             let action = if payload.enabled { "installed and started" } else { "uninstalled and stopped" };
             mailbackup_core::event_log::log_event(
@@ -4627,6 +4741,95 @@ mod tests {
             "provider": "generic", "name": "N", "email": email, "server": "imap.example.com",
             "port": 993, "username": email, "password": "pw", "schedule": schedule,
         })
+    }
+
+    /// Another process (the CLI, the background service) saves the config
+    /// after the server read it: every server change keeps what it saved
+    /// (review of #83).
+    #[tokio::test]
+    async fn server_changes_keep_what_another_process_saved_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        let router = create_router(state.clone());
+        let (status, body) = send(&router, "POST", "/api/accounts", new_account("a@example.com", "0 1 * * *")).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let a = state.config.read().await.accounts[0].clone();
+
+        // Behind the server's back: another account and a setting
+        let other_process = |id: &str, retention: u32| {
+            let mut on_disk = AppConfig::load_existing(&state.config_path).unwrap().unwrap();
+            let mut b = a.clone();
+            b.id = id.to_string();
+            b.email = format!("{}@example.com", id);
+            on_disk.accounts.push(b);
+            on_disk.settings.log_retention_days = Some(retention);
+            on_disk.save(&state.config_path).unwrap();
+        };
+        let on_disk = || AppConfig::load_existing(&state.config_path).unwrap().unwrap();
+        let ids = |cfg: &AppConfig| cfg.accounts.iter().map(|x| x.id.clone()).collect::<Vec<_>>();
+
+        other_process("b1", 7);
+        let (status, body) = send(&router, "PUT", &format!("/api/accounts/{}", a.id), serde_json::json!({ "name": "Renamed" })).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let saved = on_disk();
+        assert_eq!(ids(&saved), [a.id.clone(), "b1".to_string()], "the update kept b1");
+        assert_eq!(saved.accounts[0].name, "Renamed");
+        assert_eq!(saved.settings.log_retention_days, Some(7), "and the other process's setting");
+        assert_eq!(ids(&*state.config.read().await), ids(&saved), "the server's copy is the saved file");
+
+        other_process("b2", 14);
+        let (status, body) = send(&router, "PUT", "/api/settings", serde_json::json!({ "close_to_tray": false })).await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        let saved = on_disk();
+        assert_eq!(ids(&saved), [a.id.clone(), "b1".to_string(), "b2".to_string()], "a settings change kept b2");
+        assert!(!saved.settings.close_to_tray);
+        assert_eq!(saved.settings.log_retention_days, Some(14), "a setting it didn't change is left as saved");
+
+        other_process("b3", 21);
+        assert_eq!(status_of(&router, "DELETE", &format!("/api/accounts/{}", a.id)).await, StatusCode::NO_CONTENT);
+        let saved = on_disk();
+        assert_eq!(ids(&saved), ["b1", "b2", "b3"], "deleting a kept b3");
+        assert_eq!(saved.settings.log_retention_days, Some(21));
+    }
+
+    /// Two servers on one config: when one moves the data folder and the
+    /// catalog, the other adopts the new locations at its next config change,
+    /// for the files it uses as well as for what it reports (review of #98).
+    #[tokio::test]
+    async fn locations_another_server_moved_to_are_used_not_only_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = test_state(dir.path(), Vec::new()).await;
+        let b = test_state(dir.path(), Vec::new()).await;
+        let (router_a, router_b) = (create_router(a.clone()), create_router(b.clone()));
+        let put = |body| json_request("PUT", "/api/settings", body);
+        assert_eq!(status(&router_a, put(serde_json::json!({ "close_to_tray": true }))).await, StatusCode::OK);
+
+        let new_data = dir.path().join("exports/moved-data");
+        let new_db = dir.path().join("exports/moved/catalog.db");
+        let (st, body) = send(&router_b, "PUT", "/api/settings", serde_json::json!({ "data_dir": new_data, "db_path": new_db })).await;
+        assert_eq!(st, StatusCode::OK, "{}", body);
+        assert_eq!(b.storage.base_dir(), new_data);
+        assert_eq!(b.db.path(), new_db);
+
+        // A, with its older copy, changes something unrelated
+        assert_eq!(status(&router_a, put(serde_json::json!({ "close_to_tray": false }))).await, StatusCode::OK);
+        let reported = a.config.read().await.clone();
+        assert_eq!(reported.data_dir, new_data);
+        assert_eq!(a.storage.base_dir(), new_data, "A's files go where its config says");
+        assert_eq!(reported.db_path, new_db);
+        assert_eq!(a.db.path(), new_db, "and its catalog too");
+
+        // Selecting the folder in use again changes nothing and stays consistent
+        let (st, body) = send(&router_a, "PUT", "/api/settings", serde_json::json!({ "data_dir": new_data })).await;
+        assert_eq!(st, StatusCode::OK, "{}", body);
+        assert_eq!(a.storage.base_dir(), new_data);
+        let on_disk = AppConfig::load_existing(&a.config_path).unwrap().unwrap();
+        assert_eq!((on_disk.data_dir, on_disk.db_path), (new_data, new_db));
+        assert!(!on_disk.settings.close_to_tray);
+    }
+
+    async fn status_of(router: &Router, method: &str, uri: &str) -> StatusCode {
+        status(router, authed(method, uri, None)).await
     }
 
     #[tokio::test]

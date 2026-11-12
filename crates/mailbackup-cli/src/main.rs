@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use console::{style, Emoji};
 use dialoguer::{Input, Password, Select};
 use indicatif::{ProgressBar, ProgressStyle};
-use mailbackup_core::config::{AccountConfig, AppConfig, ProviderType};
+use mailbackup_core::config::{AccountConfig, AppConfig, ConfigLock, ProviderType};
 use mailbackup_core::db::Database;
 use mailbackup_core::imap::ImapSyncEngine;
 use mailbackup_core::keyring::CredentialStore;
@@ -253,7 +253,7 @@ async fn main() -> Result<()> {
             handle_account_server_ids(&mut config, cli.config.as_deref(), &db, &account, trust.as_deref(), reset, source.as_deref())?;
         }
         Commands::Account(AccountCommands::ImportCsv { file, dry_run }) => {
-            handle_account_import_csv(&mut config, cli.config.as_deref(), &credentials, &file, dry_run)?;
+            handle_account_import_csv(&mut config, cli.config.as_deref(), &db, &storage, &credentials, &file, dry_run)?;
         }
         Commands::Sync(args) => {
             handle_sync(&config, &config_path, &db, &storage, &credentials, args).await?;
@@ -603,6 +603,10 @@ fn handle_account_remove(
     credentials: &CredentialStore,
     account_id: &str,
 ) -> Result<()> {
+    let save_path = config_path.unwrap_or_else(|| mailbackup_core::config::default_config_path().leak());
+    // The file as it is now is changed, not the copy read at startup
+    let _lock = ConfigLock::acquire(save_path)?;
+    config.reload_from(save_path, &_lock)?;
     if config.get_account(account_id).is_none() {
         bail!("Account '{}' not found", account_id);
     }
@@ -616,7 +620,6 @@ fn handle_account_remove(
         let _ = credentials.delete_password(acc.credential_ref());
     }
 
-    let save_path = config_path.unwrap_or_else(|| mailbackup_core::config::default_config_path().leak());
     config.save(save_path)?;
 
     println!("{} Removed account '{}' from configuration and credentials store.", CHECK_EMOJI, account_id);
@@ -632,6 +635,16 @@ fn handle_account_server_ids(
     reset: bool,
     source: Option<&str>,
 ) -> Result<()> {
+    let save_path = config_path.unwrap_or_else(|| mailbackup_core::config::default_config_path().leak());
+    // Changing trust saves the file as it is now, not the copy read at startup
+    let _lock = match trust {
+        Some(_) => {
+            let lock = ConfigLock::acquire(save_path)?;
+            config.reload_from(save_path, &lock)?;
+            Some(lock)
+        }
+        None => None,
+    };
     let Some(acc) = config.accounts.iter_mut().find(|a| a.id == account || (a.email == account && !a.is_archive())) else {
         bail!("Account '{}' not found", account);
     };
@@ -641,7 +654,6 @@ fn handle_account_server_ids(
             bail!("'{}' is a read-only archive and isn't synced", id);
         }
         acc.trust_server_ids = trust == "on";
-        let save_path = config_path.unwrap_or_else(|| mailbackup_core::config::default_config_path().leak());
         config.save(save_path)?;
         println!(
             "{} {} '{}'.",
@@ -675,6 +687,8 @@ fn handle_account_server_ids(
 fn handle_account_import_csv(
     config: &mut AppConfig,
     config_path: Option<&std::path::Path>,
+    db: &Database,
+    storage: &StorageEngine,
     credentials: &CredentialStore,
     file_path: &std::path::Path,
     dry_run: bool,
@@ -686,7 +700,18 @@ fn handle_account_import_csv(
     let content = std::fs::read_to_string(file_path)
         .context(format!("Failed to read CSV file: {}", file_path.display()))?;
 
-    let report = mailbackup_core::csv_import::parse_accounts_csv(&content);
+    let mut report = mailbackup_core::csv_import::parse_accounts_csv(&content);
+    // Addresses that already have an account, or appear twice in the file,
+    // are errors: an import never replaces an account (issue #74)
+    let (plan, conflicts) = mailbackup_core::accounts::plan_import(config, &report.valid_accounts, false);
+    report.errors.extend(conflicts);
+    report.errors.sort_by_key(|e| e.line);
+    let planned: std::collections::HashSet<usize> = plan.iter().map(|(i, _)| *i).collect();
+    let mut index = 0;
+    report.valid_accounts.retain(|_| {
+        index += 1;
+        planned.contains(&(index - 1))
+    });
 
     println!("\n{} Parsing CSV: {}", MAIL_EMOJI, style(file_path.display()).cyan());
     println!(
@@ -728,21 +753,34 @@ fn handle_account_import_csv(
 
     let save_path = config_path.unwrap_or_else(|| mailbackup_core::config::default_config_path().leak());
 
+    // Each account is created like `account add` does: under the config
+    // lock, with an id of its own, never over another account
+    let mut imported = 0;
+    let mut failed = 0;
     for acc in &report.valid_accounts {
-        let cfg_acc = acc.to_account_config();
-        credentials.set_account_password(&cfg_acc, &acc.password)?;
-        let acc_id = cfg_acc.id.clone();
-        config.accounts.retain(|a| a.id != acc_id);
-        config.accounts.push(cfg_acc);
+        let new = mailbackup_core::accounts::new_account_from_row(acc);
+        match mailbackup_core::accounts::create(config, save_path, db, storage, credentials, new) {
+            Ok(created) => {
+                imported += 1;
+                if created.id != acc.id {
+                    println!("  {} {} was added as '{}' (its usual id is taken)", MAIL_EMOJI, acc.email, created.id);
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                println!("  {} Line {}: {} not imported: {}", WARN_EMOJI, acc.line, acc.email, e);
+            }
+        }
     }
 
-    config.save(save_path)?;
-
     println!(
-        "{} Successfully imported {} account(s) into configuration and credentials store.",
+        "{} Imported {} account(s) into configuration and credentials store.",
         CHECK_EMOJI,
-        report.valid_accounts.len()
+        imported
     );
+    if failed > 0 {
+        bail!("{} account(s) could not be imported", failed);
+    }
 
     Ok(())
 }

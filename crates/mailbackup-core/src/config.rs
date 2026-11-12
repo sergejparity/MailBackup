@@ -428,7 +428,63 @@ pub fn system_export_locations() -> Vec<(&'static str, PathBuf)> {
     locs
 }
 
+/// The lock every writer of a config file holds, in every process (the
+/// server, the desktop app, the CLI and the background service), from reading
+/// the file to saving it. A writer that changed a copy read earlier would
+/// otherwise save over what another process saved meanwhile (review of #83).
+///
+/// Not reentrant: code holding it must not call anything that takes it again
+/// ([`AppConfig::update`], [`crate::accounts::create`],
+/// [`crate::accounts::update_from_row`]).
+#[derive(Debug)]
+pub struct ConfigLock {
+    _gate: crate::sync_gate::SyncGate,
+}
+
+/// The name the config lock is held under (a lock file next to the
+/// accounts' sync gates). Never an account id: ids contain no `#`.
+const CONFIG_LOCK_NAME: &str = "#config#";
+
+impl ConfigLock {
+    /// Waits for the lock of the config file at `config_path`. Blocking: use
+    /// [`ConfigLock::acquire_async`] from async code.
+    pub fn acquire(config_path: &Path) -> Result<ConfigLock> {
+        Ok(ConfigLock { _gate: crate::sync_gate::SyncGate::acquire(config_path, CONFIG_LOCK_NAME)? })
+    }
+
+    /// [`ConfigLock::acquire`] without blocking the async runtime.
+    pub async fn acquire_async(config_path: PathBuf) -> Result<ConfigLock> {
+        tokio::task::spawn_blocking(move || ConfigLock::acquire(&config_path))
+            .await
+            .map_err(|e| Error::Other(format!("config lock task failed: {}", e)))?
+    }
+}
+
 impl AppConfig {
+    /// Replaces `self` with the config file at `path` as it is now, if there
+    /// is one. Called under the config lock, so what is then changed and
+    /// saved starts from what every other process saved.
+    pub fn reload_from(&mut self, path: &Path, _lock: &ConfigLock) -> Result<()> {
+        if let Some(on_disk) = Self::load_existing(path)? {
+            *self = on_disk;
+        }
+        Ok(())
+    }
+
+    /// Changes the config file at `path` as one step under the config lock:
+    /// reads it, applies `change`, checks the settings and saves it. Returns
+    /// the saved config (callers keep it as their copy) and `change`'s
+    /// result. If `change` or the save fails, the file is left as it was.
+    /// With no file yet, `change` starts from the defaults.
+    pub fn update<R>(path: &Path, change: impl FnOnce(&mut AppConfig) -> Result<R>) -> Result<(AppConfig, R)> {
+        let _lock = ConfigLock::acquire(path)?;
+        let mut config = Self::load_existing(path)?.unwrap_or_default();
+        let result = change(&mut config)?;
+        config.settings.validate().map_err(|e| Error::Config(format!("{}: {}", path.display(), e)))?;
+        config.save(path)?;
+        Ok((config, result))
+    }
+
     pub fn load_or_create(path: Option<&Path>) -> Result<Self> {
         let config_path = match path {
             Some(p) => p.to_path_buf(),
