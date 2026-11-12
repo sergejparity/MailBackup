@@ -2660,10 +2660,8 @@ async fn api_update_settings(
 
     // 1. Move the archive data directory if requested
     if let Some(target_path) = requested_dir {
-        let current_dir = {
-            let cfg = state.config.read().await;
-            cfg.data_dir.clone()
-        };
+        // The folder in use, not only the one the config names
+        let current_dir = state.storage.base_dir();
 
         if target_path != current_dir {
             let move_existing = payload.move_existing.unwrap_or(true);
@@ -2969,6 +2967,7 @@ async fn save_config_change(
     latest.reload_from(&state.config_path, &lock)?;
     change(&mut latest);
     latest.settings.validate()?;
+    adopt_locations(state, cfg, &latest).await?;
     latest.save(&state.config_path)?;
     *cfg = latest;
     Ok(())
@@ -2978,8 +2977,33 @@ async fn save_config_change(
 /// caller then changes and saves starts from what every process saved.
 async fn lock_and_reload(state: &AppState, cfg: &mut AppConfig) -> mailbackup_core::Result<ConfigLock> {
     let lock = ConfigLock::acquire_async(state.config_path.clone()).await?;
-    cfg.reload_from(&state.config_path, &lock)?;
+    let mut latest = cfg.clone();
+    latest.reload_from(&state.config_path, &lock)?;
+    adopt_locations(state, cfg, &latest).await?;
+    *cfg = latest;
     Ok(lock)
+}
+
+/// Before `latest` becomes this server's config: if another process moved
+/// the data folder or the catalog since `current` was adopted (the file
+/// names other locations), the running storage engine and catalog switch
+/// to them, so the config reported and the files used never differ
+/// (review of #98). The other process moved the data; nothing is copied
+/// here. The storage switch waits for archivers and pruning in this
+/// process (the storage lock gate). On an error nothing is adopted.
+async fn adopt_locations(state: &AppState, current: &AppConfig, latest: &AppConfig) -> mailbackup_core::Result<()> {
+    let failed = |e: tokio::task::JoinError| mailbackup_core::Error::Other(format!("relocation task failed: {}", e));
+    if latest.data_dir != current.data_dir {
+        let (storage, dir) = (state.storage.clone(), latest.data_dir.clone());
+        tokio::task::spawn_blocking(move || storage.relocate(&dir, false)).await.map_err(failed)??;
+        tracing::info!("Using the data folder another process moved to: {}", latest.data_dir.display());
+    }
+    if latest.db_path != current.db_path {
+        let (db, path) = (state.db.clone(), latest.db_path.clone());
+        tokio::task::spawn_blocking(move || db.relocate(&path, false)).await.map_err(failed)??;
+        tracing::info!("Using the catalog another process moved to: {}", latest.db_path.display());
+    }
+    Ok(())
 }
 
 /// The answer when the config can't be read under its lock.
@@ -4716,6 +4740,42 @@ mod tests {
         let saved = on_disk();
         assert_eq!(ids(&saved), ["b1", "b2", "b3"], "deleting a kept b3");
         assert_eq!(saved.settings.log_retention_days, Some(21));
+    }
+
+    /// Two servers on one config: when one moves the data folder and the
+    /// catalog, the other adopts the new locations at its next config change,
+    /// for the files it uses as well as for what it reports (review of #98).
+    #[tokio::test]
+    async fn locations_another_server_moved_to_are_used_not_only_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = test_state(dir.path(), Vec::new()).await;
+        let b = test_state(dir.path(), Vec::new()).await;
+        let (router_a, router_b) = (create_router(a.clone()), create_router(b.clone()));
+        let put = |body| json_request("PUT", "/api/settings", body);
+        assert_eq!(status(&router_a, put(serde_json::json!({ "close_to_tray": true }))).await, StatusCode::OK);
+
+        let new_data = dir.path().join("exports/moved-data");
+        let new_db = dir.path().join("exports/moved/catalog.db");
+        let (st, body) = send(&router_b, "PUT", "/api/settings", serde_json::json!({ "data_dir": new_data, "db_path": new_db })).await;
+        assert_eq!(st, StatusCode::OK, "{}", body);
+        assert_eq!(b.storage.base_dir(), new_data);
+        assert_eq!(b.db.path(), new_db);
+
+        // A, with its older copy, changes something unrelated
+        assert_eq!(status(&router_a, put(serde_json::json!({ "close_to_tray": false }))).await, StatusCode::OK);
+        let reported = a.config.read().await.clone();
+        assert_eq!(reported.data_dir, new_data);
+        assert_eq!(a.storage.base_dir(), new_data, "A's files go where its config says");
+        assert_eq!(reported.db_path, new_db);
+        assert_eq!(a.db.path(), new_db, "and its catalog too");
+
+        // Selecting the folder in use again changes nothing and stays consistent
+        let (st, body) = send(&router_a, "PUT", "/api/settings", serde_json::json!({ "data_dir": new_data })).await;
+        assert_eq!(st, StatusCode::OK, "{}", body);
+        assert_eq!(a.storage.base_dir(), new_data);
+        let on_disk = AppConfig::load_existing(&a.config_path).unwrap().unwrap();
+        assert_eq!((on_disk.data_dir, on_disk.db_path), (new_data, new_db));
+        assert!(!on_disk.settings.close_to_tray);
     }
 
     async fn status_of(router: &Router, method: &str, uri: &str) -> StatusCode {
