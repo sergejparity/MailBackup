@@ -22,8 +22,18 @@ use std::path::{Path, PathBuf};
 /// account.
 #[derive(Debug)]
 pub struct SyncGate {
-    _file: File,
+    file: File,
     account_id: String,
+}
+
+impl Drop for SyncGate {
+    fn drop(&mut self) {
+        // Unlock explicitly rather than rely on closing the file: a child this
+        // process is spawning shares the open file from `fork` until its
+        // `exec`, and the lock would last until then, refusing the account as
+        // busy. An explicit unlock releases it for every copy.
+        let _ = self.file.unlock();
+    }
 }
 
 impl SyncGate {
@@ -58,14 +68,14 @@ impl SyncGate {
     pub fn acquire(config_path: &Path, account_id: &str) -> Result<SyncGate> {
         let file = Self::open(config_path, account_id)?;
         file.lock()?;
-        Ok(SyncGate { _file: file, account_id: account_id.to_string() })
+        Ok(SyncGate { file, account_id: account_id.to_string() })
     }
 
     /// The account's gate if it is free right now.
     pub fn try_acquire(config_path: &Path, account_id: &str) -> Result<Option<SyncGate>> {
         let file = Self::open(config_path, account_id)?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(SyncGate { _file: file, account_id: account_id.to_string() })),
+            Ok(()) => Ok(Some(SyncGate { file, account_id: account_id.to_string() })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
         }
@@ -121,6 +131,18 @@ mod tests {
         assert!(SyncGate::try_acquire(&config, "b").unwrap().is_some(), "per account");
         drop(held);
         assert!(SyncGate::try_acquire(&config, "a").unwrap().is_some(), "released");
+    }
+
+    #[test]
+    fn dropping_the_gate_releases_it_while_a_copy_of_its_file_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        let held = SyncGate::try_acquire(&config, "a").unwrap().expect("free");
+        // What a child gets from `fork` until its `exec`: the same open file
+        let inherited = held.file.try_clone().unwrap();
+        drop(held);
+        assert!(SyncGate::try_acquire(&config, "a").unwrap().is_some(), "released");
+        drop(inherited);
     }
 
     #[test]

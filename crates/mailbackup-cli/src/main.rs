@@ -179,8 +179,8 @@ struct ExportMboxArgs {
 
 #[derive(Args)]
 struct ServeArgs {
-    #[arg(short, long, default_value = "8765", help = "Port to listen on")]
-    port: u16,
+    #[arg(short, long, help = "Port to listen on (default: settings.web_port from the config)")]
+    port: Option<u16>,
 }
 
 #[tokio::main]
@@ -284,19 +284,39 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Serve(args) => {
-            println!("{} Starting MailBackup Studio on http://127.0.0.1:{}", MAIL_EMOJI, args.port);
+            let port = args.port.unwrap_or(config.settings.web_port);
             let current_exe = std::env::current_exe()?;
-            let server_exe = current_exe.parent().unwrap().join("mailbackup-server");
+            let server_exe = current_exe.parent().context("Cannot locate the mailbackup executable's folder")?.join(SERVER_EXE);
             if server_exe.exists() {
-                let mut child = std::process::Command::new(server_exe).spawn()?;
-                child.wait()?;
+                println!("{} Starting MailBackup Studio on http://127.0.0.1:{}", MAIL_EMOJI, port);
+                let status = server_command(&server_exe, &config_path, port)
+                    .status()
+                    .with_context(|| format!("Failed to start {}", server_exe.display()))?;
+                if !status.success() {
+                    bail!("mailbackup-server exited with {}", status);
+                }
             } else {
-                println!("To launch the standalone web server: cargo run -p mailbackup-server");
+                println!(
+                    "To launch the standalone web server: cargo run -p mailbackup-server -- --config {} --port {}",
+                    config_path.display(),
+                    port
+                );
             }
         }
     }
 
     Ok(())
+}
+
+const SERVER_EXE: &str = if cfg!(windows) { "mailbackup-server.exe" } else { "mailbackup-server" };
+
+/// The `mailbackup-server` invocation for `serve`: the same config file the
+/// CLI loaded and the port it announces, so the server can't fall back to
+/// `~/.mailbackup` or to the config's `web_port`.
+fn server_command(server_exe: &std::path::Path, config_path: &std::path::Path, port: u16) -> std::process::Command {
+    let mut cmd = std::process::Command::new(server_exe);
+    cmd.arg("--config").arg(config_path).arg("--port").arg(port.to_string());
+    cmd
 }
 
 /// Longest password read from stdin, counting its line ending.
@@ -992,6 +1012,13 @@ async fn handle_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_forwards_config_and_port_to_the_server() {
+        let cmd = server_command(std::path::Path::new("/bin/srv"), std::path::Path::new("/etc/mb/c.yaml"), 8799);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["--config", "/etc/mb/c.yaml", "--port", "8799"]);
+    }
 
     fn read(input: &[u8]) -> Result<String> {
         read_password(input)
