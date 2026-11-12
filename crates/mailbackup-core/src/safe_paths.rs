@@ -196,7 +196,7 @@ pub fn normalize_dir(path: &Path) -> Option<PathBuf> {
     Some(canonical.join(rest))
 }
 
-fn is_ignorable(name: &std::ffi::OsStr) -> bool {
+pub(crate) fn is_ignorable(name: &std::ffi::OsStr) -> bool {
     name.to_str().map(|n| IGNORABLE_FILES.contains(&n)).unwrap_or(false)
 }
 

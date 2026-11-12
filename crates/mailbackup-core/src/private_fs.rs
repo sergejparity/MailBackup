@@ -129,20 +129,65 @@ fn create_new_atomic_with(
         write(&mut file, data)?;
         file.sync_all()?;
         drop(file);
-        match link(&temp, path) {
-            Err(e) if links_unsupported(&e) => {
-                if std::fs::symlink_metadata(path).is_ok() {
-                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("'{}' exists", path.display())));
-                }
-                std::fs::rename(&temp, path)
-            }
-            other => other,
-        }
+        place_new(&temp, path, link)
     })();
     let _ = std::fs::remove_file(&temp);
     result?;
     sync_parent(path);
     Ok(())
+}
+
+/// Puts the complete file `temp` at `path` only if `path` doesn't exist (see
+/// [`create_new_atomic`]). `temp` may be left behind; the caller removes it.
+fn place_new(temp: &Path, path: &Path, link: impl FnOnce(&Path, &Path) -> io::Result<()>) -> io::Result<()> {
+    match link(temp, path) {
+        Err(e) if links_unsupported(&e) => {
+            if std::fs::symlink_metadata(path).is_ok() {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("'{}' exists", path.display())));
+            }
+            std::fs::rename(temp, path)
+        }
+        other => other,
+    }
+}
+
+/// Writes `path` through `fill`, which writes into an owner-only temp file
+/// next to it. Only once `fill` succeeded and the file is flushed is it put
+/// at `path`, so `path` never holds a partial file:
+/// - `replace`: an existing file is replaced atomically and stays as it was
+///   until then; the new file takes over its permissions;
+/// - otherwise `path` is created only if it doesn't exist, as with
+///   [`create_new_atomic`] (`AlreadyExists` if it does).
+///
+/// If `fill` or anything after it fails, `path` is untouched and the temp
+/// file is removed.
+pub fn write_with<T, E: From<io::Error>>(
+    path: &Path,
+    replace: bool,
+    fill: impl FnOnce(&mut File) -> Result<T, E>,
+) -> Result<T, E> {
+    let temp = temp_path_for(path)?;
+    let result = (|| {
+        let mut file = options().write(true).create_new(true).open(&temp)?;
+        let value = fill(&mut file)?;
+        file.sync_all()?;
+        if replace {
+            if let Ok(existing) = std::fs::metadata(path) {
+                file.set_permissions(existing.permissions())?;
+            }
+            drop(file);
+            std::fs::rename(&temp, path)?;
+        } else {
+            drop(file);
+            place_new(&temp, path, |temp, path| std::fs::hard_link(temp, path))?;
+        }
+        Ok(value)
+    })();
+    let _ = std::fs::remove_file(&temp);
+    if result.is_ok() {
+        sync_parent(path);
+    }
+    result
 }
 
 /// The file system can't hard-link (FAT/exFAT report EPERM or "unsupported").

@@ -1121,3 +1121,61 @@ fn a_malformed_search_query_is_invalid_input() {
     }
     assert!(db.search_fts("plain words", 10).unwrap().is_empty());
 }
+
+/// Issue #76: an export whose client went away stops between messages, and
+/// the target is never left partial: an existing file stays as it was, a
+/// new one isn't created, and no temp file remains.
+#[test]
+fn a_cancelled_mbox_export_leaves_the_target_as_it_was() {
+    use mailbackup_core::cancel::Cancel;
+    let dir = tempdir().unwrap();
+    let storage = StorageEngine::new(dir.path().join("data"));
+    let paths: Vec<String> = (1..=3)
+        .map(|uid| {
+            let raw = format!("From: a@example.com\r\nSubject: m{}\r\n\r\nbody\r\n", uid);
+            storage.store_eml("acc", "INBOX", uid, None, raw.as_bytes()).unwrap().relative_path.to_string_lossy().to_string()
+        })
+        .collect();
+    let exporter = MboxExporter::new(&storage);
+    let out_dir = dir.path().join("exports");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    // Checked before each message: cancelled after the first one is written
+    struct CancelAfterFirst<'a>(&'a Cancel, Vec<u8>);
+    impl std::io::Write for CancelAfterFirst<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.cancel();
+            self.1.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let cancel = Cancel::new();
+    let mut sink = CancelAfterFirst(&cancel, Vec::new());
+    let err = exporter.export_counted_until(&paths, &mut sink, &cancel).unwrap_err();
+    assert!(matches!(err, mailbackup_core::Error::Cancelled), "{}", err);
+    assert_eq!(String::from_utf8_lossy(&sink.1).matches("Subject: m").count(), 1, "stopped after one message");
+
+    let cancelled = Cancel::new();
+    cancelled.cancel();
+    let existing = out_dir.join("old.mbox");
+    std::fs::write(&existing, b"the previous export").unwrap();
+    assert!(exporter.export_to_mbox_until(&paths, &existing, true, &cancelled).is_err());
+    assert_eq!(std::fs::read(&existing).unwrap(), b"the previous export", "an overwrite keeps the old file");
+
+    let fresh = out_dir.join("new.mbox");
+    assert!(exporter.export_to_mbox_until(&paths, &fresh, false, &cancelled).is_err());
+    assert!(!fresh.exists(), "nothing is created");
+
+    let names: Vec<_> = std::fs::read_dir(&out_dir).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert_eq!(names, ["old.mbox"], "no temp file is left");
+
+    // Not cancelled: an overwrite replaces the file with the complete export
+    let count = exporter.export_to_mbox_until(&paths, &existing, true, &Cancel::new()).unwrap();
+    assert_eq!(count.written, 3);
+    assert_eq!(std::fs::read_to_string(&existing).unwrap().matches("Subject: m").count(), 3);
+    // And without overwrite, an existing file is refused
+    assert!(exporter.export_to_mbox_until(&paths, &existing, false, &Cancel::new()).is_err());
+}

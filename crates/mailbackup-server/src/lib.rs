@@ -9,6 +9,7 @@ use axum::{
     Json, Router,
 };
 use mail_parser::MessageParser;
+use mailbackup_core::cancel::Cancel;
 use mailbackup_core::config::{AccountConfig, AppConfig, AuthType, ConfigLock, FolderFilter, ProviderType};
 use mailbackup_core::db::{AdvancedSearchFilter, Database};
 use mailbackup_core::imap::ImapSyncEngine;
@@ -2246,37 +2247,53 @@ async fn api_export_mbox(
             .into_response();
     }
 
+    // The export runs to its end on a blocking thread whatever the client
+    // does, so it reports to the event log itself. A client that goes away
+    // cancels it between messages, and nothing is left at the target
+    // (issue #76).
     let storage = state.storage.clone();
     let output = final_output_path.clone();
+    let overwrite = payload.overwrite;
+    let cancel = Cancel::new();
+    let client_gone = cancel.on_drop();
     let exported = tokio::task::spawn_blocking(move || {
-        MboxExporter::new(&storage).export_to_mbox_counted(&paths, &output, payload.overwrite)
-    })
-    .await
-    .unwrap_or_else(|e| Err(mailbackup_core::Error::Other(format!("export task failed: {}", e))));
-    match exported {
-        Ok(count) => {
-            let path_str = final_output_path.to_string_lossy().to_string();
-            mailbackup_core::event_log::log_event(
+        let result = MboxExporter::new(&storage).export_to_mbox_until(&paths, &output, overwrite, &cancel);
+        match &result {
+            Ok(count) => mailbackup_core::event_log::log_event(
                 "ARCHIVE_EXPORTED",
                 &format!(
                     "Exported {} message(s) to .mbox archive: {}{}",
                     count.written,
-                    path_str,
+                    output.display(),
                     if count.skipped > 0 { format!(" ({} could not be read and are missing)", count.skipped) } else { String::new() }
                 ),
-            );
-            Json(ExportResult {
-                exported_count: count.written,
-                skipped_count: count.skipped,
-                output_path: path_str,
-            })
-            .into_response()
+            ),
+            Err(mailbackup_core::Error::Cancelled) => mailbackup_core::event_log::log_event(
+                "EXPORT_CANCELLED",
+                &format!("Export to {} stopped: the client went away. Nothing was written there.", output.display()),
+            ),
+            Err(e) => mailbackup_core::event_log::log_event(
+                "EXPORT_ERROR",
+                &format!("Failed to export to {}: {}", output.display(), e),
+            ),
         }
-        Err(e) => {
-            let err_msg = format!("Failed to export to {}: {}", final_output_path.display(), e);
-            mailbackup_core::event_log::log_event("EXPORT_ERROR", &err_msg);
-            (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response()
-        }
+        result
+    })
+    .await
+    .unwrap_or_else(|e| Err(mailbackup_core::Error::Other(format!("export task failed: {}", e))));
+    client_gone.disarm();
+    match exported {
+        Ok(count) => Json(ExportResult {
+            exported_count: count.written,
+            skipped_count: count.skipped,
+            output_path: final_output_path.to_string_lossy().to_string(),
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to export to {}: {}", final_output_path.display(), e),
+        )
+            .into_response(),
     }
 }
 
@@ -2628,7 +2645,25 @@ pub struct UpdateSettingsResponse {
 async fn api_update_settings(
     State(state): State<AppState>,
     Json(payload): Json<UpdateSettingsPayload>,
-) -> impl IntoResponse {
+) -> Response {
+    // Runs as a task of its own (issue #76): a client that goes away while
+    // the data folder is copied cancels the copy, which removes what it
+    // copied, but once the data has moved, the switch and the config save
+    // that records it always finish. Otherwise the server could use one
+    // folder while the config file names another.
+    let cancel = Cancel::new();
+    let client_gone = cancel.on_drop();
+    let response = match tokio::spawn(update_settings(state, payload, cancel)).await {
+        Ok(response) => response,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Settings change failed: {}", e)).into_response(),
+    };
+    client_gone.disarm();
+    response
+}
+
+/// [`api_update_settings`]; `cancel` stops copying the data folder.
+async fn update_settings(state: AppState, payload: UpdateSettingsPayload, cancel: Cancel) -> Response {
     let mut migrated_files = 0u64;
     let mut resolved_storage_path = None;
     let mut resolved_db_path = None;
@@ -2675,9 +2710,25 @@ async fn api_update_settings(
         if target_path != current_dir {
             let move_existing = payload.move_existing.unwrap_or(true);
             // Copy and switch in one step, with no archiver or pruning
-            // between them (issue #79)
-            match state.storage.relocate(&target_path, move_existing) {
+            // between them (issue #79), on the blocking pool: the copy may
+            // take minutes (issue #76)
+            let (storage, target) = (state.storage.clone(), target_path.clone());
+            let relocated = tokio::task::spawn_blocking(move || storage.relocate_until(&target, move_existing, &cancel))
+                .await
+                .unwrap_or_else(|e| Err(mailbackup_core::Error::Other(format!("storage move task failed: {}", e))));
+            match relocated {
                 Ok(count) => migrated_files = count,
+                Err(mailbackup_core::Error::Cancelled) => {
+                    mailbackup_core::event_log::log_event(
+                        "STORAGE_MOVE_CANCELLED",
+                        &format!(
+                            "Moving the archive to {} stopped: the client went away. The copy was removed; the archive stays in {}.",
+                            target_path.display(),
+                            current_dir.display()
+                        ),
+                    );
+                    return (StatusCode::CONFLICT, "The storage move was cancelled.").into_response();
+                }
                 Err(e) => {
                     let what = if move_existing { "migrate storage data" } else { "create the storage directory" };
                     return (
@@ -2698,7 +2749,11 @@ async fn api_update_settings(
     // 2. Relocate the database catalog if requested
     if let Some(target_db) = requested_db
         && target_db != current_db {
-        if let Err(e) = state.db.relocate(&target_db, move_db) {
+        let (db, target) = (state.db.clone(), target_db.clone());
+        let relocated = tokio::task::spawn_blocking(move || db.relocate(&target, move_db))
+            .await
+            .unwrap_or_else(|e| Err(mailbackup_core::Error::Other(format!("catalog move task failed: {}", e))));
+        if let Err(e) = relocated {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to relocate database: {}", e),
@@ -3748,6 +3803,54 @@ mod tests {
             StatusCode::OK
         );
         assert!(new_data.is_dir());
+    }
+
+    /// Issue #76: a client that goes away while the data folder is moved
+    /// cancels the copy, which leaves nothing behind; the server and its
+    /// config keep the old folder. With the client staying, the same move
+    /// completes.
+    #[tokio::test]
+    async fn a_storage_move_whose_client_went_away_is_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path(), Vec::new()).await;
+        state.config.read().await.save(&state.config_path).unwrap();
+        let router = create_router(state.clone());
+        let old = state.storage.base_dir();
+        let stored = state.storage.store_eml("acc", "INBOX", 1, None, b"Subject: x\r\n\r\nbody\r\n").unwrap();
+        let target = dir.path().join("exports/moved");
+        let saved_data_dir = || AppConfig::load_existing(&state.config_path).unwrap().unwrap().data_dir;
+
+        for client_stays in [false, true] {
+            // An archiver holds the storage lock: the move waits before it
+            // copies anything
+            let archiver = state.storage.lock_shared().unwrap();
+            let request = {
+                let router = router.clone();
+                let put = json_request("PUT", "/api/settings", serde_json::json!({ "data_dir": target }));
+                tokio::spawn(async move { router.oneshot(put).await.unwrap().status() })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            if !client_stays {
+                request.abort();
+            }
+            drop(archiver);
+
+            if client_stays {
+                assert_eq!(request.await.unwrap(), StatusCode::OK);
+                assert_eq!(state.storage.base_dir(), target);
+                assert_eq!(saved_data_dir(), target, "the move is saved");
+                assert!(target.join(&stored.relative_path).exists());
+            } else {
+                // Waits until the move has ended
+                let storage = state.storage.clone();
+                drop(tokio::task::spawn_blocking(move || storage.lock_shared().unwrap()).await.unwrap());
+                assert_eq!(state.storage.base_dir(), old, "still the old folder");
+                assert!(!target.exists(), "the copy was removed");
+                assert_eq!(state.config.read().await.data_dir, old);
+                assert_eq!(saved_data_dir(), old);
+                assert!(stored.absolute_path.exists());
+            }
+        }
     }
 
     #[tokio::test]

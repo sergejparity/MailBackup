@@ -1,3 +1,4 @@
+use crate::cancel::Cancel;
 use crate::error::{Error, Result};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -94,6 +95,60 @@ pub struct StoredMessageInfo {
     pub size_bytes: u64,
 }
 
+/// What a data-folder copy created, so a cancelled or failed copy can
+/// remove it again (and nothing that was there before).
+#[derive(Default)]
+struct Created {
+    files: Vec<PathBuf>,
+    /// Outermost first.
+    dirs: Vec<PathBuf>,
+}
+
+impl Created {
+    /// `create_dir_all`, remembering each folder it created.
+    fn dir_all(&mut self, dir: &Path) -> Result<()> {
+        let mut missing = Vec::new();
+        let mut at = Some(dir);
+        while let Some(path) = at {
+            if path.as_os_str().is_empty() || std::fs::symlink_metadata(path).is_ok() {
+                break;
+            }
+            missing.push(path.to_path_buf());
+            at = path.parent();
+        }
+        crate::private_fs::create_dir_all(dir)?;
+        self.dirs.extend(missing.into_iter().rev());
+        Ok(())
+    }
+
+    /// Copies a file to `dst`, which must not exist yet: a copy never
+    /// overwrites, so undoing it never removes a file it didn't create. OS
+    /// metadata files (`.DS_Store` and the like), which a target folder may
+    /// already hold, are left as they are and not copied. Returns whether
+    /// the file was copied.
+    fn copy(&mut self, src: &Path, dst: &Path) -> Result<bool> {
+        if std::fs::symlink_metadata(dst).is_ok() {
+            if dst.file_name().is_some_and(crate::safe_paths::is_ignorable) {
+                return Ok(false);
+            }
+            return Err(Error::Other(format!("'{}' already exists in the new data folder", dst.display())));
+        }
+        self.files.push(dst.to_path_buf());
+        crate::private_fs::copy(src, dst)?;
+        Ok(true)
+    }
+
+    fn undo(self) {
+        for file in self.files.iter().rev() {
+            let _ = std::fs::remove_file(file);
+        }
+        for dir in self.dirs.iter().rev() {
+            // Only empty: something else may have been put there meanwhile
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
 impl StorageEngine {
     pub fn new(base_dir: impl AsRef<Path>) -> Self {
         Self {
@@ -120,10 +175,18 @@ impl StorageEngine {
     /// switches. Returns the number of files copied. On an error the folder
     /// stays the current one.
     pub fn relocate(&self, new_base: impl AsRef<Path>, move_existing: bool) -> Result<u64> {
+        self.relocate_until(new_base, move_existing, &Cancel::default())
+    }
+
+    /// [`Self::relocate`] that checks `cancel` before each file it copies
+    /// (issue #76). If it is set, or the copy fails, what the copy created in
+    /// `new_base` is removed again and the folder stays the current one. Once
+    /// the copy is complete the switch is made, whatever `cancel` says then.
+    pub fn relocate_until(&self, new_base: impl AsRef<Path>, move_existing: bool, cancel: &Cancel) -> Result<u64> {
         let new_base = new_base.as_ref().to_path_buf();
         self.gate.exclusive(|| {
             let copied = if move_existing {
-                self.copy_locked(&new_base)?
+                self.copy_locked(&new_base, cancel)?
             } else {
                 crate::private_fs::create_dir_all(&new_base)?;
                 0
@@ -188,14 +251,18 @@ impl StorageEngine {
     /// switching to it (see [`Self::relocate`]), under the same exclusion.
     /// Returns the number of files copied.
     pub fn migrate_data(&self, new_base_dir: impl AsRef<Path>) -> Result<u64> {
-        self.gate.exclusive(|| self.copy_locked(new_base_dir.as_ref()))
+        self.gate.exclusive(|| self.copy_locked(new_base_dir.as_ref(), &Cancel::default()))
     }
 
     /// The copy of [`Self::migrate_data`]; the caller holds the gate. The
     /// current folder's lock is held exclusively throughout, so no archiver
     /// of another process is between storing a file there and committing its
     /// row. The lock file itself is not copied: each folder has its own.
-    fn copy_locked(&self, new_base: &Path) -> Result<u64> {
+    ///
+    /// Stops when `cancel` is set. On a cancellation or an error, the files
+    /// and folders this copy created are removed again (folders only if they
+    /// are then empty), so the target is left as it was found.
+    fn copy_locked(&self, new_base: &Path, cancel: &Cancel) -> Result<u64> {
         let old_base = self.base_dir();
         let new_base = new_base.to_path_buf();
 
@@ -203,20 +270,31 @@ impl StorageEngine {
             return Ok(0);
         }
 
-        crate::private_fs::create_dir_all(&new_base)?;
-
-        if !old_base.exists() {
-            return Ok(0);
-        }
-        let old_lock = self.lock_file()?;
-        old_lock.lock()?;
-
-        let mut copied_count = 0u64;
-
-        fn copy_dir_recursive(src: &Path, dst: &Path, copied: &mut u64) -> Result<()> {
-            if !dst.exists() {
-                crate::private_fs::create_dir_all(dst)?;
+        let mut created = Created::default();
+        let result = (|| {
+            created.dir_all(&new_base)?;
+            if !old_base.exists() {
+                return Ok(0);
             }
+            let old_lock = self.lock_file()?;
+            old_lock.lock()?;
+            let mut copied_count = 0u64;
+            copy_dir_recursive(&old_base, &new_base, &mut copied_count, &mut created, cancel)?;
+            Ok(copied_count)
+        })();
+        if result.is_err() {
+            created.undo();
+        }
+        return result;
+
+        fn copy_dir_recursive(
+            src: &Path,
+            dst: &Path,
+            copied: &mut u64,
+            created: &mut Created,
+            cancel: &Cancel,
+        ) -> Result<()> {
+            created.dir_all(dst)?;
             for entry in std::fs::read_dir(src)? {
                 let entry = entry?;
                 let file_type = entry.file_type()?;
@@ -231,17 +309,16 @@ impl StorageEngine {
                 let dst_path = dst.join(&file_name);
 
                 if file_type.is_dir() {
-                    copy_dir_recursive(&src_path, &dst_path, copied)?;
+                    copy_dir_recursive(&src_path, &dst_path, copied, created, cancel)?;
                 } else if file_type.is_file() {
-                    crate::private_fs::copy(&src_path, &dst_path)?;
-                    *copied += 1;
+                    cancel.check()?;
+                    if created.copy(&src_path, &dst_path)? {
+                        *copied += 1;
+                    }
                 }
             }
             Ok(())
         }
-
-        copy_dir_recursive(&old_base, &new_base, &mut copied_count)?;
-        Ok(copied_count)
     }
 
     pub fn sanitize_slug(input: &str) -> String {

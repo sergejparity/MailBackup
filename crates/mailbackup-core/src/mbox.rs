@@ -12,6 +12,7 @@
 //! local line endings and plain text): rewriting messages to satisfy it would
 //! lose the bytes the archive exists to keep.
 
+use crate::cancel::Cancel;
 use crate::error::Result;
 use crate::storage::StorageEngine;
 use chrono::{DateTime, Utc};
@@ -49,9 +50,21 @@ impl<'a> MboxExporter<'a> {
 
     /// [`Self::export_to_writer`], also counting the messages skipped
     /// because their file couldn't be read. A write error ends the export.
-    pub fn export_counted<W: Write>(&self, eml_relative_paths: &[String], mut writer: W) -> Result<ExportCount> {
+    pub fn export_counted<W: Write>(&self, eml_relative_paths: &[String], writer: W) -> Result<ExportCount> {
+        self.export_counted_until(eml_relative_paths, writer, &Cancel::default())
+    }
+
+    /// [`Self::export_counted`] that checks `cancel` before each message and
+    /// ends with [`crate::Error::Cancelled`] once it is set.
+    pub fn export_counted_until<W: Write>(
+        &self,
+        eml_relative_paths: &[String],
+        mut writer: W,
+        cancel: &Cancel,
+    ) -> Result<ExportCount> {
         let mut count = ExportCount::default();
         for rel_path in eml_relative_paths {
+            cancel.check()?;
             let eml_bytes = match self.storage.read_eml(rel_path) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -94,22 +107,40 @@ impl<'a> MboxExporter<'a> {
         output_path: impl AsRef<Path>,
         overwrite: bool,
     ) -> Result<ExportCount> {
+        self.export_to_mbox_until(eml_relative_paths, output_path, overwrite, &Cancel::default())
+    }
+
+    /// [`Self::export_to_mbox_counted`] that stops when `cancel` is set
+    /// (issue #76). The export is written to a temp file next to the target
+    /// and put in place only when it is complete, so a cancelled or failed
+    /// export never leaves a partial file, and a file it would overwrite
+    /// stays as it was until then. Without `overwrite`, an existing file is
+    /// an error.
+    pub fn export_to_mbox_until(
+        &self,
+        eml_relative_paths: &[String],
+        output_path: impl AsRef<Path>,
+        overwrite: bool,
+        cancel: &Cancel,
+    ) -> Result<ExportCount> {
         let output_path = output_path.as_ref();
         if let Some(parent) = output_path.parent()
             && !parent.as_os_str().is_empty() {
             crate::private_fs::create_dir_all(parent)?;
         }
-
-        let mut options = crate::private_fs::options();
-        options.write(true);
-        if overwrite {
-            options.create(true).truncate(true);
-        } else {
-            options.create_new(true);
+        if !overwrite && std::fs::symlink_metadata(output_path).is_ok() {
+            // Checked again when the file is put in place; this only spares
+            // writing an export that can't be kept
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("'{}' exists", output_path.display()),
+            )
+            .into());
         }
-        let file = options.open(output_path)?;
-        let writer = BufWriter::new(file);
-        let count = self.export_counted(eml_relative_paths, writer)?;
+
+        let count = crate::private_fs::write_with(output_path, overwrite, |file| {
+            self.export_counted_until(eml_relative_paths, BufWriter::new(file), cancel)
+        })?;
         info!("Exported {} messages to mbox ({} skipped): {}", count.written, count.skipped, output_path.display());
         Ok(count)
     }

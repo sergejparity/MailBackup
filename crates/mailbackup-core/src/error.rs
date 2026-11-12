@@ -76,6 +76,11 @@ pub enum Error {
     #[error("Account '{0}' is busy: a sync or a change of it is in progress")]
     AccountBusy(String),
 
+    /// A long operation stopped because its [`crate::cancel::Cancel`] flag
+    /// was set (its client went away); what it had started is undone.
+    #[error("The operation was cancelled")]
+    Cancelled,
+
     /// The server's response couldn't be parsed; the session can't be used
     /// for another command.
     #[error("IMAP protocol error: {0}")]
