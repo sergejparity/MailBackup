@@ -85,14 +85,14 @@ fn kind(result: Result<impl std::fmt::Debug>) -> Kind {
 }
 
 #[test]
-fn new_store_is_a_version_2_envelope_with_a_private_key_file() {
+fn new_store_is_a_version_3_envelope_with_a_private_key_file() {
     let fx = Fixture::new();
     let store = fx.store();
     store.set_password("acc", "hunter2").unwrap();
     assert_eq!(store.get_password("acc").unwrap(), "hunter2");
 
     let json = fx.json();
-    assert_eq!(json["version"], 2);
+    assert_eq!(json["version"], 3);
     assert!(json["kdf"].is_null());
     assert!(json["check"].as_str().unwrap().starts_with(ENC_PREFIX));
     assert!(json["entries"]["account:acc"].as_str().unwrap().starts_with(ENC_PREFIX));
@@ -209,7 +209,7 @@ fn damaged_stores_are_reported_and_never_overwritten() {
     let mut plaintext_entry = good.clone();
     plaintext_entry["entries"]["account:acc"] = serde_json::json!("plain");
     let mut newer = good.clone();
-    newer["version"] = serde_json::json!(3);
+    newer["version"] = serde_json::json!(4);
     let mut no_entries = good.clone();
     no_entries.as_object_mut().unwrap().remove("entries");
 
@@ -340,7 +340,7 @@ fn legacy_store_with_its_key_file_is_upgraded_in_place() {
 
     let store = fx.store();
     assert_eq!(store.get_password("a").unwrap(), "pw-a");
-    assert_eq!(fx.json()["version"], 2, "upgraded on first read");
+    assert_eq!(fx.json()["version"], 3, "upgraded on first read");
     assert_eq!(std::fs::read_to_string(fx.key_path()).unwrap(), hex::encode(key), "same key kept");
     assert_eq!(fx.store().get_password("b").unwrap(), "pw-b");
 }
@@ -353,10 +353,12 @@ fn legacy_path_derived_key_is_read_once_and_replaced_by_a_real_key() {
 
     assert_eq!(fx.store().get_password("a").unwrap(), "pw-a");
     let json = fx.json();
-    assert_eq!(json["version"], 2);
+    assert_eq!(json["version"], 3);
     let real = parse_key(&std::fs::read_to_string(fx.key_path()).unwrap()).unwrap();
     assert_ne!(real, weak);
-    assert!(decrypt_secret(json["check"].as_str().unwrap(), &weak).is_err(), "never written with the weak key");
+    let written: StoreFile = serde_json::from_value(json).unwrap();
+    assert!(!check_matches(&written, &weak), "never written with the weak key");
+    assert!(check_matches(&written, &real));
     assert_eq!(fx.store().get_password("a").unwrap(), "pw-a");
 }
 
@@ -369,9 +371,9 @@ fn legacy_sha256_passphrase_store_moves_to_argon2() {
     let store = fx.store_with_passphrase("my passphrase");
     assert_eq!(store.get_password("a").unwrap(), "pw-a");
     let json = fx.json();
-    assert_eq!(json["version"], 2);
+    assert_eq!(json["version"], 3);
     assert_eq!(json["kdf"]["alg"], "argon2id");
-    assert!(decrypt_secret(json["check"].as_str().unwrap(), &old).is_err());
+    assert!(!check_matches(&serde_json::from_value(json).unwrap(), &old));
     assert!(!fx.key_path().exists());
     assert_eq!(fx.store_with_passphrase("my passphrase").get_password("a").unwrap(), "pw-a");
 }
@@ -460,7 +462,7 @@ fn legacy_plaintext_and_undotted_files_are_migrated() {
     assert_eq!(store.get_password("a").unwrap(), "clear");
     assert!(!undotted.exists());
     assert!(!fx.raw().contains("clear"));
-    assert_eq!(fx.json()["version"], 2);
+    assert_eq!(fx.json()["version"], 3);
 }
 
 #[test]
@@ -1107,6 +1109,247 @@ fn a_partly_installed_service_keeps_its_disk_passwords() {
 }
 
 // ---------------------------------------------------------------------------
+// Values bound to their entry (version 3, issue #75)
+// ---------------------------------------------------------------------------
+
+fn bound_account(id: &str, server: &str) -> crate::config::AccountConfig {
+    crate::config::AccountConfig {
+        id: id.into(),
+        name: id.into(),
+        email: format!("{}@example.com", id),
+        provider: crate::config::ProviderType::GenericImap,
+        imap_server: server.into(),
+        imap_port: 993,
+        use_tls: true,
+        username: id.into(),
+        auth_type: crate::config::AuthType::Password,
+        schedule: None,
+        retention_days: None,
+        folder_filter: Default::default(),
+        gmail_smart_labels: true,
+        enabled: true,
+        storage_namespace: None,
+        credential_ref: None,
+        archive: None,
+        trust_server_ids: false,
+    }
+}
+
+/// A version 2 store (`enc:v1:` values, no associated data) with `key`, as
+/// 0.8.16 and earlier wrote it.
+fn unbound_store(key: &[u8; 32], entries: &[(&str, &str)]) -> serde_json::Value {
+    let entries: serde_json::Map<String, serde_json::Value> =
+        entries.iter().map(|(k, v)| (k.to_string(), serde_json::json!(encrypt_secret(v, key).unwrap()))).collect();
+    serde_json::json!({
+        "version": 2, "kdf": null,
+        "check": encrypt_secret(CHECK_VALUE, key).unwrap(),
+        "entries": entries,
+    })
+}
+
+#[test]
+fn swapping_two_accounts_values_makes_the_store_unreadable() {
+    let fx = Fixture::new();
+    let store = fx.store();
+    let a = bound_account("a", "imap.a.example");
+    let b = bound_account("b", "imap.b.example");
+    store.set_account_password(&a, "pw-a").unwrap();
+    store.set_account_password(&b, "pw-b").unwrap();
+    let good = fx.json();
+
+    // Password and binding both moved from b to a: the binding check alone
+    // would pass, the associated data doesn't
+    let mut swapped = good.clone();
+    for suffix in ["", ":binding"] {
+        let (ka, kb) = (format!("account:a{}", suffix), format!("account:b{}", suffix));
+        swapped["entries"][&ka] = good["entries"][&kb].clone();
+        swapped["entries"][&kb] = good["entries"][&ka].clone();
+    }
+    // Only the passwords swapped
+    let mut passwords = good.clone();
+    passwords["entries"]["account:a"] = good["entries"]["account:b"].clone();
+    passwords["entries"]["account:b"] = good["entries"]["account:a"].clone();
+    // The check value used as an entry
+    let mut check = good.clone();
+    check["entries"]["account:a"] = good["check"].clone();
+
+    for tampered in [swapped, passwords, check] {
+        fx.write_raw(&tampered);
+        let store = fx.store();
+        assert_eq!(kind(store.get_account_password(&a)), Kind::Corrupt);
+        assert_eq!(kind(store.set_password("c", "pw-c")), Kind::Corrupt);
+        assert_eq!(fx.json(), tampered, "a store that doesn't decrypt is never rewritten");
+    }
+}
+
+#[test]
+fn dropping_a_binding_does_not_rebind_the_password_on_first_use() {
+    let fx = Fixture::new();
+    let a = bound_account("a", "imap.a.example");
+    fx.store().set_account_password(&a, "pw-a").unwrap();
+    let mut dropped = fx.json();
+    dropped["entries"].as_object_mut().unwrap().remove("account:a:binding");
+    fx.write_raw(&dropped);
+
+    // Pointed at another server: without associated data the missing binding
+    // would be trusted on first use and the password sent there
+    let moved = bound_account("a", "evil.example");
+    assert_eq!(kind(fx.store().get_account_password(&moved)), Kind::Corrupt);
+    assert_eq!(fx.json(), dropped);
+}
+
+#[test]
+fn a_password_without_a_binding_is_still_bound_on_first_use() {
+    let fx = Fixture::new();
+    let a = bound_account("a", "imap.a.example");
+    fx.store().set_password("a", "pw-a").unwrap(); // saved before bindings existed
+    assert_eq!(fx.store().get_account_password(&a).unwrap(), "pw-a");
+    assert!(fx.json()["entries"]["account:a:binding"].is_string());
+    // Rewritten with the binding in its associated data, and enforced
+    assert_eq!(fx.store().get_account_password(&a).unwrap(), "pw-a");
+    let moved = bound_account("a", "evil.example");
+    assert!(matches!(fx.store().get_account_password(&moved), Err(Error::CredentialMismatch(_))));
+}
+
+#[test]
+fn an_unbound_value_is_refused_in_a_version_3_store() {
+    let fx = Fixture::new();
+    let key = [3u8; 32];
+    std::fs::write(fx.key_path(), hex::encode(key)).unwrap();
+    fx.write_raw(&unbound_store(&key, &[("account:a", "pw-a"), ("account:b", "pw-b")]));
+    let old = fx.json();
+    fx.store().set_password("c", "pw-c").unwrap();
+    let mut mixed = fx.json();
+    assert_eq!(mixed["version"], 3);
+    // b's old value, copied in from the version 2 file
+    mixed["entries"]["account:a"] = old["entries"]["account:b"].clone();
+    fx.write_raw(&mixed);
+    assert_eq!(kind(fx.store().get_password("a")), Kind::Corrupt);
+    assert_eq!(kind(fx.store().set_password("d", "x")), Kind::Corrupt);
+    assert_eq!(fx.json(), mixed);
+}
+
+#[test]
+fn a_version_2_store_is_upgraded_only_after_every_entry_decrypts() {
+    let fx = Fixture::new();
+    let key = [3u8; 32];
+    std::fs::write(fx.key_path(), hex::encode(key)).unwrap();
+    let a = bound_account("a", "imap.a.example");
+    let binding = connection_binding(&a);
+    fx.write_raw(&unbound_store(&key, &[("account:a", "pw-a"), ("account:a:binding", &binding), ("account:b", "pw-b")]));
+
+    // Read: every value decrypts, so the store is rewritten as version 3,
+    // with the same key and the same contents
+    assert_eq!(fx.store().get_account_password(&a).unwrap(), "pw-a");
+    let json = fx.json();
+    assert_eq!(json["version"], 3);
+    assert!(json["check"].as_str().unwrap().starts_with(ENC_PREFIX));
+    for value in json["entries"].as_object().unwrap().values() {
+        assert!(value.as_str().unwrap().starts_with(ENC_PREFIX));
+    }
+    assert_eq!(std::fs::read_to_string(fx.key_path()).unwrap(), hex::encode(key));
+    assert_eq!(fx.local(), BTreeMap::from([
+        ("account:a".to_string(), "pw-a".to_string()),
+        ("account:a:binding".to_string(), binding.clone()),
+        ("account:b".to_string(), "pw-b".to_string()),
+    ]));
+
+    // One damaged value: nothing is rewritten, by a read or a write
+    let fx = Fixture::new();
+    std::fs::write(fx.key_path(), hex::encode(key)).unwrap();
+    let mut damaged = unbound_store(&key, &[("account:a", "pw-a"), ("account:b", "pw-b")]);
+    damaged["entries"]["account:b"] = serde_json::json!(encrypt_secret("pw-b", &[4u8; 32]).unwrap());
+    fx.write_raw(&damaged);
+    assert_eq!(kind(fx.store().get_password("a")), Kind::Corrupt);
+    assert_eq!(kind(fx.store().set_password("c", "x")), Kind::Corrupt);
+    assert_eq!(fx.json(), damaged);
+
+    // A version 2 store protected by a passphrase keeps its salt
+    let fx = Fixture::new();
+    fx.store_with_passphrase("pw").set_password("seed", "x").unwrap();
+    let derived = {
+        let store = fx.store_with_passphrase("pw");
+        let file: StoreFile = serde_json::from_value(fx.json()).unwrap();
+        store.key_for_v2(&file, &fx.store_path()).unwrap()
+    };
+    let mut v2 = unbound_store(&derived.key, &[("account:a", "pw-a")]);
+    v2["kdf"] = fx.json()["kdf"].clone();
+    fx.write_raw(&v2);
+    assert_eq!(fx.store_with_passphrase("pw").get_password("a").unwrap(), "pw-a");
+    assert_eq!(fx.json()["version"], 3);
+    assert_eq!(fx.json()["kdf"], v2["kdf"]);
+}
+
+/// The keyring fallback decision from #45 doesn't depend on the store's
+/// format: an absent keyring uses the local store, a locked one (or one that
+/// refuses access) and a corrupt store block it.
+#[test]
+fn keyring_fallback_decision_is_the_same_for_both_formats() {
+    let key = [3u8; 32];
+    for version in [2, 3] {
+        let setup = || {
+            let fx = Fixture::new();
+            std::fs::write(fx.key_path(), hex::encode(key)).unwrap();
+            fx.write_raw(&unbound_store(&key, &[("account:acc", "pw")]));
+            if version == 3 {
+                fx.service_reader().set_password("other", "x").unwrap();
+                assert_eq!(fx.json()["version"], 3);
+            }
+            fx
+        };
+
+        // Absent / headless: the local store, both for reading and writing
+        let fx = setup();
+        let keyring = fx.fake(&[]);
+        keyring.set_state(Some(Kind::Unavailable));
+        let store = fx.store_with(keyring.clone());
+        assert_eq!(store.get_password("acc").unwrap(), "pw", "v{}", version);
+        store.set_password("new", "pw2").unwrap();
+        assert_eq!(fx.local().get("account:new").map(String::as_str), Some("pw2"));
+        assert_eq!(fx.json()["version"], 3);
+
+        // Locked or access denied (both map to Locked): never written to disk
+        let fx = setup();
+        let before = fx.raw();
+        let keyring = fx.fake(&[]);
+        keyring.set_state(Some(Kind::Locked));
+        let store = fx.store_with(keyring);
+        assert_eq!(kind(store.set_password("new", "pw2")), Kind::Locked, "v{}", version);
+        assert_eq!(fx.raw(), before, "v{}: nothing written past a locked keyring", version);
+        // A read may upgrade the store's format (its key is the key file's),
+        // but adds no secret
+        let entries = fx.local();
+        assert_eq!(kind(store.get_password("missing")), Kind::Locked);
+        assert_eq!(fx.local(), entries);
+
+        // A locked keyring holding the store's only key blocks
+        let fx = setup();
+        std::fs::remove_file(fx.key_path()).unwrap();
+        let before = fx.raw();
+        let locked = fx.store_with(Arc::new(FailingKeyring::new(Kind::Locked)));
+        assert_eq!(kind(locked.get_password("acc")), Kind::Locked, "v{}", version);
+        assert_eq!(kind(locked.set_password("acc", "x")), Kind::Locked);
+        assert!(!fx.key_path().exists());
+        assert_eq!(fx.raw(), before);
+
+        // A corrupt store blocks, with or without a keyring
+        let fx = setup();
+        let mut corrupt = fx.json();
+        let entry = corrupt["entries"]["account:acc"].as_str().unwrap().to_string();
+        let flipped = if entry.ends_with('0') { '1' } else { '0' };
+        corrupt["entries"]["account:acc"] = serde_json::json!(format!("{}{}", &entry[..entry.len() - 1], flipped));
+        fx.write_raw(&corrupt);
+        for keyring in [fx.fake(&[]), { let k = fx.fake(&[]); k.set_state(Some(Kind::Unavailable)); k }] {
+            let store = fx.store_with(keyring);
+            assert_eq!(kind(store.get_password("acc")), Kind::Corrupt, "v{}", version);
+            assert_eq!(kind(store.delete_password("acc")), Kind::Corrupt);
+        }
+        assert_eq!(kind(fx.store().set_password("new", "x")), Kind::Corrupt);
+        assert_eq!(fx.json(), corrupt);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fixed vectors (issue #40). Computed independently (Python `cryptography` /
 // `hashlib`), so they pin the algorithms and encodings, not just whatever the
 // current crates produce. A dependency upgrade must pass them unchanged.
@@ -1129,8 +1372,57 @@ fn vector_aes_256_gcm_entry_decrypts() {
     let a = encrypt_secret(VECTOR_SECRET, &vector_key()).unwrap();
     let b = encrypt_secret(VECTOR_SECRET, &vector_key()).unwrap();
     assert_ne!(a, b);
-    assert!(a.starts_with(ENC_PREFIX) && a.len() == encoded.len());
+    assert!(a.starts_with(ENC_PREFIX_V1) && a.len() == encoded.len());
     assert_eq!(decrypt_secret(&a, &vector_key()).unwrap(), VECTOR_SECRET);
+}
+
+#[test]
+fn vector_aes_256_gcm_bound_entry_decrypts() {
+    // Same key, nonce and secret as above. The associated data is
+    // be64(len) "mailbackup:credential-store:v3", 0x01 (an entry),
+    // be64(len) "account:acct-live", then 0x01 and be64(len) <binding>, or
+    // 0x00 for no binding. The check value's is the label and 0x00.
+    let binding = "imap.example.test:993:live@example.test";
+    let bound = "enc:v2:000102030405060708090a0b:8c46e6dfe1d0c81a9423c462e236e7c6f10f54a66b9ff84b14bb841829e137b98570d798fd8725bf8d";
+    let unbound = "enc:v2:000102030405060708090a0b:8c46e6dfe1d0c81a9423c462e236e7c6f10f54a66b9ff84b14385026c83822bbf6d50032075894f82a";
+    let check = "enc:v2:000102030405060708090a0b:925ee1c7ebd4df1882738d64f321e6d7a55b7ab5c40e48a01e127162288a265242fde9e5a5cbc892bfa2383ad29c";
+    let with_binding = associated_data(Aad::Entry { name: "account:acct-live", binding: Some(binding) });
+    let without_binding = associated_data(Aad::Entry { name: "account:acct-live", binding: None });
+    assert_eq!(decrypt_bound(bound, &vector_key(), &with_binding).unwrap(), VECTOR_SECRET);
+    assert_eq!(decrypt_bound(unbound, &vector_key(), &without_binding).unwrap(), VECTOR_SECRET);
+    assert_eq!(decrypt_bound(check, &vector_key(), &associated_data(Aad::Check)).unwrap(), CHECK_VALUE);
+    // Bound to exactly that identity
+    assert!(decrypt_bound(bound, &vector_key(), &without_binding).is_err());
+    assert!(decrypt_bound(unbound, &vector_key(), &with_binding).is_err());
+    let other = associated_data(Aad::Entry { name: "account:acct-other", binding: Some(binding) });
+    assert!(decrypt_bound(bound, &vector_key(), &other).is_err());
+    assert!(decrypt_secret(&bound.replace("enc:v2:", "enc:v1:"), &vector_key()).is_err());
+
+    let a = encrypt_bound(VECTOR_SECRET, &vector_key(), &with_binding).unwrap();
+    assert!(a.starts_with(ENC_PREFIX) && a.len() == bound.len());
+    assert_eq!(decrypt_bound(&a, &vector_key(), &with_binding).unwrap(), VECTOR_SECRET);
+}
+
+#[test]
+fn associated_data_never_coincides_for_different_identities() {
+    // Shifting bytes between the name and the binding, or an empty binding
+    // against none, must change the encoding
+    let cases = [
+        associated_data(Aad::Check),
+        associated_data(Aad::Entry { name: "", binding: None }),
+        associated_data(Aad::Entry { name: "", binding: Some("") }),
+        associated_data(Aad::Entry { name: "account:a", binding: None }),
+        associated_data(Aad::Entry { name: "account:a", binding: Some("") }),
+        associated_data(Aad::Entry { name: "account:a", binding: Some("b") }),
+        associated_data(Aad::Entry { name: "account:ab", binding: None }),
+        associated_data(Aad::Entry { name: "account:ab", binding: Some("") }),
+        associated_data(Aad::Entry { name: "account:a\u{1}", binding: Some("b") }),
+    ];
+    for (i, a) in cases.iter().enumerate() {
+        for b in &cases[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
 }
 
 #[test]

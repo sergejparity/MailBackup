@@ -76,7 +76,7 @@ fn test_credential_fallback_store() {
     // Verify that the file on disk is encrypted and DOES NOT contain plaintext!
     let raw_file = std::fs::read_to_string(&cred_file).unwrap();
     assert!(!raw_file.contains("supersecret123"), "Plaintext password must not be present on disk!");
-    assert!(raw_file.contains("enc:v1:"), "Stored secrets must be encrypted with enc:v1: prefix");
+    assert!(raw_file.contains("enc:v2:"), "Stored secrets must be encrypted with the enc:v2: prefix");
 
     store.delete_password("acc1").unwrap();
     assert!(store.get_password("acc1").is_err());
@@ -106,7 +106,7 @@ fn test_legacy_plaintext_credential_migration() {
     // The file on disk must now be automatically upgraded to AES-256-GCM ciphertext
     let upgraded_raw = std::fs::read_to_string(&cred_file).unwrap();
     assert!(!upgraded_raw.contains("cleartext_password_999"), "Plaintext must be erased from disk!");
-    assert!(upgraded_raw.contains("enc:v1:"), "Upgraded credentials must be encrypted");
+    assert!(upgraded_raw.contains("enc:v2:"), "Upgraded credentials must be encrypted");
 
     // Reading again after encryption must still succeed
     let retrieved_again = store.get_password("legacy_user").unwrap();
@@ -137,7 +137,7 @@ fn test_legacy_undotted_file_migration() {
     assert!(target_file.exists());
     let raw = std::fs::read_to_string(&target_file).unwrap();
     assert!(!raw.contains("secret456"));
-    assert!(raw.contains("enc:v1:"));
+    assert!(raw.contains("enc:v2:"));
 }
 
 #[test]

@@ -113,8 +113,9 @@ fn key_file_store_update_survives_a_restart() {
     old_moved.imap_port = 143;
     assert!(matches!(store.get_account_password(&old_moved), Err(Error::CredentialMismatch(_))));
 
+    // Rewritten as version 3 (values bound to their entry, issue #75)
     let file = read_json(&dir.path().join("config").join(".credentials_store.json"));
-    assert_eq!(file["version"], 2);
+    assert_eq!(file["version"], 3);
     assert!(file["kdf"].is_null());
     assert_eq!(std::fs::read(dir.path().join("config").join(".credentials_key")).unwrap(), key_before, "same key");
 }
@@ -259,7 +260,7 @@ fn a_damaged_entry_fails_and_changes_nothing() {
 
 #[test]
 fn an_unreadable_or_unknown_store_fails_and_changes_nothing() {
-    for content in [&b"{ \"version\": 2, \"entr"[..], br#"{"version": 3, "kdf": null, "check": "", "entries": {}}"#, b"[1, 2]"] {
+    for content in [&b"{ \"version\": 2, \"entr"[..], br#"{"version": 4, "kdf": null, "check": "", "entries": {}}"#, b"[1, 2]"] {
         let dir = copy_fixture(&fixtures_root().join("credentials").join("key-file"));
         std::fs::write(dir.path().join("config").join(".credentials_store.json"), content).unwrap();
         let store = key_file_store(dir.path(), Arc::new(NoKeyring));
@@ -338,7 +339,7 @@ fn invalid_or_excessive_kdf_parameters_fail_before_any_derivation() {
 // --- Credential store: legacy formats --------------------------------------
 
 #[test]
-fn legacy_formats_are_read_and_upgraded_to_v2() {
+fn legacy_formats_are_read_and_upgraded_to_the_current_envelope() {
     let legacy = fixtures_root().join("credentials").join("legacy");
     let cases: [(&str, Option<&str>, &str, &str); 4] = [
         ("plaintext", None, "acct-plain", "synthetic-plaintext-password"),
@@ -350,9 +351,9 @@ fn legacy_formats_are_read_and_upgraded_to_v2() {
         let dir = copy_fixture(&legacy.join(name));
         let store = passphrase_store(dir.path(), passphrase);
         assert_eq!(store.get_password(id).unwrap(), secret, "{}", name);
-        // Upgraded in place to a version 2 store; a restart reads it again
+        // Upgraded in place to a version 3 store; a restart reads it again
         let file = read_json(&dir.path().join(".credentials_store.json"));
-        assert_eq!(file["version"], 2, "{}", name);
+        assert_eq!(file["version"], 3, "{}", name);
         assert_eq!(file["kdf"].is_null(), passphrase.is_none(), "{}", name);
         assert!(!dir.path().join("credentials_store.json").exists(), "{}: the undotted file is removed", name);
         assert_eq!(passphrase_store(dir.path(), passphrase).get_password(id).unwrap(), secret, "{}", name);

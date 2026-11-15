@@ -57,6 +57,40 @@ fn generate_compat_fixtures() {
     );
 }
 
+/// The version 3 credential store (`enc:v2:` values bound to their entry,
+/// issue #75), in key-file and passphrase mode. A separate set: the fixtures
+/// above stay as the version 2 writer left them.
+///
+/// ```text
+/// MAILBACKUP_WRITE_COMPAT_FIXTURES=1 MAILBACKUP_FIXTURE_COMMIT=<sha> \
+///     cargo test -p mailbackup-core --test compat_generate generate_store_v3_fixtures -- --ignored
+/// ```
+#[test]
+#[ignore = "writes the committed fixtures; run once, explicitly (see the module docs)"]
+fn generate_store_v3_fixtures() {
+    if std::env::var("MAILBACKUP_WRITE_COMPAT_FIXTURES").as_deref() != Ok("1") {
+        panic!("Set MAILBACKUP_WRITE_COMPAT_FIXTURES=1 to write the fixtures");
+    }
+    let commit = std::env::var("MAILBACKUP_FIXTURE_COMMIT").expect("set MAILBACKUP_FIXTURE_COMMIT to the writer's commit");
+    let root = store_v3_fixtures_root();
+    assert!(!root.exists(), "{} already exists: fixtures are written once and never regenerated", root.display());
+
+    credentials_key_file(&root.join("key-file"));
+    credentials_passphrase(&root.join("passphrase"));
+    let store = read_json(&root.join("key-file").join("config").join(".credentials_store.json"));
+    assert_eq!(store["version"], 3, "written by a version that writes version 3 stores");
+
+    write_json(
+        &root.join("WRITER.json"),
+        &json!({
+            "mailbackup_version": env!("CARGO_PKG_VERSION"),
+            "commit": commit,
+            "written_at": chrono::Utc::now().to_rfc3339(),
+            "note": "Version 3 credential stores, written once by tests/compat_generate.rs (generate_store_v3_fixtures). Never regenerate."
+        }),
+    );
+}
+
 // --- Credential store ------------------------------------------------------
 
 fn store_at(dir: &Path) -> CredentialStore {
