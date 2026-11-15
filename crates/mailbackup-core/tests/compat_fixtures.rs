@@ -60,6 +60,7 @@ fn fails_without_change<T: std::fmt::Debug>(dir: &Path, expected: Kind, op: impl
 
 #[test]
 fn key_file_store_has_the_v2_envelope_and_entry_names() {
+    // The fixture as the version 2 writer left it (read and upgraded below)
     let fx = fixtures_root().join("credentials").join("key-file");
     let expected = read_json(&fx.join("expected.json"));
     let file = read_json(&fx.join("config").join(".credentials_store.json"));
@@ -131,6 +132,134 @@ fn deleting_an_adopted_secret_removes_both_copies_for_good() {
     // too; the other legacy entry stays
     let legacy = entry_names(&dir.path().join("home").join(".credentials_store.json"));
     assert_eq!(legacy, BTreeSet::from([format!("account:{}", DELETED_ID)]));
+}
+
+// --- Credential store: version 3 (values bound to their entry, #75) --------
+
+fn v3_key_file() -> std::path::PathBuf {
+    store_v3_fixtures_root().join("key-file")
+}
+
+#[test]
+fn v3_key_file_store_has_bound_values_and_the_same_entry_names() {
+    let fx = v3_key_file();
+    let expected = read_json(&fx.join("expected.json"));
+    let file = read_json(&fx.join("config").join(".credentials_store.json"));
+    assert_eq!(file["version"], 3);
+    assert!(file["kdf"].is_null());
+    assert!(file["check"].as_str().unwrap().starts_with("enc:v2:"));
+    for value in file["entries"].as_object().unwrap().values() {
+        assert!(value.as_str().unwrap().starts_with("enc:v2:"), "every value is bound");
+    }
+    assert_eq!(entry_names(&fx.join("config").join(".credentials_store.json")), strings(&expected["config_store_entries"]));
+    // The same scenario as the version 2 fixture
+    let v2 = read_json(&fixtures_root().join("credentials").join("key-file").join("expected.json"));
+    assert_eq!(expected, v2);
+}
+
+#[test]
+fn v3_key_file_store_reads_every_secret_without_rewriting() {
+    let dir = copy_fixture(&v3_key_file());
+    let before = snapshot_data_files(dir.path());
+    let store = key_file_store(dir.path(), Arc::new(NoKeyring));
+    assert_eq!(store.get_account_password(&live_account()).unwrap(), LIVE_PW);
+    assert_eq!(store.get_account_password(&staged_account()).unwrap(), STAGED_PW);
+    assert_eq!(store.get_password(PRE_BINDING_ID).unwrap(), PRE_BINDING_PW);
+    assert_eq!(store.get_password(ADOPTED_ID).unwrap(), ADOPTED_PW);
+    assert_eq!(kind(store.get_password(DELETED_ID).unwrap_err()), Some(Kind::NotFound));
+    let mut moved = live_account();
+    moved.imap_server = "elsewhere.example.test".to_string();
+    assert!(matches!(store.get_account_password(&moved), Err(Error::CredentialMismatch(_))));
+    assert_eq!(snapshot_data_files(dir.path()), before, "an up-to-date store isn't rewritten by reads");
+}
+
+#[test]
+fn v3_passphrase_store_reads_and_keeps_its_kdf() {
+    let dir = copy_fixture(&store_v3_fixtures_root().join("passphrase"));
+    let kdf_before = read_json(&dir.path().join(".credentials_store.json"))["kdf"].clone();
+    let store = passphrase_store(dir.path(), Some(PASSPHRASE));
+    assert_eq!(store.get_account_password(&live_account()).unwrap(), LIVE_PW);
+    assert_eq!(store.get_account_password(&staged_account()).unwrap(), STAGED_PW);
+    store.set_password("acct-new", "synthetic-new").unwrap();
+    let file = read_json(&dir.path().join(".credentials_store.json"));
+    assert_eq!(file["version"], 3);
+    assert_eq!(file["kdf"], kdf_before);
+    fails_without_change(dir.path(), Kind::WrongKey, || passphrase_store(dir.path(), Some("not it")).get_password("acct-new"));
+}
+
+/// Rewrites the v3 key-file fixture's config store with `change`.
+fn tampered_v3(change: impl FnOnce(&mut serde_json::Value)) -> tempfile::TempDir {
+    let dir = copy_fixture(&v3_key_file());
+    let path = dir.path().join("config").join(".credentials_store.json");
+    let mut file = read_json(&path);
+    change(&mut file);
+    write_json(&path, &file);
+    dir
+}
+
+type Tamper<'a> = Box<dyn Fn(&mut serde_json::Value) + 'a>;
+
+#[test]
+fn v3_values_moved_between_entries_fail_and_change_nothing() {
+    let live = "account:acct-live";
+    let staged = "account:acct-live~cred-1";
+    let swaps: [Tamper<'_>; 4] = [
+        // Two passwords swapped
+        Box::new(|f| {
+            let (a, b) = (f["entries"][live].clone(), f["entries"][staged].clone());
+            f["entries"][live] = b;
+            f["entries"][staged] = a;
+        }),
+        // Password and binding both swapped: the binding check alone passes
+        Box::new(|f| {
+            for suffix in ["", ":binding"] {
+                let (ka, kb) = (format!("{}{}", live, suffix), format!("{}{}", staged, suffix));
+                let (a, b) = (f["entries"][&ka].clone(), f["entries"][&kb].clone());
+                f["entries"][&ka] = b;
+                f["entries"][&kb] = a;
+            }
+        }),
+        // The binding dropped, so it would be re-bound on first use
+        Box::new(|f| {
+            f["entries"].as_object_mut().unwrap().remove(&format!("{}:binding", live));
+        }),
+        // A version 2 value pasted in
+        Box::new(|f| {
+            let v2 = read_json(&fixtures_root().join("credentials").join("key-file").join("config").join(".credentials_store.json"));
+            f["entries"][live] = v2["entries"][live].clone();
+        }),
+    ];
+    for swap in swaps {
+        let dir = tampered_v3(|f| swap(f));
+        let store = key_file_store(dir.path(), Arc::new(NoKeyring));
+        fails_without_change(dir.path(), Kind::Corrupt, || store.get_account_password(&live_account()));
+        fails_without_change(dir.path(), Kind::Corrupt, || store.set_password("acct-new", "x"));
+    }
+}
+
+#[test]
+fn v3_damaged_store_or_locked_keyring_never_falls_back_to_the_legacy_copy() {
+    // #45, unchanged by the format: a damaged store blocks the legacy copy
+    let dir = tampered_v3(|f| {
+        let entry = f["entries"]["account:acct-live"].as_str().unwrap().to_string();
+        f["entries"]["account:acct-live"] = serde_json::Value::String(entry.replace("enc:v2:", "enc:v2:zz"));
+    });
+    let store = key_file_store(dir.path(), Arc::new(NoKeyring));
+    fails_without_change(dir.path(), Kind::Corrupt, || store.get_password(ADOPTED_ID));
+
+    // A locked keyring is an error, not the legacy copy
+    let dir = copy_fixture(&v3_key_file());
+    let kr_dir = dir.path().join("kr");
+    std::fs::create_dir_all(&kr_dir).unwrap();
+    let home = dir.path().join("home");
+    let store = store_in(&kr_dir, Arc::new(FailingKeyring(Kind::Locked)))
+        .with_legacy_store(home.join(".credentials_store.json"), home.join(".credentials_key"));
+    fails_without_change(dir.path(), Kind::Locked, || store.get_password(ADOPTED_ID));
+
+    // No keyring at all: the local store and then the legacy location are read
+    let dir = copy_fixture(&v3_key_file());
+    let store = key_file_store(dir.path(), Arc::new(NoKeyring));
+    assert_eq!(store.get_password(ADOPTED_ID).unwrap(), ADOPTED_PW);
 }
 
 // --- Credential store: keyring mode ----------------------------------------

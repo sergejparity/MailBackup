@@ -1,0 +1,6 @@
+{
+  "commit": "3c923d6cd84fda96179d134c800028933caddfa5",
+  "mailbackup_version": "0.9.0",
+  "note": "Version 3 credential stores, written once by tests/compat_generate.rs (generate_store_v3_fixtures). Never regenerate.",
+  "written_at": "2026-11-15T20:09:39.115946411+00:00"
+}

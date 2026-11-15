@@ -20,5 +20,6 @@ Rules:
 - Tests (`tests/compat_fixtures.rs`) work on copies and never write here.
 - **Never regenerate** these with upgraded dependencies. The generator
   (`tests/compat_generate.rs`) refuses to overwrite them. If a format changes on
-  purpose, add a new, separately versioned fixture set and keep this one.
+  purpose, add a new, separately versioned fixture set and keep this one
+  (as `../compat-store-v3/` does for the version 3 credential store).
 - Git must not touch line endings here (see `.gitattributes`).
