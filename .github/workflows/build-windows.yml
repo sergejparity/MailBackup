@@ -111,25 +111,25 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
     steps:
+      # Only for scripts/release-files.sh; no build runs here
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Download the build's artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: mailbackup-windows-x64
           path: artifact
 
-      # One flat folder of release files; the CLI is named for the platform so
-      # it can't be mistaken for another platform's build later
+      # One flat folder of release files under fixed names without spaces
+      # (the installers' own names contain one, which GitHub would turn into
+      # a dot on upload), and SHA256SUMS
       - name: Collect release files and write SHA256SUMS
         run: |
-          set -euo pipefail
-          mkdir dist
-          cp artifact/mailbackup.exe dist/mailbackup-cli-windows-x64.exe
-          cp artifact/mailbackup-server.exe dist/mailbackup-server-windows-x64.exe
-          cp artifact/mailbackup-gui.exe dist/mailbackup-gui-windows-x64.exe
-          cp artifact/bundle/nsis/*.exe artifact/bundle/msi/*.msi dist/
-          cd dist
-          sha256sum -- * > SHA256SUMS
-          cat SHA256SUMS
+          scripts/release-files.sh collect artifact dist "${TAG#v}"
+          cat dist/SHA256SUMS
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -148,12 +148,9 @@ jobs:
           set -euo pipefail
           mkdir verify
           gh release download "$TAG" --dir verify
-          cd verify
-          sha256sum -c SHA256SUMS
-          # Every file in the release must be listed, not only listed files
-          # present
-          diff <(ls -1 | grep -vx SHA256SUMS | sort) <(awk '{print $2}' SHA256SUMS | sort)
-          for f in *.exe *.msi; do
+          # Every listed file matches, and every file is listed
+          scripts/release-files.sh check verify
+          for f in verify/*.exe verify/*.msi; do
             gh attestation verify "$f" --repo "$GH_REPO"
           done
 

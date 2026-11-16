@@ -55,6 +55,10 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
+      # The release job's file handling (scripts/release-files.sh)
+      - name: Test release file scripts
+        run: scripts/release-files-test.sh
+
   clippy:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
