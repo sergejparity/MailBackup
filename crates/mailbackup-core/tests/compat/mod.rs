@@ -20,6 +20,12 @@ pub fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("compat")
 }
 
+/// Root of the version 3 credential store fixtures (values bound to their
+/// entry, issue #75), written once by `generate_store_v3_fixtures`.
+pub fn store_v3_fixtures_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("compat-store-v3")
+}
+
 pub const PASSPHRASE: &str = "synthetic fixture passphrase";
 pub const IDENTITY: &str = "imap.example.test:993:live@example.test";
 

@@ -3,16 +3,25 @@
 //! The local store (`.credentials_store.json`) is a versioned envelope:
 //!
 //! ```json
-//! { "version": 2,
+//! { "version": 3,
 //!   "kdf": null | { "alg": "argon2id", "version": 19, "m_cost": …, "t_cost": …, "p_cost": …, "salt": "<hex>" },
-//!   "check": "enc:v1:…",
-//!   "entries": { "account:<id>": "enc:v1:<nonce hex>:<ciphertext hex>", … } }
+//!   "check": "enc:v2:…",
+//!   "entries": { "account:<id>": "enc:v2:<nonce hex>:<ciphertext hex>", … } }
 //! ```
 //!
 //! Each value is AES-256-GCM. The key is either a random key kept in the key
 //! file (`.credentials_key`, and the keyring when available) or, with `kdf`
 //! set, derived with Argon2id from the `MAILBACKUP_MASTER_KEY` passphrase.
 //! `check` holds a known value, so a wrong key is told apart from damage.
+//!
+//! Since version 3 every value (`enc:v2:`) is bound to its place with
+//! associated data (see [`associated_data`]): the entry's name and, for a
+//! password, its connection binding. Someone who can write the file but not
+//! read the key can't move one account's password to another account, nor
+//! drop a binding so the password gets bound to new settings on first use;
+//! either way the store no longer decrypts. Version 2 stores (`enc:v1:`, no
+//! associated data) are read and rewritten as version 3 once every entry has
+//! decrypted; a version 3 store accepts only `enc:v2:` values.
 //!
 //! Rules:
 //! - Only `NotFound` means "no secret". A store that can't be read, parsed or
@@ -40,10 +49,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const SERVICE_NAME: &str = "mailbackup";
-const ENC_PREFIX: &str = "enc:v1:";
+/// Values without associated data: version 2 stores and the flat legacy maps.
+const ENC_PREFIX_V1: &str = "enc:v1:";
+/// Values bound to their entry with associated data: version 3 stores.
+const ENC_PREFIX: &str = "enc:v2:";
 const MASTER_KEY_ENTRY: &str = "master_encryption_key";
 const PASSPHRASE_VARS: [&str; 2] = ["MAILBACKUP_MASTER_KEY", "MAILBACKUP_ENCRYPTION_KEY"];
-const STORE_VERSION: u32 = 2;
+const STORE_VERSION: u32 = 3;
+/// The previous envelope, with `enc:v1:` values; read and upgraded.
+const STORE_VERSION_UNBOUND: u32 = 2;
 const CHECK_VALUE: &str = "mailbackup:credential-store:v2";
 
 // Argon2id parameters for new stores (OWASP: 19 MiB, 2 passes, 1 lane), and
@@ -751,7 +765,7 @@ impl CredentialStore {
             let file: StoreFile = serde_json::from_value(value.clone()).map_err(|e| {
                 corrupt(format!("The credential store {} is damaged ({}). It was left unchanged.", path.display(), e))
             })?;
-            if file.version != STORE_VERSION {
+            if file.version != STORE_VERSION && file.version != STORE_VERSION_UNBOUND {
                 return Err(corrupt(format!(
                     "The credential store {} has version {}, which this version of MailBackup can't read. It was left unchanged.",
                     path.display(),
@@ -760,7 +774,10 @@ impl CredentialStore {
             }
             let store_key = self.key_for_v2(&file, &path)?;
             let entries = decrypt_v2(&file, &store_key.key, &path)?;
-            Ok(Some(Loaded { entries, current: Some(store_key), legacy_path: (!in_place).then_some(path), needs_migration: !in_place }))
+            // An older envelope is rewritten only here, after every entry has
+            // decrypted; a store that doesn't decrypt is never rewritten
+            let needs_migration = !in_place || file.version != STORE_VERSION;
+            Ok(Some(Loaded { entries, current: Some(store_key), legacy_path: (!in_place).then_some(path), needs_migration }))
         } else if object.values().all(|v| v.is_string()) {
             let map: BTreeMap<String, String> =
                 object.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect();
@@ -786,7 +803,7 @@ impl CredentialStore {
                 )
             })?;
             let key = self.derive(passphrase, kdf, &salt)?;
-            if decrypt_secret(&file.check, &key).ok().as_deref() != Some(CHECK_VALUE) {
+            if !check_matches(file, &key) {
                 return Err(Error::credential(
                     Kind::WrongKey,
                     format!("The passphrase doesn't unlock the credential store {}. It was left unchanged.", path.display()),
@@ -796,7 +813,7 @@ impl CredentialStore {
         }
 
         let (candidates, blocker) = self.file_key_candidates();
-        if let Some(key) = candidates.into_iter().find(|k| decrypt_secret(&file.check, k).ok().as_deref() == Some(CHECK_VALUE)) {
+        if let Some(key) = candidates.into_iter().find(|k| check_matches(file, k)) {
             return Ok(StoreKey { key, kdf: None });
         }
         Err(blocker.unwrap_or_else(|| {
@@ -815,7 +832,7 @@ impl CredentialStore {
     /// keys and then, read-only, with the keys older versions derived: the
     /// passphrase's plain SHA-256 and the key-file path.
     fn decrypt_legacy(&self, map: &BTreeMap<String, String>, path: &Path) -> Result<BTreeMap<String, String>> {
-        let Some((_, sample)) = map.iter().find(|(_, v)| v.starts_with(ENC_PREFIX)) else {
+        let Some((_, sample)) = map.iter().find(|(_, v)| v.starts_with(ENC_PREFIX_V1)) else {
             return Ok(map.clone()); // plaintext only
         };
         let (mut candidates, blocker) = self.file_key_candidates();
@@ -833,7 +850,7 @@ impl CredentialStore {
         })?;
         map.iter()
             .map(|(k, v)| {
-                let plain = if v.starts_with(ENC_PREFIX) {
+                let plain = if v.starts_with(ENC_PREFIX_V1) {
                     decrypt_secret(v, &key).map_err(|_| {
                         corrupt(format!("The entry '{}' in {} is damaged. The store was left unchanged.", k, path.display()))
                     })?
@@ -853,10 +870,13 @@ impl CredentialStore {
         let file = StoreFile {
             version: STORE_VERSION,
             kdf: store_key.kdf.clone(),
-            check: encrypt_secret(CHECK_VALUE, &store_key.key)?,
+            check: encrypt_bound(CHECK_VALUE, &store_key.key, &associated_data(Aad::Check))?,
             entries: entries
                 .iter()
-                .map(|(k, v)| Ok((k.clone(), encrypt_secret(v, &store_key.key)?)))
+                .map(|(k, v)| {
+                    let aad = associated_data(Aad::Entry { name: k, binding: entry_binding(k, entries) });
+                    Ok((k.clone(), encrypt_bound(v, &store_key.key, &aad)?))
+                })
                 .collect::<Result<_>>()?,
         };
         let data = serde_json::to_vec_pretty(&file).map_err(|e| Error::Serialization(e.to_string()))?;
@@ -1078,22 +1098,96 @@ impl KdfParams {
     }
 }
 
+/// Whether `key` opens the store's `check` value, in the store's format.
+fn check_matches(file: &StoreFile, key: &[u8; 32]) -> bool {
+    let check = if file.version == STORE_VERSION_UNBOUND {
+        decrypt_secret(&file.check, key)
+    } else {
+        decrypt_bound(&file.check, key, &associated_data(Aad::Check))
+    };
+    check.ok().as_deref() == Some(CHECK_VALUE)
+}
+
 fn decrypt_v2(file: &StoreFile, key: &[u8; 32], path: &Path) -> Result<BTreeMap<String, String>> {
-    if decrypt_secret(&file.check, key).ok().as_deref() != Some(CHECK_VALUE) {
+    if !check_matches(file, key) {
         return Err(Error::credential(Kind::WrongKey, format!("The credential store {} doesn't decrypt with its key.", path.display())));
     }
-    file.entries
-        .iter()
-        .map(|(k, v)| {
-            if !v.starts_with(ENC_PREFIX) {
-                return Err(corrupt(format!("The entry '{}' in {} isn't encrypted. The store was left unchanged.", k, path.display())));
+    let bound = file.version != STORE_VERSION_UNBOUND;
+    let prefix = if bound { ENC_PREFIX } else { ENC_PREFIX_V1 };
+    let damaged = |k: &str| corrupt(format!("The entry '{}' in {} is damaged. The store was left unchanged.", k, path.display()));
+    // A password's associated data holds its binding's plaintext, and a
+    // binding's name is longer than its password's: decrypt longest first
+    let mut names: Vec<&String> = file.entries.keys().collect();
+    names.sort_by_key(|k| std::cmp::Reverse(k.len()));
+    let mut plain = BTreeMap::new();
+    for k in names {
+        let v = &file.entries[k];
+        if !v.starts_with(prefix) {
+            // In a version 3 store this includes an `enc:v1:` value copied in
+            // from an older file: it isn't bound to this entry
+            return Err(corrupt(format!(
+                "The entry '{}' in {} isn't encrypted in this store's format. The store was left unchanged.",
+                k,
+                path.display()
+            )));
+        }
+        let secret = if bound {
+            let aad = associated_data(Aad::Entry { name: k, binding: entry_binding(k, &plain) });
+            decrypt_bound(v, key, &aad)
+        } else {
+            decrypt_secret(v, key)
+        }
+        .map_err(|_| damaged(k))?;
+        plain.insert(k.clone(), secret);
+    }
+    Ok(plain)
+}
+
+/// What a value's associated data says it belongs to.
+enum Aad<'a> {
+    /// The store's `check` value.
+    Check,
+    /// The entry `name`, and for an account's password its connection binding
+    /// (`None` if the store holds none, as for a password saved before
+    /// bindings existed).
+    Entry { name: &'a str, binding: Option<&'a str> },
+}
+
+/// Domain label in front of every associated data.
+const AAD_LABEL: &[u8] = b"mailbackup:credential-store:v3";
+
+/// Unambiguous encoding of `aad`: the label and every field length-prefixed
+/// (64-bit big-endian), a tag byte for the kind of value and for whether a
+/// binding is present. Two different identities never give the same bytes.
+fn associated_data(aad: Aad) -> Vec<u8> {
+    fn field(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    let mut out = Vec::new();
+    field(&mut out, AAD_LABEL);
+    match aad {
+        Aad::Check => out.push(0),
+        Aad::Entry { name, binding } => {
+            out.push(1);
+            field(&mut out, name.as_bytes());
+            match binding {
+                None => out.push(0),
+                Some(binding) => {
+                    out.push(1);
+                    field(&mut out, binding.as_bytes());
+                }
             }
-            let plain = decrypt_secret(v, key).map_err(|_| {
-                corrupt(format!("The entry '{}' in {} is damaged. The store was left unchanged.", k, path.display()))
-            })?;
-            Ok((k.clone(), plain))
-        })
-        .collect()
+        }
+    }
+    out
+}
+
+/// The binding stored for the password entry `name` (`account:<id>`), from
+/// the plaintext `entries`.
+fn entry_binding<'a>(name: &str, entries: &'a BTreeMap<String, String>) -> Option<&'a str> {
+    let id = name.strip_prefix("account:")?;
+    entries.get(&binding_key(id)).map(String::as_str)
 }
 
 /// Local-store entries that aren't secrets: which value was copied from a
@@ -1254,19 +1348,42 @@ fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     Ok(bytes)
 }
 
+/// An `enc:v1:` value (no associated data), as version 2 stores hold.
+#[cfg(test)]
 fn encrypt_secret(secret: &str, master_key: &[u8; 32]) -> Result<String> {
+    seal(ENC_PREFIX_V1, secret, master_key, b"")
+}
+
+/// Reads an `enc:v1:` value (no associated data).
+fn decrypt_secret(encoded: &str, master_key: &[u8; 32]) -> Result<String> {
+    open(ENC_PREFIX_V1, encoded, master_key, b"")
+}
+
+/// An `enc:v2:` value bound to `aad` (see [`associated_data`]).
+fn encrypt_bound(secret: &str, master_key: &[u8; 32], aad: &[u8]) -> Result<String> {
+    seal(ENC_PREFIX, secret, master_key, aad)
+}
+
+/// Reads an `enc:v2:` value; fails unless it was written with this `aad`.
+fn decrypt_bound(encoded: &str, master_key: &[u8; 32], aad: &[u8]) -> Result<String> {
+    open(ENC_PREFIX, encoded, master_key, aad)
+}
+
+fn seal(prefix: &str, secret: &str, master_key: &[u8; 32], aad: &[u8]) -> Result<String> {
+    use aes_gcm::aead::Payload;
     let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*master_key));
     let nonce = random_bytes::<12>()?;
     let ciphertext = cipher
-        .encrypt(&Nonce::from(nonce), secret.as_bytes())
+        .encrypt(&Nonce::from(nonce), Payload { msg: secret.as_bytes(), aad })
         .map_err(|e| Error::Keyring(format!("Encryption error: {}", e)))?;
 
-    Ok(format!("{}{}:{}", ENC_PREFIX, hex::encode(nonce), hex::encode(ciphertext)))
+    Ok(format!("{}{}:{}", prefix, hex::encode(nonce), hex::encode(ciphertext)))
 }
 
-fn decrypt_secret(encoded: &str, master_key: &[u8; 32]) -> Result<String> {
+fn open(prefix: &str, encoded: &str, master_key: &[u8; 32], aad: &[u8]) -> Result<String> {
+    use aes_gcm::aead::Payload;
     let payload = encoded
-        .strip_prefix(ENC_PREFIX)
+        .strip_prefix(prefix)
         .ok_or_else(|| Error::Keyring("Not an encrypted credential".to_string()))?;
     let (nonce_hex, ciphertext_hex) = payload
         .split_once(':')
@@ -1281,7 +1398,7 @@ fn decrypt_secret(encoded: &str, master_key: &[u8; 32]) -> Result<String> {
 
     let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*master_key));
     let decrypted_bytes = cipher
-        .decrypt(&Nonce::from(nonce), ciphertext_bytes.as_ref())
+        .decrypt(&Nonce::from(nonce), Payload { msg: ciphertext_bytes.as_ref(), aad })
         .map_err(|e| Error::Keyring(format!("Decryption failed: {}", e)))?;
 
     String::from_utf8(decrypted_bytes).map_err(|e| Error::Keyring(format!("Corrupted UTF-8 secret: {}", e)))
