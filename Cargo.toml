@@ -19,7 +19,7 @@ tokio = { version = "1.40", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_norway = "0.9"
-rusqlite = { version = "0.41", features = ["bundled", "bundled-full", "chrono", "uuid", "fallible_uint"] }
+rusqlite = { version = "0.42", features = ["bundled", "bundled-full", "chrono", "uuid", "fallible_uint"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 sha2 = "0.11"
